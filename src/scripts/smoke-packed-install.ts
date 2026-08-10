@@ -2315,7 +2315,7 @@ function requireNativeHookPermissionDeny(probe: string, output: Record<string, u
   }
 }
 
-function smokeInstalledNativeHookDist(prefixDir: string): void {
+function smokeInstalledNativeHookDist(prefixDir: string, runtimeBinary: string): void {
 function runPackedTransportRegressions(hookScript: string, smokeCwd: string): void {
   const invoke = (cwd: string, environment: NodeJS.ProcessEnv, payload: Record<string, unknown>) => run(process.execPath, [realpathSync(hookScript)], {
     cwd, env: environment, input: JSON.stringify(payload),
@@ -2943,8 +2943,17 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
     }
     if (Object.keys(runActorProbe('main-root', 'zsh fast startup control', 'Bash', {
       command: `zsh -f -c ':'`,
-    })).length !== 0) {
+    }, { OMX_RUNTIME_BINARY: runtimeBinary })).length !== 0) {
       throw new Error('packed main-root zsh fast startup control should be allowed');
+    }
+    if (Object.keys(runActorProbe('main-root', 'zsh fast startup control ambient startup environment', 'Bash', {
+      command: `zsh -f -c ':'`,
+    }, {
+      OMX_RUNTIME_BINARY: runtimeBinary,
+      ENV: '/dev/null',
+      ZDOTDIR: join(smokeCwd, '.omx', 'state', 'zsh-home'),
+    })).length !== 0) {
+      throw new Error('packed main-root zsh fast startup control should remain allowed with ambient shell-startup environment');
     }
     const boxedPlanningRoot = join(smokeCwd, 'boxed-planning-root');
     const boxedPlanningStateDir = join(boxedPlanningRoot, '.omx', 'state');
@@ -5628,7 +5637,7 @@ async function main(): Promise<void> {
     for (const argv of PACKED_INSTALL_SMOKE_CORE_COMMANDS) {
       run(omxPath, argv, { cwd: repoRoot, env: installEnv });
     }
-    smokeInstalledNativeHookDist(prefixDir);
+    smokeInstalledNativeHookDist(prefixDir, runtimeBinary);
     const lifecycle = await smokePackedHookTrustLifecycle(omxPath);
     console.log(
       lifecycle.codexVersion !== null
