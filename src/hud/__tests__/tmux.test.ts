@@ -142,6 +142,8 @@ describe('HUD resize hook helpers', () => {
     for (const token of ['pane_id', '%1', 'pane_pid', '101', 'session_id', '$7', 'window_id', '@3']) {
       assert.match(split?.[4] ?? '', new RegExp(token.replace('$', '\\$')));
     }
+    assert.match(split?.[5] ?? '', /OMX_TMUX_SPLIT_OPERATION_MARKER='[^']+' node omx\.js hud --watch/);
+    assert.doesNotMatch(split?.[5] ?? '', /; export OMX_TMUX_SPLIT_OPERATION_MARKER/);
     assert.match(split?.[6] ?? '', /__omx_hud_split_rejected_/);
   });
 

@@ -1236,7 +1236,7 @@ const OMX_TMUX_SPLIT_OPERATION_MARKER_ENV = 'OMX_TMUX_SPLIT_OPERATION_MARKER';
 
 function writeHudSplitOperationMarkedCommand(command: string, marker: string): string {
   if (process.platform === 'win32') return `$env:${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV} = '${marker}'; ${command}`;
-  return `${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV}='${marker}'; export ${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV}; ${command}`;
+  return `${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV}='${marker}' ${command}`;
 }
 
 function hasHudSplitOperationMarker(startCommand: string, marker: string): boolean {
@@ -1244,6 +1244,7 @@ function hasHudSplitOperationMarker(startCommand: string, marker: string): boole
   const powerShellMarker = `$env:${OMX_TMUX_SPLIT_OPERATION_MARKER_ENV} = '${marker}'`;
   return startCommand === posixMarker
     || startCommand.startsWith(`${posixMarker};`)
+    || startCommand.startsWith(`${posixMarker} `)
     || startCommand === powerShellMarker
     || startCommand.startsWith(`${powerShellMarker};`);
 }
