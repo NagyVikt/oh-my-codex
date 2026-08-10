@@ -1430,7 +1430,7 @@ export function createHudWatchPane(
     : HUD_TMUX_HEIGHT_LINES;
   const args = [
     'split-window', '-v', ...(options.fullWidth ? ['-f'] : []), '-l', String(heightLines), '-d',
-    '-t', sourcePaneId, '-c', shellEscapeSingle(cwd), writeHudSplitOperationMarkedCommand(hudCmd, operationMarker),
+    '-t', sourcePaneId, '-c', shellEscapeSingle(cwd), shellEscapeSingle(writeHudSplitOperationMarkedCommand(hudCmd, operationMarker)),
   ];
   let paneId: string | null = null;
   const nonce = randomUUID();
