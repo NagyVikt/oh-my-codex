@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { readAllState, readHudConfig } from './state.js';
@@ -189,6 +189,10 @@ function needsHudTopologyRecreate(pane: TmuxPaneSnapshot, leaderPane?: TmuxPaneS
   const expectedLeft = typeof leaderPane?.paneLeft === 'number' ? leaderPane.paneLeft : 0;
   const expectedWidth = typeof leaderPane?.paneWidth === 'number' ? leaderPane.paneWidth : pane.windowWidth;
   const spansExpectedWidth = pane.paneLeft === expectedLeft && pane.paneWidth === expectedWidth;
+  if (typeof pane.paneTop === 'number' && typeof leaderPane?.paneBottom === 'number') {
+    const sitsImmediatelyBelowLeader = pane.paneTop === leaderPane.paneBottom + 2;
+    return !spansExpectedWidth || !sitsImmediatelyBelowLeader;
+  }
   const touchesWindowBottom = pane.paneBottom === (pane.windowHeight ?? 0) - 1;
   return !spansExpectedWidth || !touchesWindowBottom;
 }
@@ -229,6 +233,16 @@ function planOwnedHudPaneDedupe(
 }
 
 const HUD_RECONCILE_LOCK_STALE_MS = 10_000;
+
+function buildHudReconcileLockPath(cwd: string, env: NodeJS.ProcessEnv): string {
+  const ownerIdentity = [
+    env.TMUX?.trim() ?? '',
+    env.TMUX_PANE?.trim() ?? '',
+    env.OMX_SESSION_ID?.trim() ?? '',
+  ].join('\0');
+  const ownerHash = createHash('sha256').update(ownerIdentity).digest('hex').slice(0, 16);
+  return join(cwd, '.omx', 'state', `hud-reconcile-${ownerHash}.lock`);
+}
 
 interface HudReconcileLock {
   path: string;
@@ -396,7 +410,10 @@ export async function reconcileHudForPromptSubmit(
   const killPane = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
   const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
 
-  const lockPath = join(cwd, '.omx', 'state', 'hud-reconcile.lock');
+  // Layout-change hooks for every OMX pane in a window may fire together. Lock
+  // per HUD owner so one leader cannot suppress a neighboring leader's one-shot
+  // reconciliation while still serializing duplicate work for the same owner.
+  const lockPath = buildHudReconcileLockPath(cwd, env);
   const lockDirReady = await mkdir(dirname(lockPath), { recursive: true }).then(() => true).catch(() => false);
   const lock = lockDirReady
     ? await acquireHudReconcileLock(
