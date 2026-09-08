@@ -34,7 +34,6 @@ import {
 import { sleep, sleepSync } from '../utils/sleep.js';
 import {
   buildPlatformCommandSpec,
-  classifySpawnError,
   resolveCommandPathForPlatform,
   spawnPlatformCommandSync,
 } from '../utils/platform-command.js';
@@ -110,7 +109,11 @@ export class CreateTeamSessionPartialError extends Error {
     /** Cleanup commands that failed after resources were created and must be retried. */
     readonly cleanupErrors: string[] = [],
   ) {
-    super('create_team_session_cleanup_incomplete');
+    super(
+      `create_team_session_cleanup_incomplete: ${originalError instanceof Error ? originalError.message : String(originalError)}`
+        + (cleanupErrors.length > 0 ? `; cleanup: ${cleanupErrors.join('; ')}` : ''),
+      { cause: originalError },
+    );
     this.name = 'CreateTeamSessionPartialError';
   }
 }
@@ -1825,11 +1828,8 @@ export function translateWorkerLaunchArgsForCli(
 }
 
 function commandExists(binary: string): boolean {
-  const { result } = spawnPlatformCommandSync(binary, ['--version'], { encoding: 'utf-8' });
-  if (result.error) {
-    return classifySpawnError(result.error as NodeJS.ErrnoException) !== 'missing';
-  }
-  return true;
+  // Launch wrappers may bootstrap profiles even for --version. Discovery must not execute them.
+  return resolveCommandPathForPlatform(binary) !== null;
 }
 
 export function trustWorkerMiseConfigIfAvailable(workerCwd: string): boolean {
