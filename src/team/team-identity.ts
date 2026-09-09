@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { existsSync, readdirSync, readFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join } from 'path';
 import { TEAM_NAME_SAFE_PATTERN } from './contracts.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
