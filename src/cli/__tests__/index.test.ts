@@ -6907,6 +6907,14 @@ describe("readTopLevelTomlString", () => {
     );
     assert.equal(value, null);
   });
+
+  it("ignores array-of-tables values", () => {
+    const value = readTopLevelTomlString(
+      '[[entries]] # array of tables\nmodel_reasoning_effort = "low"\n',
+      "model_reasoning_effort",
+    );
+    assert.equal(value, null);
+  });
 });
 
 describe("injectModelInstructionsBypassArgs", () => {
@@ -7019,6 +7027,25 @@ describe("upsertTopLevelTomlString", () => {
       updated,
       'model_reasoning_effort = "xhigh"\n[tui]\nstatus_line = []\n',
     );
+  });
+
+  it("preserves array-of-tables values when inserting a top-level key", () => {
+    const content = '[[entries]] # array of tables\nmodel_reasoning_effort = "low"\n';
+    const updated = upsertTopLevelTomlString(content, "model_reasoning_effort", "high");
+    assert.equal(updated, `model_reasoning_effort = "high"\n${content}`);
+  });
+
+  it("inserts before an array of tables that precedes an ordinary table", () => {
+    const content = [
+      "[[skills.config]]",
+      'path = "/tmp/skill/SKILL.md"',
+      "enabled = false",
+      "[tui]",
+      "status_line = []",
+      "",
+    ].join("\r\n");
+    const updated = upsertTopLevelTomlString(content, "model_reasoning_effort", "high");
+    assert.equal(updated, `model_reasoning_effort = "high"\r\n${content}`);
   });
 });
 
