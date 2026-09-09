@@ -2923,6 +2923,28 @@ describe('team worker CLI helpers', () => {
     ));
   });
 
+  it('assertTeamWorkerCliBinaryAvailable treats empty PATH components as the current directory without executing', { skip: process.platform === 'win32' }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omx-cli-cwd-probe-'));
+    const marker = join(dir, 'executed');
+    const previousPath = process.env.PATH;
+    const previousCwd = process.cwd();
+    try {
+      await writeFile(join(dir, 'codex'), `#!/bin/sh\nprintf invoked > '${marker}'\n`);
+      await chmod(join(dir, 'codex'), 0o755);
+      process.chdir(dir);
+      for (const pathValue of ['', ':', `:${join(dir, 'no-such-segment')}`, `${join(dir, 'no-such-segment')}:`]) {
+        process.env.PATH = pathValue;
+        assertTeamWorkerCliBinaryAvailable('codex');
+        assert.equal(fs.existsSync(marker), false, 'discovery must not execute cwd-resolved wrappers');
+      }
+    } finally {
+      process.chdir(previousCwd);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('CreateTeamSessionPartialError exposes the original startup failure and cleanup debt', () => {
     const original = new Error('tmux_test_startup_failure');
     const partial = {

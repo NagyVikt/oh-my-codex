@@ -3264,7 +3264,7 @@ exit 1
   });
 
   for (const command of ['status-json', 'status-text', 'shutdown'] as const) {
-    it(`reports the selected state path for ${command} without searching another root`, async () => {
+    it(`reports the selected state path for ${command} and ignores aliases from unselected roots`, async () => {
       const wd = await mkdtemp(join(tmpdir(), 'omx-team-selected-root-'));
       const previousCwd = process.cwd();
       const envKeys = ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const;
@@ -3286,6 +3286,15 @@ exit 1
         const originalConfig = await readFile(configPath, 'utf8');
         delete process.env.OMX_TEAM_STATE_ROOT;
         process.env.OMX_STATE_ROOT = join(wd, 'inherited-root');
+        // An alias team in the unselected cwd root must not rename or mask the
+        // team addressed through the selected canonical state root.
+        const decoyDir = join(wd, '.omx', 'state', 'team', 'alias-team');
+        await mkdir(decoyDir, { recursive: true });
+        await writeFile(join(decoyDir, 'manifest.v2.json'), JSON.stringify({
+          leader: {},
+          requested_name: 'selected-root-team',
+          display_name: 'selected-root-team',
+        }));
         console.log = (message?: unknown) => { logs.push(String(message ?? '')); };
 
         await teamCommand(command === 'shutdown'

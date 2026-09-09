@@ -161,13 +161,15 @@ function resolvePosixCommandPath(
     return existsImpl(candidate) ? candidate : null;
   }
 
+  // Empty PATH components resolve to the current directory under execvp
+  // semantics, so discovery must consider them to stay consistent with how a
+  // later bare-binary spawn actually resolves the command.
   const pathEntries = String(env.PATH ?? env.Path ?? '')
     .split(delimiter)
-    .map((value) => value.trim())
-    .filter(Boolean);
+    .map((value) => value.trim());
 
   for (const entry of pathEntries) {
-    const candidate = resolve(entry, trimmed);
+    const candidate = resolve(entry === '' ? '.' : entry, trimmed);
     if (existsImpl(candidate)) return candidate;
   }
 

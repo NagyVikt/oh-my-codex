@@ -1729,7 +1729,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         error: error instanceof Error ? error.message : String(error),
       });
     });
-    if (configBeforeShutdown) {
+    if (summary.configExisted) {
       console.log(`Team shutdown complete: ${name}`);
     } else {
       const statePath = join(resolveCanonicalTeamStateRoot(cwd), 'team', resolvedName);
