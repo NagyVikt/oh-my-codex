@@ -1,3 +1,5 @@
+import { StringDecoder } from "node:string_decoder";
+
 const JSON_OAUTH_TOKEN_FIELD_PATTERN = /(["'](?:access_token|refresh_token|id_token)["']\s*:\s*)(["'])(?:\\.|(?!\2)[^\\])*\2/gi;
 
 const SECRET_PATTERNS: RegExp[] = [
@@ -22,4 +24,43 @@ export function redactAuthSecrets(value: unknown): string {
     });
   }
   return text;
+}
+
+/** Redact complete stderr records rather than arbitrary OS pipe chunks. */
+export function createAuthStderrRedactor(emit: (text: string) => void): {
+  write: (chunk: Buffer) => void;
+  end: () => void;
+} {
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let dropping = false;
+  // Keep pretty-printed token fields together when the value starts on the next line.
+  const incompleteSecret = /(?:["']?(?:access_token|refresh_token|id_token|(?:session|auth|api)[_-]?token)["']?\s*[:=]?|\bbearer)\s*$/i;
+  const accept = (text: string) => {
+    if (dropping) return;
+    for (const part of text.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+      pending += part;
+      // A newline after overflow might still precede a pretty-printed secret value.
+      // Without its buffered prefix, no later boundary is provably safe to emit.
+      if (pending.length > 64 * 1024) {
+        emit("[omx auth] oversized stderr record; remaining stderr suppressed\n");
+        pending = "";
+        dropping = true;
+        return;
+      }
+      if (!part.endsWith("\n")) continue;
+      if (!incompleteSecret.test(pending)) {
+        emit(redactAuthSecrets(pending));
+        pending = "";
+      }
+    }
+  };
+  return {
+    write: (chunk) => accept(decoder.write(chunk)),
+    end: () => {
+      accept(decoder.end());
+      if (pending) emit(redactAuthSecrets(pending));
+      pending = "";
+    },
+  };
 }
