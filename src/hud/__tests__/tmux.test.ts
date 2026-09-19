@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   buildHudLayoutHookSlot,
   boundHudHeight,
@@ -101,7 +102,14 @@ describe('HUD resize hook helpers', () => {
 
   it('registers session hooks only after capturing exact pane, PID, session, and window authority', () => {
     const calls: string[][] = [];
-    const result = registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux', OMX_SESSION_ID: 'sess-a' } }, (args) => {
+    const result = registerHudResizeHook('%9', '%1', 3, {
+      cwd: '/repo',
+      env: {
+        TMUX: '/tmp/tmux',
+        OMX_SESSION_ID: 'sess-a',
+        OMX_ENTRY_PATH: fileURLToPath(new URL('../../cli/omx.js', import.meta.url)),
+      },
+    }, (args) => {
       calls.push(args);
       return hookAuthority(args) ?? '';
     });
@@ -113,6 +121,7 @@ describe('HUD resize hook helpers', () => {
     const registrationCommand = (args: string[]): string | undefined => args[1] === '-w' ? args[5] : args[4];
 
     assert.equal(result, true);
+    assert.equal(registrations.length, 3);
     assert.deepEqual(calls[0], ['list-panes', '-a', '-F', '#{pane_id} #{pane_dead} #{pane_pid}']);
     assert.deepEqual(calls[1], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
     assert.deepEqual(registrations[0]?.slice(1, 4), ['-t', '$7', hookSlot]);
@@ -123,6 +132,9 @@ describe('HUD resize hook helpers', () => {
     assert.match(registrationCommand(registrations[0]!) ?? '', /resize-pane/);
     assert.match(registrationCommand(registrations[0]!) ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
     for (const registration of registrations) {
+      if (process.platform !== 'win32' && registrationSlot(registration) !== hookSlot) {
+        assert.match(registrationCommand(registration) ?? '', /hud --reconcile-tmux >\/dev\/null 2>&1 \|\| true/);
+      }
       const suffixIndex = registration[1] === '-w' ? 6 : 5;
       assert.equal(registration[suffixIndex], ';');
       assert.deepEqual(registration.slice(suffixIndex + 1, suffixIndex + 4), ['set-option', '-t', '$7']);

@@ -10,7 +10,7 @@
  *   omx hud --reconcile-tmux
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { readlinkSync, realpathSync } from 'node:fs';
 import { readAllState, readHudConfig } from './state.js';
 import { getHudRenderMaxLines, renderHud } from './render.js';
@@ -19,6 +19,7 @@ import { HUD_TMUX_HEIGHT_LINES } from './constants.js';
 import { sleep } from '../utils/sleep.js';
 import { runHudAuthorityTick } from './authority.js';
 import { isHudWatchSessionAttached } from './session-attached.js';
+import { closeOwnedHudPane, createHudOwnerAliveProbe } from './watch-owner.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 import {
   killTmuxPane,
@@ -31,7 +32,6 @@ import {
   isHudOwnerCurrent,
   clearTmuxPaneHistory,
   resizeTmuxPane,
-  shellEscapeSingle,
 } from './tmux.js';
 import { OMX_TMUX_HUD_OWNER_ENV, needsHudTopologyRecreate, reconcileHudForPromptSubmit } from './reconcile.js';
 import { buildHudRuntimeEnv } from './tmux.js';
@@ -95,6 +95,8 @@ interface RunWatchModeDependencies {
   setIntervalFn: (handler: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
   clearIntervalFn: (timer: ReturnType<typeof setInterval>) => void;
   isSessionAttachedFn: () => boolean;
+  isOwnerAliveFn: (cwd: string) => Promise<boolean>;
+  closeOwnedPaneFn: () => void;
 }
 
 export interface ResolveHudWatchCwdDependencies {
@@ -215,29 +217,18 @@ export async function runWatchMode(
         },
       });
       if (!omxEntry) return;
-      const command = [
-        'cd',
-        shellEscapeSingle(reconcileCwd),
-        '&&',
-        `TMUX_PANE=${shellEscapeSingle(leaderPaneId)}`,
-        `OMX_TMUX_HUD_OWNER=${shellEscapeSingle('1')}`,
-        dependencies.env.OMX_SESSION_ID
-          ? `OMX_SESSION_ID=${shellEscapeSingle(dependencies.env.OMX_SESSION_ID)}`
-          : '',
-        dependencies.env.OMX_ROOT
-          ? `OMX_ROOT=${shellEscapeSingle(dependencies.env.OMX_ROOT)}`
-          : '',
-        shellEscapeSingle(process.execPath),
-        shellEscapeSingle(omxEntry),
-        'hud',
-        '--reconcile-tmux',
-        '>/dev/null',
-        '2>&1',
-      ].filter(Boolean).join(' ');
-      execFileSync('tmux', ['run-shell', '-b', command], {
-        env: dependencies.env,
+      // A tmux run-shell job reports nonzero exits in the user's active pane
+      // even with redirected stderr. Run independently of the pane's shell;
+      // reconciliation may replace this watcher, and retries are best-effort.
+      const child = spawn(process.execPath, [omxEntry, 'hud', '--reconcile-tmux'], {
+        cwd: reconcileCwd,
+        env: { ...dependencies.env, TMUX_PANE: leaderPaneId },
         stdio: 'ignore',
+        detached: true,
+        windowsHide: true,
       });
+      child.on('error', () => {});
+      child.unref();
     }),
     writeStdout: deps.writeStdout ?? ((text: string) => process.stdout.write(text)),
     writeStderr: deps.writeStderr ?? ((text: string) => process.stderr.write(text)),
@@ -248,6 +239,8 @@ export async function runWatchMode(
     setIntervalFn: deps.setIntervalFn ?? ((handler: () => void, intervalMs: number) => setInterval(handler, intervalMs)),
     clearIntervalFn: deps.clearIntervalFn ?? ((timer: ReturnType<typeof setInterval>) => clearInterval(timer)),
     isSessionAttachedFn: deps.isSessionAttachedFn ?? (() => isHudWatchSessionAttached({ env: dependencies.env })),
+    isOwnerAliveFn: deps.isOwnerAliveFn ?? createHudOwnerAliveProbe(deps.env ?? process.env),
+    closeOwnedPaneFn: deps.closeOwnedPaneFn ?? (() => closeOwnedHudPane(dependencies.env)),
   };
 
   if (!dependencies.isTTY && !dependencies.env.CI) {
@@ -289,6 +282,13 @@ export async function runWatchMode(
     inFlight = true;
     let renderedThisTick: 'rendered' | 'suppressed' | 'stopped' = 'suppressed';
     try {
+      const frameCwd = dependencies.resolveWatchCwdFn(cwd);
+      if (!await dependencies.isOwnerAliveFn(frameCwd)) {
+        renderedThisTick = 'stopped';
+        stop();
+        dependencies.closeOwnedPaneFn();
+        return;
+      }
       // A detached session has no client to receive stdout, so skip the
       // render-only work (state reads with git subprocess spawns, tmux height
       // reconciliation, stdout writes) while still running the authority
@@ -301,7 +301,6 @@ export async function runWatchMode(
         // Fail-open: an unknown attachment answer renders.
         attached = true;
       }
-      const frameCwd = dependencies.resolveWatchCwdFn(cwd);
       if (firstRender || attached) {
         const config = await dependencies.readHudConfigFn(frameCwd);
         const ctx = await dependencies.readAllStateFn(frameCwd, config);
