@@ -123,6 +123,9 @@ describe('HUD resize hook helpers', () => {
     assert.match(registrationCommand(registrations[0]!) ?? '', /resize-pane/);
     assert.match(registrationCommand(registrations[0]!) ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
     for (const registration of registrations) {
+      if (registrationSlot(registration) !== hookSlot) {
+        assert.match(registrationCommand(registration) ?? '', /2>&1 \|\| true/);
+      }
       const suffixIndex = registration[1] === '-w' ? 6 : 5;
       assert.equal(registration[suffixIndex], ';');
       assert.deepEqual(registration.slice(suffixIndex + 1, suffixIndex + 4), ['set-option', '-t', '$7']);
