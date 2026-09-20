@@ -8,6 +8,34 @@ const env = { TMUX: 'test', TMUX_PANE: '%2', OMX_TMUX_HUD_OWNER: '1', OMX_TMUX_H
 const state: SessionState = { session_id: 'sess-a', started_at: '', cwd: '/tmp', pid: 123, tmux_pane_id: '%1' };
 
 describe('HUD owner liveness', () => {
+  for (const [name, snapshot, expected] of [
+    ['closed leader', '%2\t0\n%3\t0', false],
+    ['dead leader kept by remain-on-exit', '%1\t1\n%2\t0', false],
+    ['live leader anywhere on the server', '%2\t0\n%1\t0', true],
+    ['unknown HUD', '%3\t0', true],
+    ['empty response', '', true],
+    ['malformed response', '%2\t0\ninvalid', true],
+  ] as const) {
+    it(`handles ${name} without requiring a session pointer`, async () => {
+      const alive = createHudOwnerAliveProbe(env, {
+        execTmuxSync: args => {
+          assert.deepEqual(args, ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}']);
+          return snapshot;
+        },
+        readPointer: async () => ({ status: 'absent' }),
+      });
+      assert.equal(await alive('/tmp'), expected);
+    });
+  }
+
+  it('preserves a HUD when tmux cannot be queried and owner state is absent', async () => {
+    const alive = createHudOwnerAliveProbe(env, {
+      execTmuxSync: () => { throw new Error('server unavailable'); },
+      readPointer: async () => ({ status: 'absent' }),
+    });
+    assert.equal(await alive('/tmp'), true);
+  });
+
   for (const status of ['absent', 'malformed', 'foreign-cwd'] as const) {
     it(`does not treat ${status} state as an exited owner`, async () => {
       const alive = createHudOwnerAliveProbe(env, {

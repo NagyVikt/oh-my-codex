@@ -18,13 +18,14 @@ const POLL_INTERVAL_MS = 50;
 const TEST_TIMEOUT_MS = 10_000;
 
 describe('owned HUD lifecycle on a private tmux server', () => {
-	for (const removePointer of [false, true]) {
-		it(`removes only its HUD when the owner exits, including remain-on-exit (pointer removed=${removePointer})`, async t => {
+	for (const shutdown of ['owner', 'removed-pointer', 'closed-pane', 'dead-pane'] as const) {
+		it(`removes only its HUD, including remain-on-exit (${shutdown})`, async t => {
 			if (!skipUnlessRealTmux(t)) return;
 			const dir = await mkdtemp(join(tmpdir(), 'omx-hud-owner-'));
 			const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
 			try {
 				await withTempTmuxSession({}, async fixture => {
+					const sibling = fixture.run(['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.leaderPaneId, 'sleep 60']);
 					const context = resolveSessionPointerContext(dir, { OMX_ROOT: dir });
 					await mkdir(context.baseStateDir, { recursive: true });
 					const pointer = context.sessionPath;
@@ -48,12 +49,24 @@ await runWatchMode(${JSON.stringify(dir)}, { watch: true, json: false, tmux: fal
 						`exec env OMX_ROOT=${quoteSh(dir)} OMX_STATE_ROOT= OMX_TEAM_STATE_ROOT= OMX_SESSION_ID=owner-test OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} ${quoteSh(process.execPath)} ${quoteSh(runner)}`]);
 					fixture.run(['set-option', '-p', '-t', hud, 'remain-on-exit', 'on']);
 					await waitForFile(ready);
-					if (removePointer) await rm(pointer);
-					const exited = new Promise<void>(resolve => owner.once('exit', () => resolve()));
-					owner.kill('SIGKILL');
-					await exited;
-					await waitForTmuxValue(fixture, ['list-panes', '-t', fixture.windowTarget, '-F', '#{pane_id}'], fixture.leaderPaneId);
-					assert.equal(fixture.run(['display-message', '-p', '-t', fixture.leaderPaneId, '#{pane_dead}']), '0');
+					if (shutdown === 'removed-pointer' || shutdown === 'closed-pane') await rm(pointer);
+					if (shutdown === 'closed-pane') {
+						fixture.run(['kill-pane', '-t', fixture.leaderPaneId]);
+					} else if (shutdown === 'dead-pane') {
+						fixture.run(['set-option', '-p', '-t', fixture.leaderPaneId, 'remain-on-exit', 'on']);
+						fixture.run(['respawn-pane', '-k', '-t', fixture.leaderPaneId, 'exit 0']);
+					} else {
+						const exited = new Promise<void>(resolve => owner.once('exit', () => resolve()));
+						owner.kill('SIGKILL');
+						await exited;
+					}
+					await waitForTmuxValue(fixture, ['list-panes', '-t', fixture.windowTarget, '-f', `#{==:#{pane_id},${hud}}`, '-F', '#{pane_id}'], '');
+					assert.equal(fixture.run(['display-message', '-p', '-t', sibling, '#{pane_dead}']), '0');
+					if (shutdown === 'closed-pane' || shutdown === 'dead-pane') {
+						assert.equal(owner.exitCode, null, 'pane closure must work even while launcher process survives');
+					} else {
+						assert.equal(fixture.run(['display-message', '-p', '-t', fixture.leaderPaneId, '#{pane_dead}']), '0');
+					}
 				});
 			} finally {
 				if (owner.exitCode === null && owner.signalCode === null) owner.kill('SIGKILL');

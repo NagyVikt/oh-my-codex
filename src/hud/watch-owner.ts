@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 import {
   classifySessionStateLiveness,
   readSessionPointer,
@@ -12,6 +14,7 @@ export function createHudOwnerAliveProbe(
   deps: {
     readPointer?: typeof readSessionPointer;
     classify?: typeof classifySessionStateLiveness;
+    execTmuxSync?: (args: string[]) => string;
   } = {},
 ): (cwd: string) => Promise<boolean> {
   let owner: SessionState | undefined;
@@ -20,6 +23,20 @@ export function createHudOwnerAliveProbe(
   const hud = parseCanonicalTmuxPaneId(env.TMUX_PANE);
   return async cwd => {
     if (!env.TMUX || env.OMX_TMUX_HUD_OWNER !== '1' || !sessionId || !leader || !hud || leader === hud) return true;
+    try {
+      const exec = deps.execTmuxSync ?? ((args: string[]) => execFileSync(
+        resolveTmuxBinaryForPlatform() || 'tmux', args,
+        { env, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1000, windowsHide: true },
+      ));
+      // Query the whole server: moving a leader to another window is not exit.
+      // Require a complete, valid snapshot containing this HUD before reaping.
+      const rows = exec(['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}']).trim().split('\n');
+      if (rows.every(row => /^%\d+\t[01]$/.test(row)) && rows.includes(`${hud}\t0`)) {
+        if (!rows.includes(`${leader}\t0`)) return false;
+      }
+    } catch {
+      // A failed tmux query is not evidence of a closed pane; try owner state.
+    }
     try {
       const pointer = await (deps.readPointer ?? readSessionPointer)(resolveSessionPointerContext(cwd, env));
       const state = pointer.state;
