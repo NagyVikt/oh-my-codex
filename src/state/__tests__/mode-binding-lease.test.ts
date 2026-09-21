@@ -18,26 +18,22 @@ import {
 } from '../process-identity.js';
 
 const roots: string[] = [];
-const BOOTSTRAP_OWNER_TOKEN = `99999999-1-${'0'.repeat(24)}`;
-
-async function waitForBootstrapCleanupBarrier(barrierDir: string, count: number): Promise<string[]> {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    const entries = (await readdir(barrierDir)).filter((entry) => entry.startsWith('arrival-'));
-    if (entries.length >= count) return entries;
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${count} bootstrap cleanup contenders`);
-    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 5));
-  }
-}
 const operationsModuleUrl = new URL('../operations.js', import.meta.url).href;
 
-async function runTransactionProcess(path: string): Promise<void> {
+async function runTransactionProcess(path: string, options: { ready?: string; release?: string; entered?: string } = {}): Promise<void> {
   const source = [
+    `import { stat, writeFile } from 'node:fs/promises';`,
     `import { withStateFileWriteTransaction } from ${JSON.stringify(operationsModuleUrl)};`,
-    'await withStateFileWriteTransaction(process.argv[1], async () => undefined);',
+    'const ready = process.env.READY_FILE; const release = process.env.RELEASE_FILE; const entered = process.env.ENTERED_FILE;',
+    'await withStateFileWriteTransaction(process.argv[1], async () => {',
+    '  if (ready) await writeFile(ready, "ready");',
+    '  if (release) { for (;;) { try { await stat(release); break; } catch (error) { if (error.code !== "ENOENT") throw error; await new Promise(resolve => setTimeout(resolve, 5)); } } }',
+    '  if (entered) await writeFile(entered, "entered");',
+    '});',
   ].join('\n');
   const child = spawn(process.execPath, ['--input-type=module', '--eval', source, path], {
     stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+    env: { ...process.env, ...(options.ready ? { READY_FILE: options.ready } : {}), ...(options.release ? { RELEASE_FILE: options.release } : {}), ...(options.entered ? { ENTERED_FILE: options.entered } : {}) },
   });
   let stderr = '';
   child.stderr.setEncoding('utf8');
@@ -49,7 +45,6 @@ async function runTransactionProcess(path: string): Promise<void> {
 }
 
 afterEach(async () => {
-  delete process.env.OMX_TEST_MODE_BINDING_BOOTSTRAP_CLEANUP_BARRIER_DIR;
   __setStateOperationTestHooksForTests({});
   __setCanonicalModeBindingLeaseTestHooksForTests({});
   delete process.env.OMX_TEST_MODE_BINDING_RECLAIM_CRASH_PHASE;
@@ -110,21 +105,24 @@ describe('canonical mode binding lease', () => {
   });
 
   for (const kind of ['malformed', 'partial', 'symlink', 'foreign-entry'] as const) {
-    it(`rejects ${kind} bootstrap state beside its own valid owner`, async () => {
-      const cwd = await mkdtemp(join(tmpdir(), `omx-mode-bootstrap-${kind}-`));
+    it(`rejects ${kind} extra-owner ambiguity beside its own valid owner`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-mode-extra-owner-${kind}-`));
       roots.push(cwd);
       const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
       const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
-      const bootstrapPath = join(lockPath, `owner-${BOOTSTRAP_OWNER_TOKEN}`);
-      const external = join(cwd, 'external-bootstrap');
-      await writeFile(external, BOOTSTRAP_OWNER_TOKEN);
+      const extraToken = `${process.pid}-${Date.now()}-${'9'.repeat(24)}`;
+      const extraPath = join(lockPath, `owner-${extraToken}`);
+      const external = join(cwd, 'external-extra-owner');
       await assert.rejects(withStateFileWriteTransaction(path, async () => {
-        if (kind === 'symlink') await symlink(external, bootstrapPath);
-        else await writeFile(bootstrapPath, kind === 'malformed' ? 'tampered' : kind === 'partial' ? BOOTSTRAP_OWNER_TOKEN.slice(0, 8) : BOOTSTRAP_OWNER_TOKEN);
+        if (kind === 'symlink') {
+          await writeFile(external, extraToken);
+          await symlink(external, extraPath);
+        } else {
+          await writeFile(extraPath, kind === 'malformed' ? 'tampered' : kind === 'partial' ? extraToken.slice(0, 8) : extraToken);
+        }
         if (kind === 'foreign-entry') await writeFile(join(lockPath, 'foreign'), 'preserve');
-      }), kind === 'symlink' ? /ELOOP|lock ownership lost|ambiguous/ : /lock ownership lost|ambiguous/);
-      assert.equal(await readFile(external, 'utf8'), BOOTSTRAP_OWNER_TOKEN);
-      assert.equal((await readdir(lockPath)).filter((entry) => entry.startsWith('owner-')).length, 2);
+      }), /lock ownership lost|ambiguous|ELOOP/);
+      if (kind === 'symlink') assert.equal(await readFile(external, 'utf8'), extraToken);
     });
   }
 
@@ -424,26 +422,28 @@ describe('canonical mode binding lease', () => {
     }
   });
 
-  it('deterministically converges two bootstrap cleanup contenders after one observes ENOENT', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-bootstrap-race-'));
+  it('serializes two parent transactions under the native mutex', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mode-lease-mutex-race-'));
     roots.push(cwd);
     const path = join(cwd, '.omx', 'state', 'sessions', 'session-a', 'ralplan-state.json');
-    await withStateFileWriteTransaction(path, async () => undefined);
+    const ready = join(cwd, 'first-ready');
+    const release = join(cwd, 'first-release');
+    const entered = join(cwd, 'second-entered');
+    const first = runTransactionProcess(path, { ready, release });
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(ready)) {
+      if (Date.now() >= deadline) throw new Error('timed out waiting for first transaction readiness');
+      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 5));
+    }
     const lockPath = (await resolveValidatedCanonicalModeBinding(path)).leasePath;
-    const displacedToken = `99999999-${Date.now() - 10_000}-${'d'.repeat(24)}`;
-    await writeFile(join(lockPath, `owner-${BOOTSTRAP_OWNER_TOKEN}`), BOOTSTRAP_OWNER_TOKEN);
-    await writeFile(join(lockPath, `.owner-reclaim-${displacedToken}`), displacedToken);
-    const barrierDir = join(cwd, 'bootstrap-cleanup-barrier');
-    await mkdir(barrierDir);
-    process.env.OMX_TEST_MODE_BINDING_BOOTSTRAP_CLEANUP_BARRIER_DIR = barrierDir;
-
-    const contenders = [runTransactionProcess(path), runTransactionProcess(path)];
-    await waitForBootstrapCleanupBarrier(barrierDir, 2);
-    await writeFile(join(barrierDir, 'release'), 'go');
-    await Promise.all(contenders);
-
-    const evidence = (await readdir(barrierDir)).filter((entry) => entry.startsWith('enoent-'));
-    assert.ok(evidence.length >= 1, 'expected one contender to observe bootstrap unlink ENOENT');
+    const second = runTransactionProcess(path, { entered });
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, 150));
+    assert.equal(existsSync(entered), false);
+    const heldOwners = (await readdir(lockPath)).filter((entry) => entry.startsWith('owner-'));
+    assert.equal(heldOwners.length, 1);
+    await writeFile(release, 'release');
+    await Promise.all([first, second]);
+    assert.equal(existsSync(entered), true);
     assert.deepEqual(await readdir(lockPath), []);
   });
 

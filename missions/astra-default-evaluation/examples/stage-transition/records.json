@@ -1,0 +1,142 @@
+{
+  "evidence": "synthetic",
+  "records": [
+    {
+      "fixtureId": "executor-bounded-change",
+      "configId": "continue-pair",
+      "workflowId": "bounded-change-01",
+      "outcome": "pass",
+      "checks": [
+        {
+          "kind": "must-include",
+          "name": "reports-required-checks",
+          "passed": true
+        },
+        {
+          "kind": "must-not-include",
+          "name": "no-scope-inflation",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 250,
+      "usage": null,
+      "operatorMinutes": 2,
+      "difficult": false,
+      "usageScope": "stages",
+      "stages": [
+        {
+          "stageId": "planner",
+          "launchResolved": {
+            "model": "gpt-6-astra",
+            "reasoningEffort": "high",
+            "source": "synthetic launch receipt"
+          },
+          "usage": {
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "uncachedInputTokens": 80,
+            "cacheReadTokens": 20,
+            "cacheWriteTokens": "unsupported",
+            "source": "synthetic token counters"
+          },
+          "latencyMs": 100,
+          "runtimeObserved": {
+            "model": "gpt-6-astra",
+            "reasoningEffort": "high",
+            "source": "synthetic runtime receipt"
+          }
+        },
+        {
+          "stageId": "executor",
+          "launchResolved": {
+            "model": "gpt-6-astra",
+            "reasoningEffort": "high",
+            "source": "synthetic launch receipt"
+          },
+          "usage": {
+            "inputTokens": 200,
+            "outputTokens": 40,
+            "uncachedInputTokens": 200,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": "unsupported",
+            "source": "synthetic token counters"
+          },
+          "latencyMs": 200
+        }
+      ],
+      "notes": "Synthetic response-content pass; no fixture edits, commands or model execution occurred."
+    },
+    {
+      "fixtureId": "executor-bounded-change",
+      "configId": "split-pair",
+      "workflowId": "bounded-change-01",
+      "outcome": "pass",
+      "checks": [
+        {
+          "kind": "must-include",
+          "name": "reports-required-checks",
+          "passed": true
+        },
+        {
+          "kind": "must-not-include",
+          "name": "no-scope-inflation",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": false,
+      "retries": 1,
+      "latencyMs": 250,
+      "usage": null,
+      "operatorMinutes": 2,
+      "difficult": true,
+      "usageScope": "stages",
+      "stages": [
+        {
+          "stageId": "planner",
+          "launchResolved": {
+            "model": "gpt-6-astra",
+            "reasoningEffort": "high",
+            "source": "synthetic launch receipt"
+          },
+          "usage": {
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "uncachedInputTokens": 80,
+            "cacheReadTokens": 20,
+            "cacheWriteTokens": "unsupported",
+            "source": "synthetic token counters"
+          },
+          "latencyMs": 100,
+          "runtimeObserved": {
+            "model": "gpt-6-astra",
+            "reasoningEffort": "high",
+            "source": "synthetic runtime receipt"
+          }
+        },
+        {
+          "stageId": "executor",
+          "launchResolved": {
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "high",
+            "source": "synthetic explicit launch override (model and effort)"
+          },
+          "usage": {
+            "inputTokens": 200,
+            "outputTokens": 40,
+            "cacheReadTokens": 0,
+            "source": "synthetic partial token counters"
+          },
+          "latencyMs": 200,
+          "runtimeObserved": {
+            "model": "gpt-6-astra",
+            "reasoningEffort": null,
+            "source": "synthetic runtime receipt; effort unexposed"
+          }
+        }
+      ],
+      "notes": "Synthetic response-content pass; no fixture edits, commands or model execution occurred."
+    }
+  ]
+}

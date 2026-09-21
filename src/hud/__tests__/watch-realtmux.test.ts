@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { describe, it, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
+import { resolveSessionPointerContext } from "../../hooks/session.js";
 import {
 	buildPtyScriptCommand,
 	isRealTmuxAvailable,
@@ -15,6 +16,109 @@ import {
 
 const POLL_INTERVAL_MS = 50;
 const TEST_TIMEOUT_MS = 10_000;
+
+describe('owned HUD lifecycle on a private tmux server', () => {
+	for (const shutdown of ['owner', 'removed-pointer', 'closed-pane', 'dead-pane'] as const) {
+		it(`removes only its HUD, including remain-on-exit (${shutdown})`, async t => {
+			if (!skipUnlessRealTmux(t)) return;
+			const dir = await mkdtemp(join(tmpdir(), 'omx-hud-owner-'));
+			const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+			try {
+				await withTempTmuxSession({}, async fixture => {
+					const sibling = fixture.run(['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.leaderPaneId, 'sleep 60']);
+					const context = resolveSessionPointerContext(dir, { OMX_ROOT: dir });
+					await mkdir(context.baseStateDir, { recursive: true });
+					const pointer = context.sessionPath;
+					await writeFile(pointer, JSON.stringify({ session_id: 'owner-test', started_at: new Date().toISOString(), cwd: dir, pid: owner.pid, tmux_pane_id: fixture.leaderPaneId }));
+					const runner = join(dir, 'watch.mjs');
+					const ready = join(dir, 'ready');
+					await writeFile(runner, `
+const { runWatchMode } = await import(${JSON.stringify(new URL('../index.js', import.meta.url).href)});
+const { writeFile } = await import('node:fs/promises');
+await runWatchMode(${JSON.stringify(dir)}, { watch: true, json: false, tmux: false }, {
+  isTTY: true, isSessionAttachedFn: () => false,
+  readHudConfigFn: async () => ({ preset: 'focused' }),
+  readAllStateFn: async () => ({}), renderHudFn: () => 'OWNER_HUD',
+  listCurrentWindowPanesFn: () => [], resizeTmuxPaneFn: () => true,
+  clearTmuxPaneHistoryFn: () => true, registerHudResizeHookFn: () => true,
+  reconcileTmuxHudFn: async () => {},
+  runAuthorityTickFn: async () => { await writeFile(${JSON.stringify(ready)}, 'ready'); },
+});
+`);
+					const hud = fixture.run(['split-window', '-d', '-c', dir, '-P', '-F', '#{pane_id}', '-t', fixture.leaderPaneId,
+						`exec env OMX_ROOT=${quoteSh(dir)} OMX_STATE_ROOT= OMX_TEAM_STATE_ROOT= OMX_SESSION_ID=owner-test OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} ${quoteSh(process.execPath)} ${quoteSh(runner)}`]);
+					fixture.run(['set-option', '-p', '-t', hud, 'remain-on-exit', 'on']);
+					await waitForFile(ready);
+					if (shutdown === 'removed-pointer' || shutdown === 'closed-pane') await rm(pointer);
+					if (shutdown === 'closed-pane') {
+						fixture.run(['kill-pane', '-t', fixture.leaderPaneId]);
+					} else if (shutdown === 'dead-pane') {
+						fixture.run(['set-option', '-p', '-t', fixture.leaderPaneId, 'remain-on-exit', 'on']);
+						fixture.run(['respawn-pane', '-k', '-t', fixture.leaderPaneId, 'exit 0']);
+					} else {
+						const exited = new Promise<void>(resolve => owner.once('exit', () => resolve()));
+						owner.kill('SIGKILL');
+						await exited;
+					}
+					await waitForTmuxValue(fixture, ['list-panes', '-t', fixture.windowTarget, '-f', `#{==:#{pane_id},${hud}}`, '-F', '#{pane_id}'], '');
+					assert.equal(fixture.run(['display-message', '-p', '-t', sibling, '#{pane_dead}']), '0');
+					if (shutdown === 'closed-pane' || shutdown === 'dead-pane') {
+						assert.equal(owner.exitCode, null, 'pane closure must work even while launcher process survives');
+					} else {
+						assert.equal(fixture.run(['display-message', '-p', '-t', fixture.leaderPaneId, '#{pane_dead}']), '0');
+					}
+				});
+			} finally {
+				if (owner.exitCode === null && owner.signalCode === null) owner.kill('SIGKILL');
+				await rm(dir, { recursive: true, force: true });
+			}
+		});
+	}
+
+	it('keeps failed periodic reconciliation out of tmux pane output', async t => {
+		if (!skipUnlessRealTmux(t)) return;
+		const dir = await mkdtemp(join(tmpdir(), "omx-hud-reconcile ' "));
+		try {
+			await withTempTmuxSession({}, async fixture => {
+				const commandLog = join(dir, 'tmux-commands');
+				await fixture.createPathShim(dir, commandLog);
+				const entry = join(dir, 'omx.js');
+				const marker = join(dir, 'reconciled');
+				await writeFile(entry, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify({args:process.argv.slice(2), pane:process.env.TMUX_PANE, root:process.env.OMX_ROOT})); process.exit(1);`);
+				const runner = join(dir, 'watch.mjs');
+				await writeFile(runner, `
+const { runWatchMode } = await import(${JSON.stringify(new URL('../index.js', import.meta.url).href)});
+process.env.OMX_ENTRY_PATH = ${JSON.stringify(entry)};
+process.env.OMX_ROOT = ${JSON.stringify(dir)};
+process.env.PATH = ${JSON.stringify(dir + delimiter)} + process.env.PATH;
+const { execFileSync } = await import('node:child_process');
+execFileSync('tmux', ['display-message', '-p', '#{socket_path}']);
+await runWatchMode(${JSON.stringify(dir)}, { watch:true, json:false, tmux:false }, {
+  isTTY:true, isOwnerAliveFn: async () => true, isSessionAttachedFn: () => true,
+  readHudConfigFn:async () => ({preset:'focused'}), readAllStateFn:async () => ({}),
+  renderHudFn:() => 'QUIET_HUD', runAuthorityTickFn:async () => {},
+  listCurrentWindowPanesFn:() => [], resizeTmuxPaneFn:() => true,
+  clearTmuxPaneHistoryFn:() => true, registerHudResizeHookFn:() => true,
+});
+`);
+				const hud = fixture.run(['split-window', '-d', '-c', dir, '-P', '-F', '#{pane_id}', '-t', fixture.leaderPaneId,
+					`exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE=${quoteSh(fixture.leaderPaneId)} ${quoteSh(process.execPath)} ${quoteSh(runner)}`]);
+				await waitForFile(marker);
+				await new Promise(resolve => setTimeout(resolve, 1500));
+				assert.deepEqual(JSON.parse(await readFile(marker, 'utf8')), { args: ['hud', '--reconcile-tmux'], pane: fixture.leaderPaneId, root: dir });
+				for (const pane of [hud, fixture.leaderPaneId]) {
+					assert.doesNotMatch(fixture.run(['capture-pane', '-p', '-t', pane, '-S', '-']), /returned 1|reconcile-tmux|HUD watch render failed/);
+				}
+				// capture-pane does not include tmux's error overlay (view-mode).
+				const commands = await readFile(commandLog, 'utf8');
+				assert.match(commands, /display-message/);
+				assert.doesNotMatch(commands, /run-shell/);
+			});
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+});
 
 function skipUnlessRealTmux(t: TestContext): boolean {
 	if (isRealTmuxAvailable() && isRealScriptAvailable()) return true;

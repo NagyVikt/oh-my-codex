@@ -1,31 +1,33 @@
-# oh-my-codex 0.21.4
+# oh-my-codex 0.21.6
 
-`0.21.4` is a patch release for the frozen range `v0.21.3..b08eceeecc7a7379f041ceca51260f073d8a95bb` (3 commits, 35 changed files, +364/−195; PRs #3615/#3618/#3622).
+`0.21.6` is a maintenance and reliability release for the frozen range `v0.21.5..dev` (52 commits, 101 files, +4294/−707): tmux HUD lifecycle correctness, AGENTS scope fixes, auth/credential record hardening, Team dispatch and Windows startup robustness, a reusable default-model cost/quality evaluation suite, and dependency updates.
 
 ## Highlights
 
-- **Astra is the default across OMX agent tiers** — leaders, specialists, standard and fast agents, low-complexity workers, Team children, exact planning/research roles, new-agent configuration, subscription defaults, and SparkShell summaries now default to `gpt-6-astra` (#3622).
-- **Explicit choices remain authoritative** — existing model configuration, profiles, per-agent overrides, CLI/environment choices, provider-specific names, custom instructions, and reasoning-effort defaults are preserved (#3622).
-- **The agent catalog matches the packaged product** — only active/internal roles are presented as directly invocable, merged/deprecated replacements are documented, and workflow guidance is aligned with `$deep-interview` → `$ralplan` → `$ultragoal`; `$team` remains conditional parallel execution (#3618).
+- **Reusable default-model cost/quality evaluations:** a declarative suite for OMX's default model lineup with deterministic stage-transition records, supplied-record reporting, and explicitly documented declaration/validation limits (#3663, #3665, #3666, #3667), answering the evaluation request in issue #3655 without asserting unmeasured numbers.
+- **Self-terminating, leak-free tmux HUD:** stale Team leader panes are skipped during reconciliation, orphan watchers and noisy reconcile failures are gone, and the HUD closes when its tmux leader pane exits. Leader absence is decided from a validated server-wide pane snapshot, so a window move is never mistaken for an exit and a failed tmux query is never treated as evidence (#3660, #3683, #3685).
+- **AGENTS scope correctness:** durable AGENTS content is no longer duplicated into session instructions, and global AGENTS survive project-scoped launches (#3678, #3684).
 
-## Compatibility
+## Fixes and compatibility
 
-Patch release with no intentional breaking CLI or package-layout changes. Astra defaults apply only where no explicit model choice exists.
+- Hardened auth storage, TOML boundaries, PATH resolution, and stderr redaction (#3662); oversized stderr suppression no longer swallows the next record (#3676).
+- Windows `EPERM` fsync during Team startup is survivable (#3661); non-directory entries no longer break Team dispatch draining (#3680).
+- Notifications strip complete ANSI CSI sequences instead of leaving partial escapes (#3668).
+- Ordinary requests stay out of optional workflow machinery (#3648); confirmed unused internal exports were removed rather than aliased (#3649); remaining 0.21 capability-parity documentation gaps are closed (#3634).
+- Dependency updates: `zod` 4.6.2, `@biomejs/biome` 2.5.13, `@types/node` 26.5.1 (#3673, #3674, #3675).
 
-## Known gap
+## Validation evidence
 
-[#3623](https://github.com/Yeachan-Heo/oh-my-codex/issues/3623) remains open, separately owned, unmerged, and outside this release. OMX doctor/setup still use Codex CLI 0.153.4's removed `plugin_hooks` feature flag for plugin-hook inference and generated configuration, which can produce misleading diagnostics and obsolete config. Native `hooks/list` recognized the installed plugin hooks in the report, so a runtime hook outage has not been demonstrated.
+Exact frozen candidate `750fdd08ef6b902c8ac9bb4f48d440ead87f6d12` is fully green on `dev` CI (17 successful checks, 8 platform-skipped, 0 failures). Every external contribution in this range (#3660, #3668, #3683, #3684, #3685) was independently reproduced on a clean `origin/dev` base before merge, with post-merge `dev` CI re-verified after each merge.
+
+Full readiness evidence: `docs/qa/release-readiness-0.21.6.md`.
 
 ## Contributors
 
-Thanks to [@Yeachan-Heo](https://github.com/Yeachan-Heo) and [@ev78394](https://github.com/ev78394) for contributing to this release.
-
-## Frozen-range acknowledgements
-
-The product candidate is frozen at `dev@b08eceeecc7a7379f041ceca51260f073d8a95bb`. #3615 is release-train metadata rather than a product headline. Issue #3623 is explicitly excluded because it is unmerged and separately owned.
+Thanks to [@Yeachan-Heo](https://github.com/Yeachan-Heo), [@ev78394](https://github.com/ev78394), [@NagyVikt](https://github.com/NagyVikt), [@hiSandog](https://github.com/hiSandog), [@wangxingzhen](https://github.com/wangxingzhen), and [@Xrondev](https://github.com/Xrondev), with dependency updates from Dependabot.
 
 ## Inventory
 
-The reproducible range is recorded in `artifacts/release-0.21.4/inventory.md`.
+The reproducible range is recorded in `artifacts/release-0.21.6/inventory.md`.
 
-**Full Changelog**: [`v0.21.3...v0.21.4`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.3...v0.21.4)
+**Full Changelog**: [`v0.21.5...v0.21.6`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.5...v0.21.6)

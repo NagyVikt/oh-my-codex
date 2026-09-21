@@ -4,6 +4,55 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.6] - 2026-09-21
+
+### Highlights
+
+- Ship a reusable default-model cost/quality evaluation suite with deterministic stage-transition records, supplied-record reporting, and documented declaration/validation limits (#3663, #3665, #3666, #3667).
+- Make the tmux HUD lifecycle self-terminating and leak-free: skip stale Team leader panes during reconciliation, stop orphan watchers and noisy reconcile failures, and close the HUD when its tmux leader pane exits (#3660, #3683, #3685).
+- Correct AGENTS scope handling: stop duplicating durable AGENTS into session instructions and preserve global AGENTS in project-scoped launches (#3678, #3684).
+
+### Fixed
+
+- Harden auth storage, TOML boundaries, PATH resolution, and stderr redaction (#3662); stop oversized stderr suppression from eating the next record (#3676).
+- Survive Windows `EPERM` fsync during Team startup (#3661) and skip non-directory entries when draining Team dispatch (#3680).
+- Strip complete ANSI CSI sequences in notifications (#3668).
+
+### Maintenance
+
+- Keep ordinary requests out of optional workflow machinery (#3648) and remove confirmed unused internal exports without new machinery (#3649).
+- Close remaining 0.21 capability-parity documentation gaps (#3634).
+- Refresh dependency locks: `zod` 4.6.2, `@biomejs/biome` 2.5.13, `@types/node` 26.5.1 (#3673, #3674, #3675).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.6.md) and [release readiness](docs/qa/release-readiness-0.21.6.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.5...v0.21.6
+
+## [0.21.5] - 2026-09-10
+
+### Highlights
+
+- Show active Team identity and per-worker progress in the tmux HUD, preserving narrow layouts, selected runtime roots, leader space, and exact resize ownership (#3644).
+- Align plugin-hook diagnostics/setup/uninstall with current Codex capabilities; preserve explicit reasoning effort and verify the real packed hook lifecycle against Codex 0.153.4 (#3627, #3631, #3632, #3650).
+- Allow ordinary native implementation/reporting under inherited permissions and remove active guidance handoffs to retired workflows (#3637, #3647).
+
+### Fixed
+
+- Keep project runtime-home credentials ephemeral and export child-safe CODEX_HOME for Team workers (#3633).
+- Make Team startup preflight side-effect free and actionable (#3643); restore portable session recovery and hydrated native runtime lookup (#3638, #3639).
+- Respect TOML array-of-tables boundaries (#3645) and POSIX PATH edge cases in command discovery (#3644).
+- Fix a real bootstrap-sentinel ABA race in canonical mode-binding lease acquisition, found via post-merge concurrency stress testing; serialize the full lease lifecycle with a new descriptor-bound native OS advisory mutex (#3650, #3652).
+- Correct cross-platform dogfood fixtures without skipping adversarial identity, trust, or no-follow checks; preserve literal tmux receipt hashes and close retained fixture handles (#3650).
+
+### Maintenance
+
+- Refresh dependency locks (#3640, #3641, #3642), add MIT LICENSE, and measure maintenance growth without additional runtime machinery (#3646).
+- Reconcile published main documentation/history before freezing the new release range (#3651).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.5.md) and [release readiness](docs/qa/release-readiness-0.21.5.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.4...v0.21.5
+
 ## [0.21.4] - 2026-09-06
 
 Patch release for the frozen range `v0.21.3..b08eceeecc7a7379f041ceca51260f073d8a95bb` (3 commits, 35 changed files, +364/−195; PRs #3615/#3618/#3622).

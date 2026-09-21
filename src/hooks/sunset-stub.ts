@@ -55,6 +55,14 @@ export const REMOVED_SKILLS: Readonly<Record<string, RemovedSkillInfo>> = Object
     replacement: "$team",
     message: 'Skill "$ultrawork" has been removed. Use "$team" instead.',
   },
+  pipeline: {
+    replacement: "$plan",
+    message: 'Skill "$pipeline" has been removed. Use "$plan" for optional planning, "$team" for coordinated execution, or "$ultragoal" for durable goals instead.',
+  },
+  "autoresearch-goal": {
+    replacement: "$autoresearch",
+    message: 'Skill "$autoresearch-goal" has been removed. Use "$autoresearch" instead.',
+  },
   "ralph-init": {
     // Was "$ralph", which is a sunset stub in the catalog: another two-hop dead end.
     replacement: "$ultragoal",
@@ -116,18 +124,4 @@ export const REMOVED_SKILLS: Readonly<Record<string, RemovedSkillInfo>> = Object
 
 export function getRemovedSkillInfo(token: string): RemovedSkillInfo | undefined {
   return REMOVED_SKILLS[token.toLowerCase()];
-}
-
-export function isRemovedSkill(token: string): boolean {
-  return token.toLowerCase() in REMOVED_SKILLS;
-}
-
-export function formatRemovedSkillError(rawToken: string): string {
-  const normalized = rawToken.replace(/^\$(?:oh-my-codex:)?/i, "").toLowerCase();
-  const info = getRemovedSkillInfo(normalized);
-  if (!info) return `Skill "${rawToken}" has been removed.`;
-  return info.message.replace(/\$\S+/g, (m) => {
-    if (m.toLowerCase().includes(normalized)) return rawToken;
-    return m;
-  });
 }

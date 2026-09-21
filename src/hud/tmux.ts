@@ -1038,7 +1038,7 @@ function buildHudLayoutReconcileHookCommand(
     const success = `${buildHudHookSelfUnregister(layoutContext)} ; run-shell -b ${quoteHudHookShellArgument(nativeReconcile)}`;
     return buildAtomicHudHookCommand(tmuxBin, layoutContext, success, env.TMUX);
   }
-  const success = `${buildHudHookSelfUnregister(layoutContext)} ; run-shell -b ${quoteHudHookShellArgument(`${reconcile} >/dev/null 2>&1`)}`;
+  const success = `${buildHudHookSelfUnregister(layoutContext)} ; run-shell -b ${quoteHudHookShellArgument(`${reconcile} >/dev/null 2>&1 || true`)}`;
   return buildAtomicHudHookCommand(tmuxBin, layoutContext, success, env.TMUX);
 }
 
@@ -1433,8 +1433,6 @@ function readHudPaneIncarnation(paneId: string, execTmuxSync: TmuxExecSync): { p
     return null;
   }
 }
-
-
 function isPaneLiveInStrictGlobalProbe(paneId: string, expectedPid: string | undefined, execTmuxSync: TmuxExecSync): boolean {
   const incarnation = readHudPaneIncarnation(paneId, execTmuxSync);
   return Boolean(incarnation && !incarnation.paneDead && (!expectedPid || incarnation.panePid === expectedPid));

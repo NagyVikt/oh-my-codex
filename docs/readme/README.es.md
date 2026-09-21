@@ -14,7 +14,7 @@
 
 Capa de orquestación multiagente para [OpenAI Codex CLI](https://github.com/openai/codex).
 
-## Novedades en v0.9.0 — Spark Initiative
+## Notas históricas de la versión v0.9.0 — Spark Initiative
 
 Spark Initiative es la versión que refuerza la ruta nativa de exploración e inspección en OMX.
 
@@ -32,7 +32,7 @@ Dentro de Codex:
 ```text
 $deep-interview "clarify the auth change"
 $ralplan "approve the auth plan and review tradeoffs"
-$ralph "carry the approved plan to completion"
+$ultragoal "carry the approved plan to completion"
 $team 3:executor "execute the approved plan in parallel"
 ```
 
@@ -48,7 +48,7 @@ omx team shutdown <team-name>
 
 1. `$deep-interview` — cuando el alcance o los límites aún no están claros.
 2. `$ralplan` — para convertir ese alcance aclarado en un plan acordado de arquitectura e implementación.
-3. `$team` o `$ralph` — usa `$team` para ejecución paralela coordinada, o `$ralph` para un bucle persistente de finalización/verificación con un solo responsable.
+3. `$team` o `$ultragoal` — usa `$team` para ejecución paralela coordinada, o `$ultragoal` para mantener un registro duradero de objetivos hasta completar el trabajo.
 
 ## Modelo central
 
@@ -124,10 +124,10 @@ Cuando se establece, los valores de `workingDirectory` fuera de estas raíces so
 Por defecto, OMX inyecta:
 
 ```text
--c model_instructions_file="<cwd>/AGENTS.md"
+-c model_instructions_file="<cwd>/.omx/state/sessions/<session-id>/AGENTS.md"
 ```
 
-Esto combina el `AGENTS.md` de `CODEX_HOME` con el `AGENTS.md` del proyecto (si existe) y luego añade la superposición de runtime.
+Ese archivo generado contiene únicamente la superposición de runtime de OMX (`<!-- OMX:RUNTIME:START -->` a `<!-- OMX:RUNTIME:END -->`). La guía duradera de `CODEX_HOME/AGENTS.md` y de los `AGENTS.md` del proyecto no se copia ahí: Codex la carga una sola vez mediante su descubrimiento nativo de AGENTS. Los workers de Team siguen componiendo sus propias instrucciones.
 Extiende el comportamiento de Codex, pero no reemplaza ni elude las políticas centrales del sistema Codex.
 
 Controles:
@@ -193,7 +193,7 @@ Notas:
   - `model_reasoning_effort = "medium"`
   - `developer_instructions = "..."`
   - `[features] multi_agent = true, child_agents_md = true`
-  - Entradas de servidores MCP (`omx_state`, `omx_memory`, `omx_code_intel`, `omx_trace`, `omx_wiki`)
+  - Entradas de servidores MCP (`omx_state`, `omx_memory`, `omx_code_intel`, `omx_trace`, `omx_wiki` (servidor wiki del repositorio), `omx_hermes` (puente acotado de estado y coordinación de sesiones))
   - `[tui] status_line`
 - `AGENTS.md` específico del alcance
 - Directorios `.omx/` de ejecución y configuración de HUD
@@ -205,7 +205,7 @@ Notas:
 
 Ejemplos:
 - Agentes: `architect`, `planner`, `executor`, `debugger`, `verifier`, `security-reviewer`
-- Skills: `deep-interview`, `ralplan`, `team`, `ralph`, `plan`, `cancel`
+- Skills: `deep-interview`, `ralplan`, `team`, `ultragoal`, `plan`, `cancel`
 
 ## Estructura del proyecto
 
