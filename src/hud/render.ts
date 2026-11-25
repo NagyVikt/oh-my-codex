@@ -58,13 +58,18 @@ function renderGitBranch(ctx: HudRenderContext): string | null {
 
 const GUARDEX_SPINNER_FRAMES = ['◐', '◓', '◑', '◒'] as const;
 const GUARDEX_SPINNER_FRAME_MS = 400;
+const GUARDEX_WIDE_CI_COLUMNS = 72;
 
-function renderGuardexFinish(ctx: HudRenderContext): string | null {
+function renderGuardexFinish(ctx: HudRenderContext, maxWidth?: number): string | null {
   if (!ctx.guardexFinish?.active) return null;
   const { index, total, state } = ctx.guardexFinish;
   if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index <= 0 || total <= 0 || index > total) return null;
   const stage = sanitizeDynamicText(ctx.guardexFinish.stage).slice(0, 40);
   if (!stage) return null;
+  if (stage === 'ci' && state === 'running') {
+    const compact = maxWidth !== undefined && maxWidth > 0 && maxWidth < GUARDEX_WIDE_CI_COLUMNS;
+    return yellow(`gx:${index}/${total} ${compact ? 'CI: wait' : 'CI · waiting for GitHub checks'}`);
+  }
   const animates = state === 'running' && (stage === 'review' || stage === 'autofix');
   const frame = animates
     ? ` ${GUARDEX_SPINNER_FRAMES[Math.floor(Date.now() / GUARDEX_SPINNER_FRAME_MS) % GUARDEX_SPINNER_FRAMES.length]}`
@@ -375,7 +380,7 @@ function renderSessionDuration(ctx: HudRenderContext): string | null {
 // Preset Configurations
 // ============================================================================
 
-type ElementRenderer = (ctx: HudRenderContext) => string | null;
+type ElementRenderer = (ctx: HudRenderContext, maxWidth?: number) => string | null;
 
 const MINIMAL_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
@@ -571,7 +576,7 @@ export function renderHud(
     ? [renderExecutionSummary, ...elements.filter(fn => fn !== renderExecutionSummary)]
     : elements;
   const parts = orderedElements
-    .map(fn => fn(ctx))
+    .map(fn => fn(ctx, options.maxWidth))
     .filter((s): s is string => s !== null);
   const agents = ctx.nativeAgents ?? [];
   if (agents.length > 0) parts.splice(ctx.team?.active ? 1 : 0, 0, cyan(`agents:${agents.length}`));
