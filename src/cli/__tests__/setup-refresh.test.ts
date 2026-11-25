@@ -6,6 +6,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -14,14 +15,23 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { setup } from "../setup.js";
 import TOML from "@iarna/toml";
+import {
+  buildManagedCodexHookTrustState,
+  buildManagedCodexHooksConfig,
+  planManagedCodexHooksRemoval,
+} from "../../config/codex-hooks.js";
+import { upsertManagedCodexHookTrustState } from "../../config/generator.js";
 
 const TEST_CODEX_PROBES = {
+  installMode: "legacy",
   codexFeaturesProbe: () => null,
   codexVersionProbe: () => null,
 } satisfies Parameters<typeof setup>[0];
 
 const EXPECTED_PROJECT_GITIGNORE = [
   ".omx/",
+  ".omx-state-locks/",
+  ".omx-state-locks.identity.json",
   ".codex/*",
   "!.codex/agents/",
   "!.codex/agents/**",
@@ -33,6 +43,8 @@ const EXPECTED_PROJECT_GITIGNORE = [
 ].join("\n") + "\n";
 
 const EXPECTED_PROJECT_GITIGNORE_WITHOUT_OMX = [
+  ".omx-state-locks/",
+  ".omx-state-locks.identity.json",
   ".codex/*",
   "!.codex/agents/",
   "!.codex/agents/**",
@@ -146,7 +158,6 @@ describe("omx setup refresh summary and dry-run behavior", () => {
 
       for (const skillName of [
         "performance-goal",
-        "autoresearch-goal",
         "ultragoal",
       ]) {
         const skillPath = join(wd, ".codex", "skills", skillName, "SKILL.md");
@@ -175,9 +186,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       });
 
       for (const skillName of [
-        "autopilot",
-        "ralplan",
-        "ralph",
+        "plan",
         "ultragoal",
         "code-review",
         "ultraqa",
@@ -204,8 +213,8 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       assert.doesNotMatch(agents, /<team_(?:compositions|pipeline|model_resolution)>/);
       assert.doesNotMatch(agents, /\bTeam mode\b/);
       assert.doesNotMatch(agents, /\bteam-executor\b/);
-      assert.match(agents, /\$ralph/);
-      assert.match(agents, /autopilot/);
+      assert.match(agents, /\$ultragoal/);
+      assert.match(agents, /understand -> execute -> verify -> report/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -252,6 +261,8 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
       assert.equal(gitignore, `node_modules/\n${EXPECTED_PROJECT_GITIGNORE}`);
       assert.equal(gitignore.match(/^\.omx\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx-state-locks\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx-state-locks\.identity\.json$/gm)?.length ?? 0, 1);
       assert.equal(gitignore.match(/^\.codex\/\*$/gm)?.length ?? 0, 1);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -363,10 +374,13 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await writeFile(join(wd, ".gitignore"), ".omx/\n.codex/\n");
 
       await runSetupInTempDir(wd, { scope: "project" });
+      await runSetupInTempDir(wd, { scope: "project" });
 
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
       assert.equal(gitignore, EXPECTED_PROJECT_GITIGNORE);
       assert.equal(gitignore.match(/^\.codex\/$/gm)?.length ?? 0, 0);
+      assert.equal(gitignore.match(/^\.omx-state-locks\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx-state-locks\.identity\.json$/gm)?.length ?? 0, 1);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -402,7 +416,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
     }
   });
 
-  it("offers an upgrade from gpt-5.3-codex to gpt-5.6-sol when accepted", async () => {
+  it("offers an upgrade from gpt-5.3-codex to gpt-6.2-sol when accepted", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     try {
       await mkdir(join(wd, ".omx", "state"), { recursive: true });
@@ -425,14 +439,14 @@ describe("omx setup refresh summary and dry-run behavior", () => {
         modelUpgradePrompt: async (currentModel, targetModel) => {
           promptCalls += 1;
           assert.equal(currentModel, "gpt-5.3-codex");
-          assert.equal(targetModel, "gpt-5.6-sol");
+          assert.equal(targetModel, "gpt-6.2-sol");
           return true;
         },
       });
 
       const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
       assert.equal(promptCalls, 1);
-      assert.match(config, /^model = "gpt-5\.6-sol"$/m);
+      assert.match(config, /^model = "gpt-6.2-sol"$/m);
       assert.doesNotMatch(config, /^model = "gpt-5\.3-codex"$/m);
       assert.doesNotMatch(config, /^model_context_window = 250000$/m);
       assert.doesNotMatch(config, /^model_auto_compact_token_limit = 200000$/m);
@@ -442,7 +456,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
     }
   });
 
-  it("offers an upgrade from gpt-5.5 to gpt-5.6-sol when accepted", async () => {
+  it("offers an upgrade from gpt-5.5 to gpt-6.2-sol when accepted", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     try {
       await mkdir(join(wd, ".omx", "state"), { recursive: true });
@@ -453,13 +467,13 @@ describe("omx setup refresh summary and dry-run behavior", () => {
         scope: "project",
         modelUpgradePrompt: async (currentModel, targetModel) => {
           assert.equal(currentModel, "gpt-5.5");
-          assert.equal(targetModel, "gpt-5.6-sol");
+          assert.equal(targetModel, "gpt-6.2-sol");
           return true;
         },
       });
 
       const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
-      assert.match(config, /^model = "gpt-5\.6-sol"$/m);
+      assert.match(config, /^model = "gpt-6.2-sol"$/m);
       assert.doesNotMatch(config, /^model = "gpt-5\.5"$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -1154,7 +1168,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
         await writeFile(artifactPath, invalidBytes);
 
         await assert.rejects(
-          runSetupInTempDir(wd, { scope: "project", skipNativeAgentRefresh: true }),
+          runSetupInTempDir(wd, { scope: "project" }),
           /invalid UTF-8/,
         );
 
@@ -1166,6 +1180,83 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       } finally {
         await rm(wd, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("repairs repeated hook-trust banners without losing approved foreign trust (#3818)", async () => {
+    const wd = await realpath(await mkdtemp(join(tmpdir(), "omx-setup-hook-trust-markers-")));
+    try {
+      const codexDir = join(wd, ".codex");
+      const hooksPath = join(codexDir, "hooks.json");
+      const configPath = join(codexDir, "config.toml");
+      await mkdir(codexDir, { recursive: true });
+
+      const hooks = buildManagedCodexHooksConfig(wd, { codexHomeDir: codexDir });
+      hooks.hooks.PreToolUse[0]!.hooks.push({
+        type: "command",
+        command: "echo foreign",
+        timeout: 600,
+      });
+      const hooksContent = JSON.stringify(hooks, null, 2);
+      const removalPlan = planManagedCodexHooksRemoval(hooksContent, hooksPath, {
+        codexHomeDir: codexDir,
+      });
+      assert.equal(removalPlan.ok, true);
+      if (!removalPlan.ok) return;
+
+      const foreignKey = `${hooksPath}:pre_tool_use:0:1`;
+      const foreignHash = removalPlan.coordinateMoves.find(
+        (move) => move.oldKey === foreignKey,
+      )?.expectedTrustedHash;
+      assert.ok(foreignHash, "fixture must include Codex's expected foreign-hook hash");
+      const managedTrustState = buildManagedCodexHookTrustState(hooksPath, wd, {
+        codexHomeDir: codexDir,
+        hooksContent,
+      });
+      const startMarker = "# OMX-owned Codex hook trust state";
+      const endMarker = "# End OMX-owned Codex hook trust state";
+      const initialConfig = upsertManagedCodexHookTrustState(
+        'model = "gpt-5.6-sol"\n',
+        wd,
+        hooksPath,
+        { codexHomeDir: codexDir, managedTrustState },
+      );
+      const repeatedBanners = initialConfig.replace(
+        startMarker,
+        Array.from({ length: 8 }, () => startMarker).join("\n"),
+      );
+      const configWithForeignTrust = repeatedBanners.replace(
+        endMarker,
+        [
+          `[hooks.state.${JSON.stringify(foreignKey)}]`,
+          `trusted_hash = ${JSON.stringify(foreignHash)}`,
+          "",
+          endMarker,
+        ].join("\n"),
+      );
+      await writeFile(hooksPath, hooksContent);
+      await writeFile(configPath, configWithForeignTrust);
+
+      await runSetupInTempDir(wd, { scope: "project" });
+
+      const refreshed = await readFile(configPath, "utf-8");
+      const parsed = TOML.parse(refreshed) as {
+        hooks?: { state?: Record<string, { trusted_hash?: unknown }> };
+      };
+      assert.equal(parsed.hooks?.state?.[foreignKey]?.trusted_hash, foreignHash);
+      assert.equal(
+        (refreshed.match(/^# OMX-owned Codex hook trust state$/gm) ?? []).length,
+        1,
+      );
+      assert.equal(
+        (refreshed.match(/^# End OMX-owned Codex hook trust state$/gm) ?? []).length,
+        1,
+      );
+
+      await runSetupInTempDir(wd, { scope: "project" });
+      assert.equal(await readFile(configPath, "utf-8"), refreshed);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
     }
   });
 });

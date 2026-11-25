@@ -13,7 +13,6 @@ import {
   assertInstalledReasoningRuntimeContract,
   assertInstalledRootReasoningHelp,
   assertInstalledRootReasoningRejection,
-  assertInstalledTeamSkillContract,
   assertPackedInstallFileMetadata,
   assertPackedRegressionWorkflowState,
   buildNativeHookSmokePayload,
@@ -54,6 +53,8 @@ import {
   assertCodexBatchWriteResult,
   assertGeneratedTrustMatchesCodex,
   managedCodexHooksByEvent,
+  assertNativeHookAdvisoryPreToolUse,
+  listPersistedStateFiles,
 } from '../smoke-packed-install.js';
 import { parseNativeSubagentResultDisposition } from '../../leader/contract.js';
 
@@ -209,7 +210,7 @@ test('packed install smoke retains narrow boot commands and adds the isolated li
   );
 });
 
-test('packed 0.144.5 fixture is sanitized, pointer-free, and kept separate from the 0.142.5 lifecycle pin', () => {
+test('packed 0.144.5 fixture is sanitized, pointer-free, and kept separate from the 0.153.4 lifecycle pin', () => {
   assert.deepEqual(PACKED_CODEX_01445_NO_POINTER_NO_TRACKER_FIXTURE, {
     hook_event_name: 'PreToolUse',
     session_id: 'packed-01445-session',
@@ -414,11 +415,16 @@ test('packed lifecycle parses the pinned hooks/list eventName schema', () => {
       cwd: project,
       hooks: [{
         eventName: 'preToolUse',
+        handlerType: 'command',
         command: 'node hook.js',
         sourcePath: hooksPath,
         key: `${hooksPath}:pre_tool_use:0:0`,
         currentHash: 'sha256:current',
         displayOrder: 0,
+        enabled: true,
+        isManaged: false,
+        source: 'project',
+        timeoutSec: 0,
         trustStatus: 'trusted',
       }],
       warnings: [],
@@ -430,7 +436,7 @@ test('packed lifecycle parses the pinned hooks/list eventName schema', () => {
   assert.equal(parsed.hooks[0]?.trustStatus, 'trusted');
 });
 
-test('packed lifecycle normalizes omitted enabled handlers and rejects disabled or non-integer hook metadata', () => {
+test('packed lifecycle requires enabled command handlers and integer hook metadata', () => {
   const project = '/tmp/project';
   const hooksPath = '/tmp/project/.codex/hooks.json';
   const response = {
@@ -438,11 +444,16 @@ test('packed lifecycle normalizes omitted enabled handlers and rejects disabled 
       cwd: project,
       hooks: [{
         eventName: 'preToolUse',
+        handlerType: 'command',
         command: 'node hook.js',
         sourcePath: hooksPath,
         key: `${hooksPath}:pre_tool_use:0:0`,
         currentHash: 'sha256:current',
         displayOrder: 0,
+        enabled: true,
+        isManaged: false,
+        source: 'project',
+        timeoutSec: 0,
         trustStatus: 'trusted',
       }],
       warnings: [],
@@ -453,21 +464,62 @@ test('packed lifecycle normalizes omitted enabled handlers and rejects disabled 
 
   for (const update of [
     { enabled: false },
+    { enabled: undefined },
     { enabled: 'true' },
     { enabled: true, displayOrder: 0.5 },
     { enabled: true, displayOrder: -1 },
+    { handlerType: 'mcpTool' },
+    { handlerType: undefined },
+    { isManaged: 'false' },
+    { source: 'invalid' },
+    { timeoutSec: -1 },
+    { timeoutSec: 0.5 },
+    { timeoutSec: '10' },
+    { timeoutSec: Number.MAX_SAFE_INTEGER + 1 },
+    { eventName: 'toString' },
+    { eventName: 'unknownEvent' },
   ]) {
     const invalid = structuredClone(response);
     Object.assign(invalid.data[0]!.hooks[0]!, update);
     assert.throws(
       () => parseCodexHooksListResult(invalid, project, hooksPath),
-      /enabled command handler|invalid hooks\[0\]\.displayOrder/,
+      /enabled command handler|handlerType|not a command handler|invalid hooks\[0\]|unsupported/,
     );
+  }
+  for (const field of Object.keys(response.data[0]!.hooks[0]!)) {
+    const invalid = structuredClone(response);
+    delete (invalid.data[0]!.hooks[0]! as Record<string, unknown>)[field];
+    assert.throws(() => parseCodexHooksListResult(invalid, project, hooksPath), `missing ${field} must fail closed`);
+  }
+  for (const field of ['hooks', 'warnings', 'errors']) {
+    const invalid = structuredClone(response);
+    delete (invalid.data[0]! as Record<string, unknown>)[field];
+    assert.throws(() => parseCodexHooksListResult(invalid, project, hooksPath), `missing ${field} must fail closed`);
+  }
+  for (const eventName of ['sessionEnd', 'interrupt']) {
+    const valid = structuredClone(response);
+    valid.data[0]!.hooks[0]!.eventName = eventName;
+    assert.doesNotThrow(() => parseCodexHooksListResult(valid, project, hooksPath));
+  }
+  for (const isManaged of [true, false]) {
+    const valid = structuredClone(response);
+    valid.data[0]!.hooks[0]!.isManaged = isManaged;
+    valid.data[0]!.hooks[0]!.timeoutSec = Number.MAX_SAFE_INTEGER;
+    assert.doesNotThrow(() => parseCodexHooksListResult(valid, project, hooksPath));
+  }
+  for (const source of [
+    'system', 'user', 'project', 'mdm', 'sessionFlags', 'plugin',
+    'cloudRequirements', 'cloudManagedConfig', 'legacyManagedConfigFile',
+    'legacyManagedConfigMdm', 'unknown',
+  ]) {
+    const valid = structuredClone(response);
+    valid.data[0]!.hooks[0]!.source = source;
+    assert.doesNotThrow(() => parseCodexHooksListResult(valid, project, hooksPath), `${source} is a valid hook source`);
   }
 });
 
 
-test('packed lifecycle requires exactly seven generated OMX trust keys and an isolated approval target', () => {
+test('packed lifecycle requires exactly the current OMX trust keys and an isolated approval target', () => {
   const hooks = MANAGED_CODEX_HOOK_EVENTS.map((event, index) => ({
     event,
     command: 'node /tmp/omx/dist/scripts/codex-native-hook.js',
@@ -484,11 +536,11 @@ test('packed lifecycle requires exactly seven generated OMX trust keys and an is
       ...trust,
       '/tmp/project/.codex/hooks.json:foreign:0:0': 'sha256:foreign',
     }, hooks),
-    /exactly the 7 current OMX hooks with no stale keys/,
+    /exactly the \d+ current OMX hooks with no stale keys/,
   );
   assert.throws(
     () => assertGeneratedTrustMatchesCodex(Object.fromEntries(Object.entries(trust).slice(0, -1)), hooks),
-    /exactly the 7 current OMX hooks with no stale keys/,
+    /exactly the \d+ current OMX hooks with no stale keys/,
   );
   assert.doesNotThrow(() => assertCodexBatchWriteResult({
     filePath: '/tmp/isolated-codex-home/config.toml',
@@ -539,7 +591,7 @@ test('packed lifecycle fails closed on malformed project hooks.state entries and
   const staleRawTrust = generatedHookTrustState(`${validConfig}\nforeign = { trusted_hash = "sha256:foreign" }`);
   assert.throws(
     () => assertGeneratedTrustMatchesCodex(staleRawTrust, hooks),
-    /exactly the 7 current OMX hooks with no stale keys/,
+    /exactly the \d+ current OMX hooks with no stale keys/,
   );
 
   const protoRawTrust = generatedHookTrustState(
@@ -548,7 +600,7 @@ test('packed lifecycle fails closed on malformed project hooks.state entries and
   assert.equal(Object.hasOwn(protoRawTrust, '__proto__'), true);
   assert.throws(
     () => assertGeneratedTrustMatchesCodex(protoRawTrust, hooks),
-    /exactly the 7 current OMX hooks with no stale keys/,
+    /exactly the \d+ current OMX hooks with no stale keys/,
   );
 });
 test('packed lifecycle treats only the production command grammar as managed ownership', () => {
@@ -598,7 +650,7 @@ test('packed lifecycle resolves Windows npm shims through safe command specs for
         platform: 'win32' as const,
         spawnSyncImpl: ((command: string, args: string[], options: Record<string, unknown>) => {
           versionSpawns.push({ command, args, options });
-          return { status: 0, stdout: 'codex-cli 0.142.5\n', stderr: '', error: undefined };
+          return { status: 0, stdout: 'codex-cli 0.153.4\n', stderr: '', error: undefined };
         }) as never,
         spawnImpl: ((command: string, args: string[], options: Record<string, unknown>) => {
           appSpawns.push({ command, args, options });
@@ -607,7 +659,7 @@ test('packed lifecycle resolves Windows npm shims through safe command specs for
       };
       const env = { PATH: bin, PATHEXT: extension.toUpperCase() };
 
-      assert.equal(probeCodexVersion(root, env, seam), 'codex-cli 0.142.5');
+      assert.equal(probeCodexVersion(root, env, seam), 'codex-cli 0.153.4');
       const server = await CodexAppServer.start({ cwd: root, env, commandSeam: seam });
       await server.close();
 
@@ -700,13 +752,13 @@ test('packed lifecycle bypasses an unrelated codex binary shadowing the pinned C
     const pinned = join(pinnedDir, 'codex');
     await Promise.all([
       writeFile(shadow, '#!/bin/sh\necho "codex 0.2.3"\n'),
-      writeFile(pinned, '#!/bin/sh\necho "codex-cli 0.142.5"\n'),
+      writeFile(pinned, '#!/bin/sh\necho "codex-cli 0.153.4"\n'),
     ]);
     await Promise.all([chmod(shadow, 0o755), chmod(pinned, 0o755)]);
 
     assert.equal(
       probeCodexVersion(root, { PATH: `${shadowDir}${delimiter}${pinnedDir}` }),
-      'codex-cli 0.142.5',
+      'codex-cli 0.153.4',
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -725,7 +777,7 @@ test('packed lifecycle deduplicates repeated PATH entries before enforcing the c
     ]);
     await Promise.all([
       writeFile(join(shadowDir, 'codex'), '#!/bin/sh\necho "codex 0.2.3"\n'),
-      writeFile(join(pinnedDir, 'codex'), '#!/bin/sh\necho "codex-cli 0.142.5"\n'),
+      writeFile(join(pinnedDir, 'codex'), '#!/bin/sh\necho "codex-cli 0.153.4"\n'),
     ]);
     await Promise.all([
       chmod(join(shadowDir, 'codex'), 0o755),
@@ -736,7 +788,7 @@ test('packed lifecycle deduplicates repeated PATH entries before enforcing the c
       probeCodexVersion(root, {
         PATH: [...Array.from({ length: 40 }, () => shadowDir), pinnedDir].join(delimiter),
       }),
-      'codex-cli 0.142.5',
+      'codex-cli 0.153.4',
     );
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -749,15 +801,16 @@ test('packed lifecycle accepts only the exact stable pinned Codex version output
   const candidateDir = join(root, 'candidate');
   const executable = join(candidateDir, 'codex');
   const candidates = [
-    { output: 'codex-cli 0.142.5', stderr: '', accepted: true },
-    { output: 'codex-cli 0.142.5', stderr: 'warning: harmless test diagnostic', accepted: true },
-    { output: 'codex-cli 0.142.5\nextra output', stderr: '', accepted: false },
-    { output: 'codex-cli 0.142.5-beta', stderr: '', accepted: false },
-    { output: 'codex-cli 0.142.5+meta', stderr: '', accepted: false },
-    { output: 'codex-cli 0.142.5.1', stderr: '', accepted: false },
-    { output: 'codex-cli v0.142.5', stderr: '', accepted: false },
+    { output: 'codex-cli 0.153.4', stderr: '', accepted: true },
+    { output: 'codex-cli 0.153.4', stderr: 'warning: harmless test diagnostic', accepted: true },
+    { output: 'codex-cli 0.153.4\nextra output', stderr: '', accepted: false },
+    { output: 'codex-cli 0.153.4-beta', stderr: '', accepted: false },
+    { output: 'codex-cli 0.153.4+meta', stderr: '', accepted: false },
+    { output: 'codex-cli 0.153.4.1', stderr: '', accepted: false },
+    { output: 'codex-cli v0.153.4', stderr: '', accepted: false },
+    { output: 'codex-cli 0.142.5', stderr: '', accepted: false },
     { output: 'codex-cli 0-142-5', stderr: '', accepted: false },
-    { output: 'codex-cli 0.142.5', stderr: 'unexpected version probe error', accepted: false },
+    { output: 'codex-cli 0.153.4', stderr: 'unexpected version probe error', accepted: false },
   ];
   try {
     await mkdir(candidateDir, { recursive: true });
@@ -768,11 +821,11 @@ test('packed lifecycle accepts only the exact stable pinned Codex version output
       );
       await chmod(executable, 0o755);
       if (candidate.accepted) {
-        assert.equal(probeCodexVersion(root, { PATH: candidateDir }), 'codex-cli 0.142.5');
+        assert.equal(probeCodexVersion(root, { PATH: candidateDir }), 'codex-cli 0.153.4');
       } else {
         assert.throws(
           () => probeCodexVersion(root, { PATH: candidateDir }),
-          /Unsupported installed Codex version for the 0\.142\.5 boundary/,
+          /Unsupported installed Codex version for the 0\.153\.4 boundary/,
         );
       }
     }
@@ -902,12 +955,12 @@ test('packed lifecycle continues after a timed-out version probe candidate', asy
     await Promise.all([mkdir(slowDir, { recursive: true }), mkdir(pinnedDir, { recursive: true })]);
     await Promise.all([
       writeFile(join(slowDir, 'codex'), '#!/bin/sh\nexec /bin/sleep 30\n'),
-      writeFile(join(pinnedDir, 'codex'), '#!/bin/sh\nprintf \'%s\\n\' \'codex-cli 0.142.5\'\n'),
+      writeFile(join(pinnedDir, 'codex'), '#!/bin/sh\nprintf \'%s\\n\' \'codex-cli 0.153.4\'\n'),
     ]);
     await Promise.all([chmod(join(slowDir, 'codex'), 0o755), chmod(join(pinnedDir, 'codex'), 0o755)]);
 
     const startedAt = Date.now();
-    assert.equal(probeCodexVersion(root, { PATH: `${slowDir}${delimiter}${pinnedDir}` }), 'codex-cli 0.142.5');
+    assert.equal(probeCodexVersion(root, { PATH: `${slowDir}${delimiter}${pinnedDir}` }), 'codex-cli 0.153.4');
     assert.ok(Date.now() - startedAt < 5_000, 'a timed-out candidate must not block later PATH candidates');
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -926,14 +979,14 @@ test('packed lifecycle fails instead of skipping when Codex disappears after sta
       'state="${0}.version-count"',
       'if [ "$1" = "--version" ]; then',
       '  if [ -f "$state" ]; then /bin/rm -f "$0"; else : > "$state"; fi',
-      '  printf \'%s\\n\' \'codex-cli 0.142.5\'',
+      '  printf \'%s\\n\' \'codex-cli 0.153.4\'',
       '  exit 0',
       'fi',
       'exit 1',
       '',
     ].join('\n'));
     await chmod(executable, 0o755);
-    assert.equal(probeCodexVersion(root, { PATH: candidateDir }), 'codex-cli 0.142.5');
+    assert.equal(probeCodexVersion(root, { PATH: candidateDir }), 'codex-cli 0.153.4');
 
     await assert.rejects(
       CodexAppServer.start({ cwd: root, env: { PATH: candidateDir } }),
@@ -1025,6 +1078,8 @@ test('packed install smoke covers every installed native hook event with minimal
     'UserPromptSubmit',
     'PreCompact',
     'PostCompact',
+    'SubagentStart',
+    'SubagentStop',
     'Stop',
   ]);
 
@@ -1107,7 +1162,7 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'compact-explicit-negation', prompt: '$ralplan,$autopilot are prohibited', expectedSkill: null, expectedStopBlock: false },
     { name: 'compact-implicit-negation', prompt: 'Autopilot mode،deep interview are prohibited.', expectedSkill: null, expectedStopBlock: false },
     { name: 'doc-clause-local-prefix', prompt: '$ralplan; $autopilot is documented in the guide.', expectedSkill: 'ralplan', expectedStopBlock: true },
-    { name: 'doc-chain-described', prompt: 'use $ralplan is the workflow command; autopilot mode is documented in the guide; $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
+    { name: 'doc-chain-described', prompt: 'use $ralplan is the workflow command; autopilot mode is documented in the guide; $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
     { name: 'doc-chain-workflow', prompt: 'use $ralplan is the workflow command; autopilot mode is workflow documentation; use $ralph execute it', expectedSkill: 'ralph', expectedStopBlock: true },
     { name: 'ref-inline-explicit', prompt: '[docs]: $ralplan\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'ref-inline-prompts', prompt: '[docs]: /prompts:architect\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
@@ -1133,10 +1188,10 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'neg-fw-dot-reopen', prompt: 'Do not run $ralplan． use $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'neg-greek-q-reopen', prompt: 'Do not run $ralplan; use $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'unicode-attached-contrast', prompt: 'Do not use deep interview яbut use autopilot mode.', expectedSkill: null, expectedStopBlock: false },
-    { name: 'prefix-list-followup', prompt: 'Do not run $ralplan, $autopilot; use $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
+    { name: 'prefix-list-followup', prompt: 'Do not run $ralplan, $autopilot; use $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
     { name: 'mixed-postposed-chain', prompt: '$ralplan, autopilot mode, $team are prohibited.', expectedSkill: null, expectedStopBlock: false },
-    { name: 'implicit-first-doc-chain', prompt: 'Autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
-    { name: 'both-mixed-doc-followup', prompt: 'Both autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
+    { name: 'implicit-first-doc-chain', prompt: 'Autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
+    { name: 'both-mixed-doc-followup', prompt: 'Both autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
     { name: 'doc-semicolon-preserves-earlier', prompt: 'Use autopilot mode; use $ralplan is the workflow command.', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'doc-independent-comma', prompt: 'Use autopilot mode, and $ralplan is documented in the guide.', expectedSkill: 'autopilot', expectedStopBlock: true },
     { name: 'reference-unclosed-quote-destination', prompt: '[docs]: "target\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
@@ -1184,37 +1239,46 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'percent-suffix', prompt: '$ralplan%docs', expectedSkill: null, expectedStopBlock: false },
     { name: 'fullwidth-percent-suffix', prompt: '$ralplan％docs', expectedSkill: null, expectedStopBlock: false },
     { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
-    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: [] },
+    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
     { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
     { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
     { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   ]);
 });
 
-test('packed regression workflow expectations distinguish active activation from receipt-unavailable Autopilot termination', () => {
+test('packed regression workflow expectations require active supported skills and failed retired ralph receipts', () => {
   assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
     { name: 'active-ralplan', expectedSkill: 'ralplan' },
     { active: true, skill: 'ralplan' },
   ));
   assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
+    { name: 'active-autopilot', expectedSkill: 'autopilot' },
+    { active: true, skill: 'autopilot', phase: 'deep-interview', active_skills: [{ skill: 'autopilot' }] },
+  ));
+  assert.throws(() => assertPackedRegressionWorkflowState(
     { name: 'failed-autopilot', expectedSkill: 'autopilot' },
+    { active: false, skill: 'autopilot', phase: 'failed', active_skills: [] },
+  ), /persisted unexpected workflow state/);
+  assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
+    { name: 'retired-ralph', expectedSkill: 'ralph' },
     {
       active: false,
-      skill: 'autopilot',
+      skill: 'ralph',
       phase: 'failed',
-      error: 'documented_host_consensus_receipt_unavailable',
+      transition_error: 'Skill "$ralph" has been removed. Use "$ultragoal" instead. The `omx ralph` CLI and ralph persistence runtime are unaffected.',
       active_skills: [],
     },
   ));
   assert.throws(() => assertPackedRegressionWorkflowState(
-    { name: 'stale-active-autopilot', expectedSkill: 'autopilot' },
-    { active: true, skill: 'autopilot', phase: 'running', active_skills: [{ skill: 'autopilot' }] },
-  ), /persisted unexpected workflow state/);
+    { name: 'active-retired-ralph', expectedSkill: 'ralph' },
+    { active: true, skill: 'ralph', phase: 'executing' },
+  ), /unexpected retired ralph state/);
 });
 
-test('packed regression Stop expectations release terminal receipt-unavailable Autopilot state', () => {
+test('packed regression Stop expectations keep active workflows blocked but retired ralph terminal', () => {
   assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'ralplan', expectedStopBlock: true }), true);
-  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'autopilot', expectedStopBlock: true }), false);
+  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'autopilot', expectedStopBlock: true }), true);
+  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'ralph', expectedStopBlock: true }), false);
 });
 
 test('packed regression environment clears inherited Team routing state', () => {
@@ -1258,7 +1322,7 @@ test('packed install native hook stdout validation allows empty or JSON output o
     /native hook UserPromptSubmit emitted invalid JSON stdout/,
   );
 });
-test('packed lifecycle and native hook smoke share the seven managed event names', () => {
+test('packed lifecycle and native hook smoke share the managed event names', () => {
   assert.deepEqual(MANAGED_CODEX_HOOK_EVENTS, PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS);
 });
 
@@ -1451,14 +1515,30 @@ test('packed install removes same-user native-anchor authentication', async () =
   const hookSource = await readFile(join(process.cwd(), 'src/scripts/codex-native-hook.ts'), 'utf8');
   const cliSource = await readFile(join(process.cwd(), 'src/cli/index.ts'), 'utf8');
   assert.doesNotMatch(hookSource, /isVerifiedPluginLauncherClaim|classifyNativeTranscriptProvenance|signNativeLeaderAttestation|native-anchor-auth/);
-  assert.match(hookSource, /unsupported_documented_leader_proof/);
+  assert.match(hookSource, /#3497|advisory-only|sanitizeNativeHookOutput|capability-warnings/);
+  assert.doesNotMatch(hookSource, /if \(denial\) return \{ hookEventName, omxEventName, skillState: null, outputJson: denial \}/);
   assert.match(cliSource, /execWithOverlay[\s\S]+OMX_CODEX_LAUNCH_ID[\s\S]+buildHudRuntimeEnv\(\{ sessionId/);
 });
 
-test('packed install contract requires canonical/plugin Team skill parity and text', async () => {
-  const canonical = await readFile(join(process.cwd(), 'skills/team/SKILL.md'));
-  const pluginMirror = await readFile(join(process.cwd(), 'plugins/oh-my-codex/skills/team/SKILL.md'));
-  assert.doesNotThrow(() => assertInstalledTeamSkillContract(canonical, pluginMirror));
+test('packed install contract requires canonical/plugin Ultragoal skill parity and operational anchors', async () => {
+  const canonical = await readFile(join(process.cwd(), 'skills/ultragoal/SKILL.md'), 'utf8');
+  const pluginMirror = await readFile(join(process.cwd(), 'plugins/oh-my-codex/skills/ultragoal/SKILL.md'), 'utf8');
+
+  assert.equal(canonical, pluginMirror, 'canonical and plugin Ultragoal skills must be byte-identical');
+  assert.ok(canonical.split(/\r?\n/).length <= 120, 'installed Ultragoal skill must remain a concise task card');
+  for (const anchor of [
+    '.omx/ultragoal/goals.json',
+    '.omx/ultragoal/ledger.jsonl',
+    'get_goal',
+    'checkpoint',
+    '--codex-goal-json',
+    'omx ultragoal steer',
+    'add_subgoal',
+    'Optional Team bridge',
+    'fresh `get_goal` snapshot',
+  ]) {
+    assert.match(canonical, new RegExp(anchor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
 });
 
 test('packed install plugin assertions enforce the packaged plugin contract', async () => {
@@ -1682,6 +1762,102 @@ test('ensureRepoDependencies falls back to npm ci when no reusable node_modules 
 
     assert.equal(result.strategy, 'installed');
     assert.deepEqual(installs, [root]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test('assertNativeHookAdvisoryPreToolUse accepts the two documented advisory shapes', () => {
+  // Empty no-op: the hook intentionally produced no advisory content (#3497).
+  assertNativeHookAdvisoryPreToolUse('advisory-empty', {});
+
+  // Documented advisory context with the PreToolUse event name.
+  assertNativeHookAdvisoryPreToolUse('advisory-context', {
+    systemMessage: 'advisory guidance',
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      additionalContext: 'advisory guidance',
+    },
+  });
+
+  // systemMessage alone, without a hookSpecificOutput envelope, is also advisory.
+  assertNativeHookAdvisoryPreToolUse('advisory-system-message', { systemMessage: 'guidance only' });
+});
+
+test('assertNativeHookAdvisoryPreToolUse rejects outputs that would hide a regression', () => {
+  const rejections: Array<[string, Record<string, unknown>, RegExp]> = [
+    ['hard block', { decision: 'block', reason: 'nope' }, /hard block/],
+    ['stopped continuation', { continue: false }, /stopped continuation/],
+    ['stopReason', { stopReason: 'native_hook_stdin_parse_error' }, /emitted stopReason/],
+    ['permission deny', {
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' },
+    }, /permissionDecision "deny"/],
+    ['permission allow', {
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+    }, /permissionDecision "allow"/],
+    ['wrong event name', {
+      systemMessage: 'x',
+      hookSpecificOutput: { hookEventName: 'Stop', additionalContext: 'x' },
+    }, /hookSpecificOutput names "Stop"/],
+    ['non-string system message', { systemMessage: 1 }, /malformed systemMessage/],
+    ['empty system message', { systemMessage: '' }, /malformed systemMessage/],
+    ['empty envelope', { hookSpecificOutput: {} }, /malformed PreToolUse advisory envelope/],
+    ['system message plus empty envelope', {
+      systemMessage: 'x',
+      hookSpecificOutput: {},
+    }, /malformed PreToolUse advisory envelope/],
+    ['envelope without event name', {
+      systemMessage: 'x',
+      hookSpecificOutput: { additionalContext: 'x' },
+    }, /malformed PreToolUse advisory envelope/],
+    ['envelope without context', {
+      systemMessage: 'x',
+      hookSpecificOutput: { hookEventName: 'PreToolUse' },
+    }, /malformed PreToolUse advisory envelope/],
+    ['mismatched envelope content', {
+      systemMessage: 'x',
+      hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: 'y' },
+    }, /does not mirror systemMessage/],
+    ['unexpected top-level field', { systemMessage: 'x', reason: 'stray' }, /unexpected top-level field "reason"/],
+    ['unexpected hook field', {
+      systemMessage: 'x',
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecisionReason: 'stray' },
+    }, /emitted unexpected field "permissionDecisionReason"/],
+    ['malformed hookSpecificOutput', { hookSpecificOutput: 'nope' }, /malformed hookSpecificOutput/],
+    ['array hookSpecificOutput', { hookSpecificOutput: [] }, /malformed hookSpecificOutput/],
+  ];
+  for (const [label, output, pattern] of rejections) {
+    assert.throws(
+      () => assertNativeHookAdvisoryPreToolUse(`probe-${label}`, output),
+      pattern,
+      `${label} must be rejected`,
+    );
+  }
+});
+
+test('listPersistedStateFiles permits empty state directory bootstrap but detects persisted artifacts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'omx-packed-state-artifacts-'));
+  try {
+    const stateRoot = join(root, '.omx', 'state');
+    await mkdir(join(stateRoot, 'sessions', 'nested'), { recursive: true });
+    assert.deepEqual(listPersistedStateFiles(stateRoot), []);
+
+    const persistedFile = join(stateRoot, 'sessions', 'nested', 'skill-active-state.json');
+    await writeFile(persistedFile, '{}\n');
+    assert.deepEqual(listPersistedStateFiles(stateRoot), [persistedFile]);
+    await rm(persistedFile);
+
+    const symlinkPath = join(stateRoot, 'sessions', 'state-link');
+    await symlink(join(root, 'missing-target'), symlinkPath);
+    assert.deepEqual(listPersistedStateFiles(stateRoot), [symlinkPath]);
+    await rm(symlinkPath);
+
+    const rootLink = join(root, 'state-link');
+    await symlink(stateRoot, rootLink);
+    assert.deepEqual(listPersistedStateFiles(rootLink), [rootLink]);
+
+    const rootFile = join(root, 'state-file');
+    await writeFile(rootFile, '{}\n');
+    assert.deepEqual(listPersistedStateFiles(rootFile), [rootFile]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

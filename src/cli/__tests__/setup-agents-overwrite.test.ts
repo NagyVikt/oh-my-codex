@@ -180,6 +180,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         addGeneratedAgentsMarker(template),
         {
           frontierModel: 'legacy-frontier',
+          frontierAgentModel: 'legacy-frontier',
           sparkModel: 'legacy-spark',
           subagentDefaultModel: 'legacy-frontier',
         },
@@ -200,15 +201,15 @@ describe('omx setup AGENTS refresh behavior', () => {
       assert.doesNotMatch(output, /Skipped AGENTS\.md overwrite/);
       assert.match(
         agentsContent,
-        new RegExp(`\\| Frontier \\(leader\\) \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
+        new RegExp(`\\| Leader\\/main session \\| config\\.toml root \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
       );
       assert.match(
         agentsContent,
-        new RegExp(`\\| Spark \\(explorer\\/fast\\) \\| \`${expectedContext.sparkModel}\` \\| low \\|`),
+        new RegExp(`\\| \`explore\` \\| spark \\| \`${expectedContext.sparkModel}\` \\| medium \\|`),
       );
       assert.match(
         agentsContent,
-        new RegExp(String.raw`\| \`executor\` \| \`${expectedContext.frontierModel}\` \| medium \| Code implementation, refactoring, feature work`),
+        new RegExp(String.raw`\| \`executor\` \| standard \| \`${expectedContext.subagentDefaultModel}\` \| medium \| Code implementation, refactoring, feature work`),
       );
       assert.doesNotMatch(agentsContent, /legacy-frontier/);
       assert.doesNotMatch(agentsContent, /legacy-spark/);
@@ -231,6 +232,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         addGeneratedAgentsMarker(template),
         {
           frontierModel: 'stale-frontier',
+          frontierAgentModel: 'stale-frontier',
           sparkModel: 'stale-spark',
           subagentDefaultModel: 'stale-frontier',
         },
@@ -254,11 +256,11 @@ describe('omx setup AGENTS refresh behavior', () => {
       assert.equal(countOccurrences(agentsContent, OMX_MANAGED_AGENTS_END_MARKER), 0);
       assert.match(
         agentsContent,
-        new RegExp(`\\| Frontier \\(leader\\) \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
+        new RegExp(`\\| Leader\\/main session \\| config\\.toml root \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
       );
       assert.match(
         agentsContent,
-        new RegExp(`\\| Spark \\(explorer\\/fast\\) \\| \`${expectedContext.sparkModel}\` \\| low \\|`),
+        new RegExp(`\\| \`explore\` \\| spark \\| \`${expectedContext.sparkModel}\` \\| medium \\|`),
       );
       assert.doesNotMatch(agentsContent, /stale-frontier/);
       assert.doesNotMatch(agentsContent, /stale-spark/);
@@ -286,7 +288,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         '',
         '| Role | Model | Reasoning Effort | Use Case |',
         '| --- | --- | --- | --- |',
-        '| Frontier (leader) | `legacy-frontier` | high | stale |',
+        '| Leader/main session | config.toml root | `legacy-frontier` | high | stale |',
         '<!-- OMX:MODELS:END -->',
         '',
         'Footer guidance stays user-owned.',
@@ -308,7 +310,7 @@ describe('omx setup AGENTS refresh behavior', () => {
       assert.match(agentsContent, /Footer guidance stays user-owned\./);
       assert.match(
         agentsContent,
-        new RegExp(`\\| Frontier \\(leader\\) \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
+        new RegExp(`\\| Leader\\/main session \\| config\\.toml root \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
       );
       assert.doesNotMatch(agentsContent, /legacy-frontier/);
       assert.doesNotMatch(agentsContent, /<!-- omx:generated:agents-md -->/);
@@ -752,6 +754,65 @@ describe('omx setup AGENTS refresh behavior', () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+  it('refreshes stale Conductor denial prose through the owner path and stays idempotent (#3635)', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-setup-agents-'));
+    const restoreTty = setMockTty(false);
+    const home = join(wd, 'home');
+    const restoreHome = setMockHome(home);
+    const template = readFileSync(join(process.cwd(), 'templates', 'AGENTS.md'), 'utf-8');
+    const staleDenial = /native children are verification\/advice-only/i;
+    const reachableWording =
+      /may implement, mutate, and report bounded delegated work directly/i;
+    const staleProofRequirement =
+      /separate host-authenticated caller, parent, and target proof/i;
+    try {
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+
+      // Pre-#3635 generated output denied ordinary native implementation/reporting (issue #3635).
+      const staleGenerated = addGeneratedAgentsMarker(template).replace(
+        'Under ordinary native support with inherited permissions, native children may implement, mutate, and report bounded delegated work directly',
+        'While a Conductor workflow is active, native children are verification/advice-only',
+      );
+      const existing = [
+        '# Team Instructions',
+        '',
+        'Keep this custom guidance.',
+        '',
+        OMX_MANAGED_AGENTS_START_MARKER,
+        staleGenerated.trimEnd(),
+        OMX_MANAGED_AGENTS_END_MARKER,
+        '',
+      ].join('\n');
+      await writeFile(join(wd, 'AGENTS.md'), existing);
+      assert.match(existing, staleDenial);
+      const output = await runSetupWithCapturedLogs(wd, {
+        scope: 'project',
+        mergeAgents: true,
+      });
+      const agentsContent = await readFile(join(wd, 'AGENTS.md'), 'utf-8');
+
+      assert.match(output, /Merged OMX-managed AGENTS\.md sections into project root\./);
+      assert.match(agentsContent, reachableWording);
+      assert.doesNotMatch(agentsContent, staleDenial);
+      assert.doesNotMatch(agentsContent, staleProofRequirement);
+      assert.match(agentsContent, /Keep this custom guidance\./);
+      assert.equal(countOccurrences(agentsContent, OMX_MANAGED_AGENTS_START_MARKER), 1);
+
+      const secondOutput = await runSetupWithCapturedLogs(wd, {
+        scope: 'project',
+        mergeAgents: true,
+      });
+      const secondContent = await readFile(join(wd, 'AGENTS.md'), 'utf-8');
+
+      assert.equal(secondContent, agentsContent);
+      assert.match(secondOutput, /AGENTS\.md already up to date in project root\./);
+      assert.doesNotMatch(secondContent, staleDenial);
+    } finally {
+      restoreHome();
+      restoreTty();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 
   it('refreshes the managed model table inside an explicit merged AGENTS.md block', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-setup-agents-'));
@@ -765,6 +826,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         addGeneratedAgentsMarker(template),
         {
           frontierModel: 'legacy-frontier',
+          frontierAgentModel: 'legacy-frontier',
           sparkModel: 'legacy-spark',
           subagentDefaultModel: 'legacy-frontier',
         },
@@ -795,7 +857,7 @@ describe('omx setup AGENTS refresh behavior', () => {
       assert.match(agentsContent, /Keep this custom guidance\./);
       assert.match(
         agentsContent,
-        new RegExp(`\\| Frontier \\(leader\\) \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
+        new RegExp(`\\| Leader\\/main session \\| config\\.toml root \\| \`${expectedContext.frontierModel}\` \\| high \\|`),
       );
       assert.doesNotMatch(agentsContent, /legacy-frontier/);
       assert.doesNotMatch(agentsContent, /legacy-spark/);

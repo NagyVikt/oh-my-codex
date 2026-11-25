@@ -148,14 +148,14 @@ describe('notify-hook team tmux guard bridge', () => {
       const lines = log.trim().split('\n').filter(Boolean);
       assert.equal(lines.length, 3);
       assert.match(lines[0], /\[display-message\]\[-p\]\[-t\]\[%42\]\[#\{pane_start_command\}\]/);
-      assert.match(lines[1], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
-      assert.match(lines[2], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
+      assert.match(lines[1], /\[send-keys\]\[-t\]\[%42\]\[Enter\]/);
+      assert.match(lines[2], /\[send-keys\]\[-t\]\[%42\]\[Enter\]/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('queue-first submits with Tab before C-m when requested', async () => {
+  it('queue-first submits with Tab before Enter when requested', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
@@ -190,8 +190,8 @@ describe('notify-hook team tmux guard bridge', () => {
       assert.match(lines[3], /\[send-keys\]\[-t\]\[%42\]\[C-u\]/);
       assert.match(lines[4], /\[paste-buffer\]\[-t\]\[%42\]\[-b\]\[omx-pane-input-.*\]\[-p\]\[-d\]/);
       assert.match(lines[5], /\[send-keys\]\[-t\]\[%42\]\[Tab\]/);
-      assert.match(lines[6], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
-      assert.match(lines[7], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
+      assert.match(lines[6], /\[send-keys\]\[-t\]\[%42\]\[Enter\]/);
+      assert.match(lines[7], /\[send-keys\]\[-t\]\[%42\]\[Enter\]/);
       assert.match(lines[8], /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -232,7 +232,7 @@ describe('notify-hook team tmux guard bridge', () => {
       const lines = log.trim().split('\n').filter(Boolean);
       assert.equal(lines.length, 7);
       assert.match(lines[0], /\[display-message\]\[-p\]\[-t\]\[%42\]\[#\{pane_start_command\}\]/);
-      assert.match(lines[5], /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
+      assert.match(lines[5], /\[send-keys\]\[-t\]\[%42\]\[Enter\]/);
       assert.match(lines[6], /\[delete-buffer\]\[-b\]\[omx-pane-input-/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -291,6 +291,7 @@ exit 0
       assert.doesNotMatch(log, /show-buffer/);
       assert.doesNotMatch(log, /paste-buffer/);
       assert.doesNotMatch(log, /\[send-keys\]\[-t\]\[%42\]\[C-m\]/);
+      assert.doesNotMatch(log, /\[send-keys\]\[-t\]\[%42\]\[Enter\]/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -475,6 +476,79 @@ exit 0
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  for (const [capture, blocked] of [
+    ['OpenAI Codex\n› Ask Codex to do anything\nWaiting for startup · esc cancel', true],
+    ['loading workspace state...', true],
+    ['Trust this folder?\n› 1. Trust and continue\n  2. Quit', true],
+    ['Do you trust the contents of this directory?\nYes, continue\nNo, quit', true],
+    ['Loading dependencies\n• Working (esc to interrupt)', false],
+    ['OpenAI Codex\nFinished loading dependencies.\n› Ask Codex to do anything', false],
+    ['OpenAI Codex\n› Explain loading model weights', false],
+    [
+      `Folder access
+/tmp/team/worktrees/worker-2
+
+Trust this folder? Codex can
+read, edit, and run files
+here, subject to your
+permission settings.
+Folder settings can run code
+automatically, even without a
+model request.
+Continue only if you trust
+these files. Your trust
+decision will be saved.
+
+› 1. Trust and continue
+  2. Quit
+
+enter continue · esc quit`,
+      true,
+    ],
+  ] as const) {
+    it(`checks startup/trust UI while preserving busy-worker delivery: ${capture.split('\n')[0]}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-startup-guard-'));
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      try {
+        await mkdir(fakeBinDir);
+        await writeFile(
+          join(fakeBinDir, 'tmux'),
+          `#!/usr/bin/env bash
+set -eu
+${liveExactPaneProof()}
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [[ "$1" == "capture-pane" ]]; then
+  cat <<'CAPTURE'
+${capture}
+CAPTURE
+elif [[ "$1" == "display-message" ]]; then
+  echo codex
+fi
+`,
+        );
+        await chmod(join(fakeBinDir, 'tmux'), 0o755);
+        const result = runEvaluatePaneInjectionReadinessInChild({
+          fakeBinDir,
+          moduleUrl: new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href,
+          paneTarget: '%42',
+          options: {
+            exactPaneId: '%42',
+            requireReady: false,
+            requireIdle: false,
+          },
+        });
+        assert.equal(result.status, 0, result.stderr);
+        const parsed = JSON.parse(result.stdout);
+        assert.equal(parsed.ok, !blocked);
+        assert.equal(parsed.reason, blocked ? 'pane_not_ready' : 'ok');
+        assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8'), /send-keys|paste-buffer|capture-pane .* -S/);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
 
   it('fails closed without input effects when exact-pane readiness queries fail', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));

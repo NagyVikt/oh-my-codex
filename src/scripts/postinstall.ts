@@ -8,6 +8,7 @@ import {
   writeUserInstallStamp,
 } from './postinstall-advisory.js';
 import { getPackageRoot } from "../utils/package.js";
+import { hydrateNativeBinary } from "../cli/native-assets.js";
 
 type PostinstallStatus =
   | "noop-local"
@@ -24,8 +25,94 @@ interface PostinstallDependencies {
   env: NodeJS.ProcessEnv;
   getCurrentVersion: () => Promise<string | null>;
   log: (message: string) => void;
+  hydrateRuntime: () => Promise<string | undefined>;
   readStamp: () => Promise<UserInstallStamp | null>;
   writeStamp: (stamp: UserInstallStamp) => Promise<void>;
+}
+
+const RUNTIME_HYDRATION_TIMEOUT_MS = 120_000;
+
+export async function hydrateOmxRuntime(options: {
+  packageRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  timeoutMs?: number;
+} = {}): Promise<string | undefined> {
+  const timeoutMs = options.timeoutMs ?? RUNTIME_HYDRATION_TIMEOUT_MS;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  timer.unref?.();
+  try {
+    return await hydrateNativeBinary("omx-runtime", {
+      packageRoot: options.packageRoot,
+      env: options.env,
+      platform: options.platform,
+      arch: options.arch,
+      signal: controller.signal,
+      strictManifestErrors: true,
+    });
+  } catch (error) {
+    if (!timedOut) throw error;
+    const detail = redactHydrationDiagnosticUrls(error instanceof Error ? error.message : String(error));
+    const cause = deepestErrorMessage(error);
+    throw new Error(
+      `[omx] omx-runtime hydration timed out after ${timeoutMs} ms: ${detail}; cause: ${cause}`,
+      { cause: error },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function hydrateOmxRuntimeNonFatal(options: {
+  packageRoot?: string;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  log?: (message: string) => void;
+  timeoutMs?: number;
+} = {}): Promise<string | undefined> {
+  const log = options.log ?? ((message: string) => console.log(message));
+  try {
+    const runtimePath = await hydrateOmxRuntime(options);
+    if (runtimePath) log(`[omx] Hydrated omx-runtime for this platform: ${runtimePath}`);
+    else log("[omx] omx-runtime was not available for this platform; native runtime features remain disabled.");
+    return runtimePath;
+  } catch (error) {
+    const message = redactHydrationDiagnosticUrls(error instanceof Error ? error.message : String(error));
+    log(`[omx] omx-runtime hydration failed non-fatally: ${message}`);
+    return undefined;
+  }
+}
+
+function deepestErrorMessage(error: unknown): string {
+  let current = error;
+  const seen = new Set<unknown>();
+  while (current instanceof Error && current.cause !== undefined && !seen.has(current)) {
+    seen.add(current);
+    current = current.cause;
+  }
+  return redactHydrationDiagnosticUrls(current instanceof Error ? current.message : String(current));
+}
+
+function redactHydrationDiagnosticUrls(message: string): string {
+  return message.replace(/https?:\/\/[^\s"'<>]+/gi, (value) => {
+    try {
+      const url = new URL(value);
+      url.username = "";
+      url.password = "";
+      url.search = "";
+      url.hash = "";
+      return url.toString();
+    } catch {
+      return "[URL redacted]";
+    }
+  });
 }
 
 function stripLeadingV(version: string): string {
@@ -55,6 +142,7 @@ const defaultDependencies: PostinstallDependencies = {
   env: process.env,
   getCurrentVersion,
   log: (message) => console.log(message),
+  hydrateRuntime: () => hydrateOmxRuntimeNonFatal(),
   readStamp: () => readUserInstallStamp(),
   writeStamp: (stamp) => writeUserInstallStamp(stamp),
 };
@@ -75,6 +163,20 @@ export async function runPostinstall(
   }
 
   const currentStampVersion = stripLeadingV(currentVersion);
+  try {
+    const runtimePath = await resolved.hydrateRuntime();
+    if (runtimePath) {
+      resolved.log(`[omx] Hydrated omx-runtime for this platform: ${runtimePath}`);
+    } else {
+      resolved.log(
+        "[omx] omx-runtime was not available for this platform; native runtime features remain disabled.",
+      );
+    }
+  } catch (error) {
+    resolved.log(
+      `[omx] omx-runtime hydration failed non-fatally: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const existingStamp = await resolved.readStamp();
   if (!isInstallVersionBump(currentVersion, existingStamp)) {
     return { status: "noop-same-version", version: currentStampVersion };

@@ -1,0 +1,58 @@
+{
+  "id": "continue-pair",
+  "label": "Proposed native-agent stages continuing the same pair",
+  "isBaseline": true,
+  "omxRevision": "7a3cab6445db8313340779ba6298b3cae24eac6e",
+  "roles": {
+    "explore": {
+      "model": "gpt-6-astra",
+      "reasoningEffort": "medium"
+    },
+    "executor": {
+      "model": "gpt-6-astra",
+      "reasoningEffort": "medium"
+    },
+    "code-reviewer": {
+      "model": "gpt-6-astra",
+      "reasoningEffort": "medium"
+    },
+    "team-worker": {
+      "model": "gpt-6-astra",
+      "reasoningEffort": "medium"
+    },
+    "sparkshell": {
+      "model": "gpt-6-astra",
+      "reasoningEffort": "medium"
+    }
+  },
+  "serviceTier": "unknown",
+  "cacheConditions": "unknown; synthetic example does not observe cache reuse",
+  "stages": [
+    {
+      "id": "planner",
+      "role": "planner",
+      "surface": "native-agent",
+      "requested": {
+        "model": "gpt-6-astra",
+        "reasoningEffort": "high"
+      },
+      "overrideSource": {
+        "model": "proposed agentModels.planner",
+        "reasoningEffort": "proposed agentReasoning.planner"
+      }
+    },
+    {
+      "id": "executor",
+      "role": "executor",
+      "surface": "native-agent",
+      "requested": {
+        "model": "gpt-6-astra",
+        "reasoningEffort": "high"
+      },
+      "overrideSource": {
+        "model": "proposed agentModels.executor",
+        "reasoningEffort": "proposed agentReasoning.executor"
+      }
+    }
+  ]
+}

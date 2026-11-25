@@ -2328,6 +2328,15 @@ describe('teamCommand api', () => {
       assert.equal(typeof claimToken, 'string');
 
       await teamCommand([
+        'api', 'renew-task-claim', '--input',
+        JSON.stringify({ team_name: 'lifecycle-team', task_id: taskId, worker: 'worker-1', claim_token: claimToken }),
+        '--json',
+      ]);
+      const renewed = JSON.parse(logs.at(-1) ?? '{}') as { ok?: boolean; data?: { ok?: boolean } };
+      assert.equal(renewed.ok, true);
+      assert.equal(renewed.data?.ok, true);
+
+      await teamCommand([
         'api',
         'transition-task-status',
         '--input',
@@ -3263,7 +3272,68 @@ exit 1
     }
   });
 
-  it('records leader runtime activity when team status is read', async () => {
+  for (const command of ['status-json', 'status-text', 'shutdown'] as const) {
+    it(`reports the selected state path for ${command} and ignores aliases from unselected roots`, async () => {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-team-selected-root-'));
+      const previousCwd = process.cwd();
+      const envKeys = ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const;
+      const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+      const originalLog = console.log;
+      const logs: string[] = [];
+      const teamName = 'selected-root-team';
+      const intendedRoot = join(wd, '.omx', 'state');
+      const selectedRoot = join(wd, 'inherited-root', '.omx', 'state');
+      const selectedPath = join(selectedRoot, 'team', teamName);
+      try {
+        process.chdir(wd);
+        delete process.env.OMX_ROOT;
+        delete process.env.OMX_STATE_ROOT;
+        delete process.env.OMX_SESSION_ID;
+        process.env.OMX_TEAM_STATE_ROOT = intendedRoot;
+        await initTeamState(teamName, 'selected root diagnostics', 'executor', 1, wd);
+        const configPath = join(intendedRoot, 'team', teamName, 'config.json');
+        const originalConfig = await readFile(configPath, 'utf8');
+        delete process.env.OMX_TEAM_STATE_ROOT;
+        process.env.OMX_STATE_ROOT = join(wd, 'inherited-root');
+        // An alias team in the unselected cwd root must not rename or mask the
+        // team addressed through the selected canonical state root.
+        const decoyDir = join(wd, '.omx', 'state', 'team', 'alias-team');
+        await mkdir(decoyDir, { recursive: true });
+        await writeFile(join(decoyDir, 'manifest.v2.json'), JSON.stringify({
+          leader: {},
+          requested_name: 'selected-root-team',
+          display_name: 'selected-root-team',
+        }));
+        console.log = (message?: unknown) => { logs.push(String(message ?? '')); };
+
+        await teamCommand(command === 'shutdown'
+          ? ['shutdown', teamName, '--force']
+          : ['status', teamName, ...(command === 'status-json' ? ['--json'] : [])]);
+
+        assert.equal(await readFile(configPath, 'utf8'), originalConfig);
+        if (command === 'status-json') {
+          const payload = JSON.parse(logs[0]) as Record<string, unknown>;
+          assert.equal(payload.status, 'missing');
+          assert.equal(payload.state_root, selectedRoot);
+          assert.equal(payload.state_path, selectedPath);
+        } else {
+          assert.ok(logs.some((line) => line.includes(selectedPath)), logs.join('\n'));
+          assert.ok(logs.some((line) => line.includes('No team state found')), logs.join('\n'));
+          assert.ok(!logs.some((line) => line.includes('Team shutdown complete')));
+        }
+      } finally {
+        console.log = originalLog;
+        process.chdir(previousCwd);
+        for (const key of envKeys) {
+          if (previousEnv[key] === undefined) delete process.env[key];
+          else process.env[key] = previousEnv[key];
+        }
+        await rm(wd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('keeps team status read-only', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-status-activity-'));
     const previousCwd = process.cwd();
     const logs: string[] = [];
@@ -3273,18 +3343,13 @@ exit 1
       await withoutTeamTestWorkerEnv(() => initTeamState('activity-team', 'inspect activity', 'executor', 1, wd));
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
+      const activityPath = join(wd, '.omx', 'state', 'leader-runtime-activity.json');
+      await writeFile(activityPath, JSON.stringify({ last_activity_at: '2026-03-21T04:11:12.000Z' }));
+      const before = await readFile(activityPath, 'utf-8');
+
       await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'activity-team', '--json']));
 
-      const activity = JSON.parse(await readFile(join(wd, '.omx', 'state', 'leader-runtime-activity.json'), 'utf-8')) as {
-        last_activity_at?: string;
-        last_team_status_at?: string;
-        last_source?: string;
-        last_team_name?: string;
-      };
-      assert.equal(activity.last_source, 'team_status');
-      assert.equal(activity.last_team_name, 'activity-team');
-      assert.ok(typeof activity.last_activity_at === 'string' && activity.last_activity_at.length > 0);
-      assert.ok(typeof activity.last_team_status_at === 'string' && activity.last_team_status_at.length > 0);
+      assert.equal(await readFile(activityPath, 'utf-8'), before);
     } finally {
       console.log = originalLog;
       process.chdir(previousCwd);
@@ -3333,6 +3398,10 @@ exit 1
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
       await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--tail-lines', '600']));
       assert.match(logs.join('\n'), /inspect_worker-1: tmux capture-pane -p -t %51 -S -600/);
+
+      logs.length = 0;
+      await withoutTeamTestWorkerEnv(() => teamCommand(['status', '--model-inspect', 'pane-tail-team', '--tail-lines', '600']));
+      assert.match(logs.join('\n'), /inspect_worker-1: omx sparkshell --tmux-pane %51 --tail-lines 600/);
 
       logs.length = 0;
       await withoutTeamTestWorkerEnv(() => teamCommand(['status', 'pane-tail-team', '--model-inspect', '--tail-lines', '600']));
@@ -3437,7 +3506,11 @@ process.on('SIGTERM', () => process.exit(0));
       }
 
       assert.ok(captured, 'worker argv capture file should be written');
-      assert.equal(captured!.codexHome, join(process.cwd(), '.codex'));
+      // Issue #3629: prompt-mode workers no longer receive a project-derived
+      // CODEX_HOME export; the codex child resolves credentials and config
+      // from the caller's own home exactly like a plain `codex` run. The
+      // xhigh reasoning override still applies (asserted below).
+      assert.equal(captured!.codexHome, null);
       assert.match(captured!.argv.join(' '), /model_reasoning_effort="xhigh"/);
       assert.match(logs.join('\n'), /architect x1 .*xhigh reasoning/);
     } finally {
@@ -3466,7 +3539,7 @@ process.on('SIGTERM', () => process.exit(0));
     }
   });
 
-  it('returns next canonical event for a team in JSON mode', async () => {
+  it('returns the next canonical event after an explicit cursor in JSON mode', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-await-'));
     const previousCwd = process.cwd();
     const logs: string[] = [];
@@ -3476,16 +3549,21 @@ process.on('SIGTERM', () => process.exit(0));
       await initTeamState('await-team', 'await test', 'executor', 1, wd);
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
 
-      const waitPromise = teamCommand(['await', 'await-team', '--json', '--timeout-ms', '500']);
-      setTimeout(() => {
-        void appendTeamEvent('await-team', {
-          type: 'worker_state_changed',
-          worker: 'worker-1',
-          state: 'blocked',
-          prev_state: 'working',
-          reason: 'needs_follow_up',
-        }, wd);
-      }, 50);
+      // An implicit cursor is captured during command startup. A timer can
+      // publish before that capture, making its event the baseline instead.
+      const baseline = await appendTeamEvent('await-team', {
+        type: 'worker_state_changed', worker: 'worker-1', state: 'working', prev_state: 'idle',
+      }, wd);
+      const waitPromise = teamCommand([
+        'await', 'await-team', '--json', '--timeout-ms', '500', '--after-event-id', baseline.event_id,
+      ]);
+      const nextEvent = await appendTeamEvent('await-team', {
+        type: 'worker_state_changed',
+        worker: 'worker-1',
+        state: 'blocked',
+        prev_state: 'working',
+        reason: 'needs_follow_up',
+      }, wd);
       await waitPromise;
 
       const payload = JSON.parse(logs.at(-1) ?? '{}') as {
@@ -3496,7 +3574,7 @@ process.on('SIGTERM', () => process.exit(0));
       };
       assert.equal(payload.team_name, 'await-team');
       assert.equal(payload.status, 'event');
-      assert.equal(typeof payload.cursor, 'string');
+      assert.equal(payload.cursor, nextEvent.event_id);
       assert.equal(payload.event?.type, 'worker_state_changed');
       assert.equal(payload.event?.state, 'blocked');
       assert.equal(payload.event?.prev_state, 'working');

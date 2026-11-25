@@ -27,6 +27,8 @@ import {
   MANAGED_HOOK_EVENTS,
   ManagedCodexHooksPlanError,
   buildManagedCodexHookTrustState,
+  buildManagedCodexHooksConfig,
+  planManagedCodexHooksRemoval,
   planManagedCodexHooksMerge,
 } from "../codex-hooks.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../omx-first-party-mcp.js";
@@ -196,6 +198,8 @@ function assertSingleManagedHookTrustState(toml: string): void {
       "/tmp/codex/hooks.json:pre_tool_use:0:0",
       "/tmp/codex/hooks.json:session_start:0:0",
       "/tmp/codex/hooks.json:stop:0:0",
+      "/tmp/codex/hooks.json:subagent_start:0:0",
+      "/tmp/codex/hooks.json:subagent_stop:0:0",
       "/tmp/codex/hooks.json:user_prompt_submit:0:0",
     ],
   );
@@ -288,7 +292,7 @@ describe("config generator idempotency (#384)", () => {
 
       assertSingleOmxBlock(toml);
       assert.doesNotMatch(toml, /^multi_agent\s*=/m);
-      assert.match(toml, /^child_agents_md = true$/m);
+      assert.doesNotMatch(toml, /^child_agents_md\s*=/m);
       assert.match(toml, /^hooks = true$/m);
       assert.match(toml, /^goals = true$/m);
       assert.doesNotMatch(toml, /^\[agents\]$/m);
@@ -384,6 +388,7 @@ describe("config generator idempotency (#384)", () => {
       "[features]\nmulti_agent = false\nchild_agents_md = true\nhooks = true\ngoals = true\n",
       { preserveMultiAgent: true },
     );
+    assert.doesNotMatch(stripped, /child_agents_md/);
 
     assert.equal(stripped, "[features]\nmulti_agent = false\n");
   });
@@ -781,6 +786,55 @@ describe("config generator idempotency (#384)", () => {
       toml,
       /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
       "default status_line should not overwrite multiline customization",
+    );
+  });
+
+  it("preserves multiline arrays in [tui] section (terminal_title, terminal_title, etc)", () => {
+    const toml = buildMergedConfig(
+      [
+        "[tui]",
+        "terminal_title = [",
+        '  "thread-title",',
+        '  "model-with-reasoning",',
+        '  "context-remaining",',
+        "]",
+        "screen_reader_detection_done = true",
+        "status_line = [",
+        '  "git-branch",',
+        '  "context-remaining",',
+        "]",
+        "",
+      ].join("\n"),
+      "/tmp/omx",
+    );
+
+    assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.ok(
+      toml.includes(
+        [
+          "terminal_title = [",
+          '"thread-title",',
+          '"model-with-reasoning",',
+          '"context-remaining",',
+          "]",
+        ].join("\n"),
+      ),
+      "multiline terminal_title array should be preserved",
+    );
+    assert.ok(
+      toml.includes("screen_reader_detection_done = true"),
+      "scalar keys should be preserved",
+    );
+    assert.ok(
+      toml.includes(
+        [
+          "status_line = [",
+          '"git-branch",',
+          '"context-remaining",',
+          "]",
+        ].join("\n"),
+      ),
+      "multiline status_line should be preserved",
     );
   });
 
@@ -1226,6 +1280,201 @@ describe("config generator idempotency (#384)", () => {
       assert.throws(() => stripExistingOmxBlocks(config), isManagedTrustConflict, name);
       assert.throws(() => buildMergedConfig(config, "/tmp/omx"), isManagedTrustConflict, name);
     }
+  });
+  it("tolerates a bare empty [hooks.state] parent header before the managed trust block (#3589)", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
+    const managed = upsertManagedCodexHookTrustState(
+      'model = "gpt-5.6-sol"\n\n[desktop]\nenabled = true\n',
+      "/tmp/omx",
+      hooksPath,
+    );
+    const marker = "# OMX-owned Codex hook trust state\n";
+    const markerIdx = managed.indexOf(marker);
+    const markerStart = markerIdx + marker.length;
+    const insideMarker = (snippet: string): string =>
+      managed.slice(0, markerStart) + snippet + managed.slice(markerStart);
+    const withEmptyParent = `${managed.slice(0, markerIdx)}[hooks.state]\n\n${managed.slice(markerIdx)}`;
+    const stripOptions = {
+      managedTrustState,
+      priorManagedHookTrustState: managedTrustState,
+    };
+    const isManagedTrustConflict = (error: unknown): boolean =>
+      error instanceof ManagedCodexHooksPlanError &&
+      error.code === "managed_trust_key_conflict";
+
+    assert.doesNotThrow(() => TOML.parse(withEmptyParent));
+    const stripped = stripManagedCodexHookTrustState(withEmptyParent, stripOptions);
+    assert.doesNotThrow(() => TOML.parse(stripped));
+    assert.match(
+      stripped,
+      /^\[hooks\.state\]$/m,
+      "the user's empty parent header is preserved",
+    );
+    for (const key of Object.keys(managedTrustState)) {
+      assert.ok(!stripped.includes(key), `managed entry ${key} should be stripped`);
+    }
+
+    const merged = buildMergedConfig(withEmptyParent, "/tmp/codex", {
+      codexHomeDir: "/tmp/codex",
+      managedHookTrustState: managedTrustState,
+      priorManagedHookTrustState: managedTrustState,
+    });
+    assert.doesNotThrow(() => TOML.parse(merged));
+    const parsedMerged = TOML.parse(merged) as {
+      hooks?: { state?: Record<string, unknown> };
+    };
+    assert.equal(
+      Object.keys(parsedMerged.hooks?.state ?? {}).length,
+      Object.keys(managedTrustState).length,
+      "setup must re-provision exactly the managed trust entries",
+    );
+
+    const upgraded = upsertManagedCodexHookTrustState(
+      withEmptyParent,
+      "/tmp/omx",
+      hooksPath,
+      stripOptions,
+    );
+    assert.doesNotThrow(() => TOML.parse(upgraded));
+    assert.match(
+      upgraded,
+      /^\[hooks\.state\]$/m,
+      "the empty parent header survives setup upgrades",
+    );
+
+    assert.throws(
+      () =>
+        stripManagedCodexHookTrustState(withEmptyParent, {
+          managedTrustState: {},
+          priorManagedHookTrustState: {},
+        }),
+      isManagedTrustConflict,
+      "unproven marker-contained state stays fail-closed",
+    );
+
+    const negativeControls = [
+      ["non-empty parent", '[hooks.state]\nforeign = "x"\n'],
+      ["unmanaged child", '[hooks.state."foreign"]\ntrusted_hash = "sha256:foreign"\n'],
+    ] as const;
+    for (const [name, snippet] of negativeControls) {
+      assert.throws(
+        () => stripManagedCodexHookTrustState(insideMarker(snippet), stripOptions),
+        isManagedTrustConflict,
+        `${name} inside the managed block must stay a conflict`,
+      );
+    }
+    assert.throws(
+      () =>
+        stripManagedCodexHookTrustState(
+          insideMarker("[hooks.state]\n[hooks.state]\n"),
+          stripOptions,
+        ),
+      (error: unknown): boolean =>
+        error instanceof ManagedCodexHooksPlanError &&
+        error.code === "managed_trust_key_conflict" &&
+        error.message.includes("marker-contained hooks.state"),
+      "duplicate empty parents must keep the marker-contained conflict classification",
+    );
+  });
+  it("tolerates the empty parent header when it is itself marker-contained (#3589)", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
+    const merged = buildMergedConfig('model = "x"\n', "/tmp/codex", {
+      codexHomeDir: "/tmp/codex",
+      managedHookTrustState: managedTrustState,
+    });
+    const trustMarker = "# OMX-owned Codex hook trust state";
+    const markerIdx = merged.indexOf(trustMarker);
+    assert.ok(markerIdx > 0, "fixture must contain the managed trust marker");
+    const withParent = `${merged.slice(0, markerIdx)}[hooks.state]\n\n${merged.slice(markerIdx)}`;
+    assert.doesNotThrow(() => TOML.parse(withParent));
+    const stripOptions = {
+      managedTrustState,
+      priorManagedHookTrustState: managedTrustState,
+    };
+    const stripped = stripManagedCodexHookTrustState(withParent, stripOptions);
+    assert.doesNotThrow(() => TOML.parse(stripped));
+    assert.match(stripped, /^\[hooks\.state\]$/m);
+    const upgraded = upsertManagedCodexHookTrustState(withParent, "/tmp/omx", hooksPath, stripOptions);
+    assert.doesNotThrow(() => TOML.parse(upgraded));
+    assert.match(
+      upgraded,
+      /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:session_start:0:0"\]$/m,
+      "managed entries must be re-provisioned after refresh",
+    );
+  });
+
+  it("keeps non-header empty hooks.state forms and duplicates fail-closed (#3589)", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
+    const managed = upsertManagedCodexHookTrustState('model = "x"\n', "/tmp/omx", hooksPath);
+    const trustMarker = "# OMX-owned Codex hook trust state\n";
+    const startIdx = managed.indexOf(trustMarker) + trustMarker.length;
+    const inside = (snippet: string): string =>
+      managed.slice(0, startIdx) + snippet + managed.slice(startIdx);
+    const stripOptions = {
+      managedTrustState,
+      priorManagedHookTrustState: managedTrustState,
+    };
+    const isManagedTrustConflict = (error: unknown): boolean =>
+      error instanceof ManagedCodexHooksPlanError &&
+      error.code === "managed_trust_key_conflict";
+
+    const insideCases = [
+      ["empty dotted assignment", "hooks.state = {}\n"],
+      ["empty inline table", "hooks = { state = {} }\n"],
+      ["[hooks] scope with empty state", "[hooks]\nstate = {}\n"],
+      ["scalar hooks.state", 'hooks.state = "foreign"\n'],
+    ] as const;
+    for (const [name, snippet] of insideCases) {
+      assert.throws(
+        () => stripManagedCodexHookTrustState(inside(snippet), stripOptions),
+        isManagedTrustConflict,
+        `${name} must remain a marker-contained conflict`,
+      );
+    }
+    const trustEndMarker = "# End OMX-owned Codex hook trust state";
+    // The reported parent sits before the fence; a second definition anywhere inside
+    // (or any whole-config-invalid prelude) must keep base fail-closed behavior.
+    const reported = `${managed.slice(0, managed.indexOf(trustMarker))}[hooks.state]\n\n${managed.slice(managed.indexOf(trustMarker))}`;
+    const reportedTrustsOnlyIdx = reported.indexOf(trustMarker) + trustMarker.length;
+    const secondChildIdx = reported.indexOf(
+      "[hooks.state.",
+      reported.indexOf("[hooks.state.", reportedTrustsOnlyIdx) + 1,
+    );
+    const duplicateCases = [
+      ["second parent after comments", reported.slice(0, reportedTrustsOnlyIdx) + "[hooks.state]\n" + reported.slice(reportedTrustsOnlyIdx)],
+      ["second parent between children", reported.slice(0, secondChildIdx) + "[hooks.state]\n" + reported.slice(secondChildIdx)],
+      ["second parent before trust end", reported.slice(0, reported.indexOf(trustEndMarker)) + "[hooks.state]\n" + reported.slice(reported.indexOf(trustEndMarker))],
+      ["two parents inside", inside("[hooks.state]\n[hooks.state]\n")],
+    ] as const;
+    for (const [name, config] of duplicateCases) {
+      assert.throws(
+        () => stripManagedCodexHookTrustState(config, stripOptions),
+        isManagedTrustConflict,
+        `${name} must remain a marker-contained conflict`,
+      );
+    }
+
+    // Whole-config-invalid preludes keep base fail-closed behavior.
+    assert.throws(
+      () =>
+        stripManagedCodexHookTrustState(
+          `hooks.state = {}\n\n${inside("[hooks.state]\n")}`,
+          stripOptions,
+        ),
+      isManagedTrustConflict,
+      "an inline-table prelude must keep the header conflict",
+    );
+
+    // A valid, empty-valued foreign sibling outside the fence is user content: it is
+    // preserved and the proven-owned managed children are still refreshed.
+    const withForeignPrelude = `hooks.state.foreign = {}\n\n${inside("[hooks.state]\n")}`;
+    assert.doesNotThrow(() => TOML.parse(withForeignPrelude));
+    const stripped = stripManagedCodexHookTrustState(withForeignPrelude, stripOptions);
+    assert.doesNotThrow(() => TOML.parse(stripped));
+    assert.match(stripped, /^hooks\.state\.foreign = \{\}$/m, "foreign state preserved");
   });
 
   it("matches managed hooks.state keys case-sensitively", () => {
@@ -2325,6 +2574,115 @@ describe("config generator idempotency (#384)", () => {
     assertSingleManagedHookTrustState(repaired);
   });
 
+  it("preserves approved foreign trust beyond OMX coordinates and dedupes repeated banners (#3818)", () => {
+    const hooksPath = "/tmp/codex/hooks.json";
+    const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
+    const managedCommand = buildManagedCodexHooksConfig("/tmp/omx")
+      .hooks.PreToolUse[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          hooks: [
+            { type: "command", command: managedCommand },
+            { type: "command", command: "echo foreign", timeout: 600 },
+          ],
+        }],
+      },
+    });
+    const removalPlan = planManagedCodexHooksRemoval(hooksContent, hooksPath);
+    assert.equal(removalPlan.ok, true);
+    if (!removalPlan.ok) return;
+    const foreignKey = `${hooksPath}:pre_tool_use:0:1`;
+    const foreignHash = removalPlan.coordinateMoves.find(
+      (move) => move.oldKey === foreignKey,
+    )?.expectedTrustedHash;
+    assert.ok(foreignHash, "fixture must have Codex's expected foreign-hook hash");
+
+    const startMarker = "# OMX-owned Codex hook trust state";
+    const endMarker = "# End OMX-owned Codex hook trust state";
+    const setupConfig = upsertManagedCodexHookTrustState(
+      'model = "gpt-5.6-sol"\n',
+      "/tmp/omx",
+      hooksPath,
+      { managedTrustState },
+    );
+    const repeatedBanners = setupConfig.replace(
+      startMarker,
+      Array.from({ length: 8 }, () => startMarker).join("\n"),
+    );
+    const configWithForeignTrust = repeatedBanners.replace(
+      endMarker,
+      [
+        `[hooks.state.${JSON.stringify(foreignKey)}]`,
+        `trusted_hash = ${JSON.stringify(foreignHash)}`,
+        "",
+        endMarker,
+      ].join("\n"),
+    );
+    const tailForeignKey = `${hooksPath}:foreign_event:0:0`;
+    const configWithRepeatedOuterBanners = [
+      "# oh-my-codex (OMX) Configuration",
+      "# oh-my-codex (OMX) Configuration",
+      configWithForeignTrust,
+      "# End oh-my-codex",
+      `[hooks.state.${JSON.stringify(tailForeignKey)}]`,
+      'trusted_hash = "sha256:approved-foreign-tail"',
+      "",
+    ].join("\n");
+
+    const refreshed = upsertManagedCodexHookTrustState(
+      configWithRepeatedOuterBanners,
+      "/tmp/omx",
+      hooksPath,
+      { managedTrustState },
+    );
+    const parsed = TOML.parse(refreshed) as {
+      hooks?: { state?: Record<string, { trusted_hash?: unknown }> };
+    };
+    assert.equal(parsed.hooks?.state?.[foreignKey]?.trusted_hash, foreignHash);
+    assert.equal(
+      parsed.hooks?.state?.[tailForeignKey]?.trusted_hash,
+      "sha256:approved-foreign-tail",
+    );
+    assert.equal(count(refreshed, /^# OMX-owned Codex hook trust state$/gm), 1);
+    assert.equal(count(refreshed, /^# End OMX-owned Codex hook trust state$/gm), 1);
+    assert.equal(
+      count(refreshed, /^\[hooks\.state\."\/tmp\/codex\/hooks\.json:/gm),
+      Object.keys(managedTrustState).length + 2,
+    );
+    assert.equal(
+      upsertManagedCodexHookTrustState(refreshed, "/tmp/omx", hooksPath, {
+        managedTrustState,
+      }),
+      refreshed,
+      "repeated setup must be idempotent after normalizing legacy banners",
+    );
+
+    const managedKey = `${hooksPath}:pre_tool_use:0:0`;
+    const managedHash = managedTrustState[managedKey]?.trusted_hash;
+    assert.ok(managedHash);
+    const exactManagedEntry = [
+      `[hooks.state.${JSON.stringify(managedKey)}]`,
+      `trusted_hash = ${JSON.stringify(managedHash)}`,
+    ].join("\n");
+    const tamperedManagedEntry = exactManagedEntry.replace(
+      JSON.stringify(managedHash),
+      JSON.stringify("sha256:tampered-managed-trust"),
+    );
+    assert.throws(
+      () => upsertManagedCodexHookTrustState(
+        configWithRepeatedOuterBanners.replace(exactManagedEntry, tamperedManagedEntry),
+        "/tmp/omx",
+        hooksPath,
+        { managedTrustState },
+      ),
+      (error: unknown) =>
+        error instanceof ManagedCodexHooksPlanError &&
+        error.code === "managed_trust_key_conflict",
+      "a genuinely tampered managed coordinate must remain fail-closed",
+    );
+  });
+
   it("preserves managed-looking trust blocks inside multiline TOML values", () => {
     const hooksPath = "/tmp/codex/hooks.json";
     const managedTrustState = buildManagedCodexHookTrustState(hooksPath, "/tmp/omx");
@@ -2631,12 +2989,11 @@ describe("config generator idempotency (#384)", () => {
     assert.match(merged, /^startup_timeout_sec = 15$/m);
   });
 
-  it("removes an existing multiline developer_instructions assignment as one root entry", () => {
+  it("preserves an existing custom multiline developer_instructions as one root entry", () => {
+    const customInstructions = `Custom instructions survive as valid TOML.\nThis line used to be orphaned by setup.\nThis closing line used to break parsing.`;
     const existing = [
       'model = "gpt-5.6-sol"',
-      'developer_instructions = """Custom instructions survive as valid TOML.',
-      'This line used to be orphaned by setup.',
-      'This closing line used to break parsing."""',
+      `developer_instructions = """${customInstructions}"""`,
       "",
       "[features]",
       "web_search = true",
@@ -2645,9 +3002,25 @@ describe("config generator idempotency (#384)", () => {
 
     const merged = buildMergedConfig(existing, "/tmp/omx");
 
-    assert.doesNotMatch(merged, /This line used to be orphaned/);
-    assert.doesNotMatch(merged, /This closing line used to break parsing/);
+    // Parse the merged TOML to extract the developer_instructions value
+    const parsedMerged = TOML.parse(merged) as Record<string, unknown>;
+    const preservedValue = parsedMerged.developer_instructions;
+
+    // Assert that the custom value is preserved exactly
+    assert.equal(
+      preservedValue,
+      customInstructions,
+      "custom developer_instructions should be preserved exactly",
+    );
+
+    // Assert that the orphaned lines are present (they should be preserved as part of the custom value)
+    assert.match(merged, /This line used to be orphaned/);
+    assert.match(merged, /This closing line used to break parsing/);
+
+    // Assert exactly one developer_instructions key exists
     assert.equal(count(merged, /^developer_instructions\s*=/gm), 1);
+
+    // Assert TOML parses successfully
     assert.doesNotThrow(() => TOML.parse(merged));
   });
 
@@ -2677,6 +3050,129 @@ describe("config generator idempotency (#384)", () => {
       assert.match(merged, /^model_context_window = 123456$/m);
       assert.doesNotMatch(merged, /^model_auto_compact_token_limit = 200000$/m);
       assert.doesNotThrow(() => TOML.parse(merged));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes previous OMX default developer_instructions on upgrade (issue #4105)", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      // Use an older OMX default value that differs from the current one
+      const olderOmxDefault =
+        'You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use skill/keyword routing like $name plus spawned role-specialized subagents for specialized work. Codex native subagents are available via .codex/agents and may be used for independent parallel subtasks within a single session or team pane. Skills are loaded from installed SKILL.md files under .codex/skills, not from native agent TOMLs. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat installed prompts as narrower internal execution surfaces under AGENTS.md authority, even when user-facing docs prefer $name keywords.';
+      await writeFile(
+        configPath,
+        [
+          'model = "o3"',
+          `developer_instructions = "${olderOmxDefault}"`,
+          'model_reasoning_effort = "medium"',
+          "",
+          "[features]",
+          "multi_agent = true",
+          "",
+        ].join("\n"),
+      );
+
+      await mergeConfig(configPath, wd);
+      const merged = await readFile(configPath, "utf-8");
+
+      // Older OMX default should be replaced with current default
+      assert.doesNotMatch(
+        merged,
+        /You have oh-my-codex installed\. AGENTS\.md is your orchestration brain/,
+        "old OMX default should be replaced",
+      );
+      assert.match(
+        merged,
+        /developer_instructions = "You have oh-my-codex installed\. AGENTS\.md is the orchestration brain/,
+        "current OMX default should be present",
+      );
+      assert.match(merged, /^model = "o3"$/m, "model should be preserved");
+      assert.doesNotThrow(() => TOML.parse(merged));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves developer_instructions in multiline literal string format", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      const customInstructions = `Custom multiline
+instructions\nwith newlines
+and special chars"quoted"`;
+      await writeFile(
+        configPath,
+        [
+          'model = "o3"',
+          `developer_instructions = '''${customInstructions}'''`,
+          'model_reasoning_effort = "medium"',
+          "",
+          "[features]",
+          "multi_agent = true",
+          "",
+        ].join("\n"),
+      );
+
+      await mergeConfig(configPath, wd);
+      const merged = await readFile(configPath, "utf-8");
+
+      // Custom value should be preserved
+      assert.match(
+        merged,
+        /developer_instructions = /,
+        "developer_instructions should be present",
+      );
+      // Should not contain OMX default marker text
+      assert.doesNotMatch(
+        merged,
+        /You have oh-my-codex installed\. AGENTS\.md is the orchestration brain/,
+        "should not contain OMX default",
+      );
+      assert.match(merged, /^model = "o3"$/m);
+      assert.doesNotThrow(() => TOML.parse(merged));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("maintains idempotency for developer_instructions across multiple setup runs", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
+    try {
+      const configPath = join(wd, "config.toml");
+      const customInstructions = "My custom project-specific instructions";
+      const initialConfig = [
+        'model = "o3"',
+        `developer_instructions = "${customInstructions}"`,
+        'model_reasoning_effort = "medium"',
+        "",
+        "[features]",
+        "multi_agent = true",
+        "",
+      ].join("\n");
+      await writeFile(configPath, initialConfig);
+
+      // First run
+      await mergeConfig(configPath, wd);
+      const first = await readFile(configPath, "utf-8");
+
+      // Second run on the same config
+      await mergeConfig(configPath, wd);
+      const second = await readFile(configPath, "utf-8");
+
+      // Both should be identical
+      assert.equal(first, second, "multiple setup runs should be idempotent");
+      // And both should parse without errors
+      assert.doesNotThrow(() => TOML.parse(first));
+      assert.doesNotThrow(() => TOML.parse(second));
+      // Should have exactly one developer_instructions key
+      assert.equal(
+        (first.match(/^developer_instructions\s*=/gm) ?? []).length,
+        1,
+        "should have exactly one developer_instructions entry",
+      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

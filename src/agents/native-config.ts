@@ -1,9 +1,19 @@
 /**
  * Native agent config generators for Codex CLI.
  * Writes standalone TOML files under ~/.codex/agents/ or ./.codex/agents/.
+ *
+ * Model precedence for the written TOML `model` key:
+ * 1. Per-agent override: .omx-config.json agentModels[role]
+ * 2. Tier env var for the role's modelClass (shell env or .omx-config.json `env`):
+ *    OMX_DEFAULT_FRONTIER_MODEL, OMX_DEFAULT_STANDARD_MODEL, OMX_DEFAULT_SPARK_MODEL
+ * 3. Built-in tier default (gpt-6.2-astra / gpt-6.2-sol / gpt-6-luna)
+ *
+ * For built-in providers the resolved model is written for every role. For custom providers the
+ * `model` key is omitted unless agentModels[role] is set. The config.toml root model is the
+ * main/leader session model only and never affects agent tiers.
  */
 
-import { existsSync, readFileSync } from "fs";
+import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { join } from "path";
 import { AGENT_DEFINITIONS, AgentDefinition } from "./definitions.js";
@@ -11,20 +21,17 @@ import { readCatalogManifest } from "../catalog/reader.js";
 import type { CatalogManifest } from "../catalog/schema.js";
 import { getInstallableNativeAgentNames } from "./policy.js";
 import {
-  getCodexConfigRootModelProvider,
-  getEnvConfiguredStandardDefaultModel,
   getAgentReasoningOverride,
   getAgentModelOverride,
-  getMainDefaultModel,
-  getSparkDefaultModel,
-  getStandardDefaultModel,
+  getModelClassDefaultModel,
+  getCodexConfigEffectiveModel,
+  getCodexConfigEffectiveModelProvider,
+  isBuiltinProvider,
   type PerAgentReasoningEffort,
 } from "../config/models.js";
-import { getRootModelName } from "../config/generator.js";
 import { codexAgentsDir } from "../utils/paths.js";
 
-export const EXACT_GPT_5_6_TERRA_MODEL = "gpt-5.6-terra";
-export const EXACT_RESEARCHER_MODEL = EXACT_GPT_5_6_TERRA_MODEL;
+
 
 const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
   "frontier-orchestrator": [
@@ -32,7 +39,7 @@ const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
     "",
     "You are operating in the frontier-orchestrator posture.",
     "- Prioritize intent classification before implementation.",
-    "- Default to delegation and orchestration when specialists exist.",
+    "- Specialist coverage must stay within the assigned role and delegation authority.",
     "- Treat the first decision as a routing problem: research vs planning vs implementation vs verification.",
     "- Challenge flawed user assumptions concisely before execution when the design is likely to cause avoidable problems.",
     "- Preserve explicit executor handoff boundaries: do not absorb deep implementation work when a specialized executor is more appropriate.",
@@ -44,8 +51,8 @@ const POSTURE_OVERLAYS: Record<AgentDefinition["posture"], string> = {
     "",
     "You are operating in the deep-worker posture.",
     "- Once the task is clearly implementation-oriented, bias toward direct execution and end-to-end completion.",
-    "- Explore first, then implement minimal changes that match existing patterns.",
-    "- Keep verification strict: diagnostics, tests, and build evidence are mandatory before claiming completion.",
+    "- For authorized implementation, explore first, then make minimal changes that match existing patterns.",
+    "- Verify the assigned result with fresh evidence: run diagnostics, tests, and builds when required by the task or repository; read-only analysis ends with supported conclusions and explicit limits.",
     "- Escalate only after materially different approaches fail or when architecture tradeoffs exceed local implementation scope.",
     "",
     "</posture_overlay>",
@@ -68,7 +75,7 @@ const MODEL_CLASS_OVERLAYS: Record<AgentDefinition["modelClass"], string> = {
     "<model_class_guidance>",
     "",
     "This role is tuned for frontier-class models.",
-    "- Use the model's steerability for coordination, tradeoff reasoning, and precise delegation.",
+    "- Use the model's steerability for the assigned scope, tradeoff reasoning, and precise handoffs.",
     "- Favor clean routing decisions over impulsive implementation.",
     "",
     "</model_class_guidance>",
@@ -93,20 +100,6 @@ const MODEL_CLASS_OVERLAYS: Record<AgentDefinition["modelClass"], string> = {
   ].join("\n"),
 };
 
-function buildExactModelOverlay(exactModel: string): string {
-  return [
-    "<exact_model_guidance>",
-    "",
-    `This role is executing under the exact ${exactModel} model.`,
-    "- Use a strict execution order: inspect -> plan -> act -> verify.",
-    "- Treat completion criteria as explicit: only report done after the requested work is implemented and fresh verification passes.",
-    "- If requirements are ambiguous or a blocker appears, state the blocker plainly and stop guessing until the missing decision is resolved.",
-    "- Do not bluff, pad, or invent results; report missing evidence and incomplete work honestly.",
-    "",
-    "</exact_model_guidance>",
-  ].join("\n");
-}
-
 const NATIVE_SUBAGENT_LEAF_GUARD = [
   "<native_subagent_leaf_guard>",
   "",
@@ -127,7 +120,6 @@ export interface GeneratedNativeAgentConfig {
 
 interface AgentModelResolutionOptions {
   codexHomeOverride?: string;
-  configTomlContent?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -137,79 +129,26 @@ interface RoleInstructionMetadata {
   modelClass: AgentDefinition["modelClass"];
   routingRole: AgentDefinition["routingRole"];
   nativeSubagentDelegation?: AgentDefinition["nativeSubagentDelegation"];
-  exactModel?: AgentDefinition["exactModel"];
 }
 
 interface ComposeRoleInstructionsOptions {
   nativeAgent?: boolean;
 }
 
-function readConfigTomlContent(
-  codexHomeOverride?: string,
-  provided?: string,
-): string {
-  if (typeof provided === "string") return provided;
-  const configPath = join(codexHomeOverride ?? process.env.CODEX_HOME ?? "", "config.toml");
-  if (codexHomeOverride && existsSync(configPath)) {
-    return readFileSync(configPath, "utf-8");
-  }
-  return "";
-}
-
-function resolveFrontierModel(options: AgentModelResolutionOptions): string {
-  const configTomlContent = readConfigTomlContent(
-    options.codexHomeOverride,
-    options.configTomlContent,
-  );
-  return getRootModelName(configTomlContent)
-    ?? getMainDefaultModel(options.codexHomeOverride);
-}
-
-function resolveStandardModel(options: AgentModelResolutionOptions): string {
-  const explicitStandardModel = getEnvConfiguredStandardDefaultModel(
-    options.env ?? process.env,
-    options.codexHomeOverride,
-  );
-
-  if (explicitStandardModel) return explicitStandardModel;
-  return getStandardDefaultModel(options.codexHomeOverride);
-}
-
 function resolveAgentModel(
   agent: AgentDefinition,
   options: AgentModelResolutionOptions = {},
-): string {
+): string | undefined {
   const modelOverride = getAgentModelOverride(agent.name, options.codexHomeOverride);
-  if (modelOverride) {
-    return modelOverride;
-  }
-  if (agent.exactModel) {
-    return agent.exactModel;
-  }
+  if (modelOverride) return modelOverride;
 
-  if (agent.name === "executor") {
-    return resolveFrontierModel(options);
+  // Case-sensitive provider classification: custom providers like "OpenAI" do not match built-in "openai".
+  const isBuiltin = isBuiltinProvider(getCodexConfigEffectiveModelProvider(options.codexHomeOverride));
+  if (isBuiltin) {
+    return getModelClassDefaultModel(agent.modelClass, options.codexHomeOverride, options.env);
   }
-
-  switch (agent.modelClass) {
-    case "frontier":
-      return resolveFrontierModel(options);
-    case "fast":
-      return getSparkDefaultModel(options.codexHomeOverride);
-    case "standard":
-    default:
-      return resolveStandardModel(options);
-  }
-}
-
-function shouldInheritRootModelProvider(
-  agent: AgentDefinition,
-  resolvedModel: string,
-  options: AgentModelResolutionOptions = {},
-): boolean {
-  if (agent.modelClass !== "fast") return true;
-  if (getAgentModelOverride(agent.name, options.codexHomeOverride)) return true;
-  return resolvedModel !== getSparkDefaultModel(options.codexHomeOverride);
+  // Custom provider: the provider's configured model (if any) is metadata only; no tier model applies.
+  return getCodexConfigEffectiveModel(options.codexHomeOverride);
 }
 
 export function composeRoleInstructions(
@@ -228,14 +167,6 @@ export function composeRoleInstructions(
       "",
       MODEL_CLASS_OVERLAYS[metadata.modelClass],
     );
-  }
-
-  const normalizedResolvedModel = resolvedModel?.trim();
-  const exactModel = normalizedResolvedModel === EXACT_GPT_5_6_TERRA_MODEL
-    ? EXACT_GPT_5_6_TERRA_MODEL
-    : metadata?.exactModel;
-  if (exactModel && normalizedResolvedModel === exactModel) {
-    parts.push("", buildExactModelOverlay(exactModel));
   }
 
   if (options.nativeAgent === true && metadata?.nativeSubagentDelegation !== "allowed") {
@@ -283,7 +214,6 @@ export function composeRoleInstructionsForRole(
       modelClass: agent.modelClass,
       routingRole: agent.routingRole,
       nativeSubagentDelegation: agent.nativeSubagentDelegation,
-      exactModel: agent.exactModel,
     }
       : null,
     resolvedModel,
@@ -347,6 +277,10 @@ export function generateStandaloneAgentToml(
 
 /**
  * Generate TOML content for a prompt-backed OMX role agent.
+ * Includes model field for all agents for documentation and discoverability.
+ * Only includes modelProvider field if there's an explicit per-agent override,
+ * not when it merely mirrors the config default. This prevents agent TOMLs from
+ * becoming stale when config.toml provider changes (fixes #3779).
  */
 export function generateAgentToml(
   agent: AgentDefinition,
@@ -354,9 +288,10 @@ export function generateAgentToml(
   options: AgentModelResolutionOptions = {},
 ): string {
   const resolvedModel = resolveAgentModel(agent, options);
-  const resolvedModelProvider = shouldInheritRootModelProvider(agent, resolvedModel, options)
-    ? getCodexConfigRootModelProvider(options.codexHomeOverride)
-    : undefined;
+  const reasoningOverride = getAgentReasoningOverride(agent.name, options.codexHomeOverride);
+  const isBuiltin = isBuiltinProvider(getCodexConfigEffectiveModelProvider(options.codexHomeOverride));
+  const hasAgentModelOverride = !!getAgentModelOverride(agent.name, options.codexHomeOverride);
+
   return generateStandaloneAgentToml({
     name: agent.name,
     description: agent.description,
@@ -366,10 +301,14 @@ export function generateAgentToml(
       resolvedModel,
       { nativeAgent: true },
     ),
-    model: resolvedModel,
-    modelProvider: resolvedModelProvider,
-    reasoningEffort: getAgentReasoningOverride(agent.name, options.codexHomeOverride)
-      ?? agent.reasoningEffort,
+    // Built-in providers: always write the resolved tier model. Custom providers: only write the
+    // model when agentModels[role] is set; otherwise the agent inherits the provider default at runtime.
+    model: (isBuiltin || hasAgentModelOverride) ? resolvedModel : undefined,
+    // Never include modelProvider field in agent TOMLs to prevent staleness.
+    // Agents inherit model_provider from config.toml at runtime. Not pinning provider for
+    // model-only overrides allows independent provider updates at runtime.
+    modelProvider: undefined,
+    reasoningEffort: reasoningOverride ?? agent.reasoningEffort,
   });
 }
 

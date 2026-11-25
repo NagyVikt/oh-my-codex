@@ -577,6 +577,7 @@ describe('ultragoal artifacts', () => {
           goalId: first.goal!.id,
           status: 'complete',
           evidence: 'Actual planned work done for .omx/ultragoal/goals.json G001-first; validation complete; reviews clean.',
+          strict: true,
           codexGoal: { goal: { objective: taskObjective, status: 'complete' } },
         }),
         /quality-gate-json|quality gate/i,
@@ -1575,6 +1576,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
         }),
         /quality-gate-json|quality gate/i,
       );
@@ -1585,6 +1587,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             codeReview: { recommendation: 'COMMENT', architectStatus: 'CLEAR', evidence: 'not clean' },
@@ -1599,6 +1602,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             aiSlopCleaner: { status: 'not_applicable', evidence: 'skipped cleaner' },
@@ -1613,6 +1617,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             codeReview: {
@@ -1631,6 +1636,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             codeReview: {
@@ -1655,6 +1661,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             codeReview: {
@@ -1677,6 +1684,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             codeReview: {
@@ -1729,6 +1737,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: cleanQualityGate(),
         }),
         /missing proof for required invariant from \.omx\/ultragoal\/brief\.md: Preserve the existing parser boundary/i,
@@ -1804,6 +1813,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             architectureInvariantGate: {
@@ -1867,6 +1877,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             architectureInvariantGate: {
@@ -1895,6 +1906,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             architectureInvariantGate: {
@@ -1934,6 +1946,7 @@ describe('ultragoal artifacts', () => {
           status: 'complete',
           evidence: 'tests passed',
           codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
           qualityGate: {
             ...cleanQualityGate(),
             architectureInvariantGate: {
@@ -2525,6 +2538,62 @@ describe('ultragoal artifacts', () => {
       assert.match(ledger, /"event":"goal_blocked"/);
       assert.match(ledger, /no such table: thread_goals/);
       assert.match(ledger, /strict completion reconciliation is deferred/);
+    });
+  });
+
+  it('guides missing native get_goal inventory with native-catalog remediation instead of DB/schema advice', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, { brief: 'brief', goals: [{ title: 'First', objective: 'Complete first milestone.' }] });
+      const first = await startNextUltragoal(cwd);
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'complete',
+          evidence: 'implementation complete but native get_goal is missing',
+          codexGoal: { error: 'INVALID_ARGUMENT: Native nested tool inventory did not return one matching catalog record' },
+          qualityGate: cleanQualityGate(),
+        }),
+        (error: unknown) => {
+          assert.match(String(error), /native get_goal tool is missing from the Codex tool catalog/);
+          assert.match(String(error), /--status blocked/);
+          assert.match(String(error), /native tool catalog does not expose get_goal/);
+          assert.doesNotMatch(String(error), /no such table: thread_goals/);
+          return true;
+        },
+      );
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals[0]?.status, 'in_progress');
+      assert.equal(plan.goals[0]?.completedAt, undefined);
+    });
+  });
+
+  it('mentions missing native get_goal catalog in rejected blocked-checkpoint input guidance', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, { brief: 'brief', goals: [{ title: 'First', objective: 'Complete first milestone.' }] });
+      const first = await startNextUltragoal(cwd);
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'blocked',
+          evidence: 'blocked without a usable get_goal snapshot',
+          codexGoal: { metadata: { unavailable: true } },
+        }),
+        /missing native get_goal tool catalog/,
+      );
+    });
+  });
+
+  it('records missing native get_goal inventory as a non-terminal blocked checkpoint', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, { brief: 'brief', goals: [{ title: 'First', objective: 'Complete first milestone.' }] });
+      const first = await startNextUltragoal(cwd);
+      const updated = await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id, status: 'blocked',
+        evidence: 'get_goal is missing from the native tool catalog; completion is not verified',
+        codexGoal: { error: 'INVALID_ARGUMENT: Native nested tool inventory did not return one matching catalog record' },
+      });
+      assert.equal(updated.goals[0]?.status, 'in_progress');
+      assert.equal(updated.goals[0]?.completedAt, undefined);
     });
   });
 
@@ -3260,3 +3329,152 @@ describe('ultragoal artifacts', () => {
   });
 
 });
+
+  it('ordinary final checkpoint completes without cohort gate; strict requires it', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      // Ordinary (default) completes with no cohort gate.
+      await checkpointUltragoal(cwd, {
+        goalId: started.goal!.id,
+        status: 'complete',
+        evidence: 'tests passed',
+        codexGoal: { goal: { objective, status: 'complete' } },
+      });
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals[0]?.status, 'complete');
+      assert.equal(isUltragoalDone(plan), true);
+    });
+
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          strict: true,
+        }),
+        /quality-gate-json|quality gate/i,
+      );
+      // Strict with valid gate succeeds.
+      await checkpointUltragoal(cwd, {
+        goalId: started.goal!.id,
+        status: 'complete',
+        evidence: 'tests passed',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+        strict: true,
+      });
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals[0]?.status, 'complete');
+    });
+  });
+
+  it('ordinary treats review lanes as advisory while strict enforces them', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      const advisoryGate = {
+        ...cleanQualityGate(),
+        codeReview: { recommendation: 'COMMENT', architectStatus: 'CLEAR', evidence: 'advisory only' },
+      };
+      // Ordinary ignores cohort fields and completes.
+      await checkpointUltragoal(cwd, {
+        goalId: started.goal!.id,
+        status: 'complete',
+        evidence: 'tests passed',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: advisoryGate,
+      });
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals[0]?.status, 'complete');
+    });
+
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      const advisoryGate = {
+        ...cleanQualityGate(),
+        codeReview: { recommendation: 'COMMENT', architectStatus: 'CLEAR', evidence: 'advisory only' },
+      };
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'complete',
+          evidence: 'tests passed',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: advisoryGate,
+          strict: true,
+        }),
+        /APPROVE/,
+      );
+    });
+  });
+  it('keeps template, Conductor handoff, and advisory-hook policy consistent for Codex App native support (#3635)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { join: joinPath, dirname: dirnamePath } = await import('node:path');
+    const { fileURLToPath: fileURLToPathFn } = await import('node:url');
+    const repoRoot = joinPath(dirnamePath(fileURLToPathFn(import.meta.url)), '../../../');
+    const template = readFileSync(joinPath(repoRoot, 'templates/AGENTS.md'), 'utf-8');
+
+    // Codex App shape: typed native agents available, no separate authenticated receipt surface.
+    const codexAppSupport = {
+      status: 'supported' as const,
+      source: 'hook_payload_available_tools' as const,
+      evidenceSummary: 'collaboration.spawn_agent',
+    };
+
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'App repair', objective: 'Complete bounded local repair.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const instruction = buildCodexGoalInstruction(started.goal!, started.plan, { nativeSubagentSupport: codexAppSupport });
+
+      // Supported-mode handoff keeps the Main-root Conductor block AND states the reachable native path.
+      assert.match(instruction, new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+      assert.match(instruction, /delegated performer lanes may implement, mutate, and report bounded work directly/i);
+      assert.match(instruction, /ordinary native reporting is completion, not a separate authority grant/i);
+
+      // The generated template must agree: no verification/advice-only denial, no separate-proof requirement.
+      assert.match(template, /may implement, mutate, and report bounded delegated work directly/i);
+      assert.match(template, /reporting back through the native result surface is ordinary completion/i);
+      assert.doesNotMatch(template, /native children are verification\/advice-only/i);
+      assert.doesNotMatch(template, /separate host-authenticated caller, parent, and target proof/i);
+
+      // Advisory-hook policy: handoff must not demand a host-authenticated receipt for ordinary reporting.
+      assert.doesNotMatch(instruction, /host-authenticated/i);
+
+      // Unsupported mode still degrades accurately with a supported recovery path.
+      const unsupported = {
+        status: 'unsupported' as const,
+        reason: 'native_subagents_unsupported' as const,
+        source: 'persisted_support_blocker' as const,
+        evidenceSummary: 'native subagents are disabled in this runtime',
+      };
+      const unsupportedInstruction = buildCodexGoalInstruction(started.goal!, started.plan, { nativeSubagentSupport: unsupported });
+      assert.doesNotMatch(unsupportedInstruction, new RegExp(escapeRegExp(LEADER_CONDUCTOR_BLOCK)));
+      assert.match(unsupportedInstruction, new RegExp(escapeRegExp(buildUnsupportedNativeSubagentGuidance(unsupported))));
+      assert.match(unsupportedInstruction, /record-review-blockers/);
+    });
+  });

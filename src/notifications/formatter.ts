@@ -8,8 +8,8 @@
 import type { FullNotificationPayload } from "./types.js";
 import { basename } from "path";
 
-/** ANSI CSI escape sequences and two-character escapes */
-const ANSI_RE = /\x1b(?:[@-Z\\-_]|\[[0-9;]*[A-Za-z])/g;
+/** ANSI CSI/two-character escapes and OSC terminal-control sequences */
+const ANSI_RE = /(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c)|\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g;
 
 /** OMX UI chrome: spinner/progress indicator characters */
 const SPINNER_LINE_RE = /^[●⎿✻·◼]/;
@@ -106,7 +106,7 @@ export function parseTmuxTail(raw: string): string {
 }
 
 function formatDuration(ms?: number): string {
-  if (!ms) return "unknown";
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "unknown";
   const seconds = Math.floor(ms / 1000);
   const minutes = Math.floor(seconds / 60);
   const hours = Math.floor(minutes / 60);

@@ -18,10 +18,15 @@ import {
   markQuestionTerminalError,
   markQuestionPrompting,
   QuestionSubmitError,
+  readQuestionRecord,
   submitQuestionAnswerById,
   waitForQuestionTerminalState,
 } from '../question/state.js';
-import { isQuestionRendererAlive, launchQuestionRenderer } from '../question/renderer.js';
+import {
+  isQuestionRendererAlive,
+  launchQuestionRenderer,
+  QuestionRendererLaunchError,
+} from '../question/renderer.js';
 import { normalizeQuestionInput } from '../question/types.js';
 import { runQuestionUi } from '../question/ui.js';
 
@@ -246,7 +251,13 @@ export async function questionCommand(args: string[]): Promise<void> {
 
   if (parsed.ui) {
     if (!parsed.statePath) throw new Error('--ui requires --state-path');
-    await runQuestionUi(parsed.statePath);
+    try {
+      await runQuestionUi(parsed.statePath);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Question UI failed: ${message}`);
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -356,8 +367,9 @@ export async function questionCommand(args: string[]): Promise<void> {
   });
 
   let finalRecord;
+  let waitingForAnswer = false;
   try {
-    const renderer = launchQuestionRenderer({
+    const renderer = await launchQuestionRenderer({
       cwd,
       recordPath,
       sessionId: policy.sessionId,
@@ -369,6 +381,7 @@ export async function questionCommand(args: string[]): Promise<void> {
         parsed.json ? { output: createJsonSafeInlineQuestionOutput() } : {},
       );
     }
+    waitingForAnswer = true;
     finalRecord = await waitForQuestionTerminalState(recordPath, {
       timeoutMs: waitTimeoutMs,
       rendererAlive: (currentRecord) => isQuestionRendererAlive(currentRecord.renderer),
@@ -377,34 +390,50 @@ export async function questionCommand(args: string[]): Promise<void> {
       ),
     });
   } catch (error) {
-    const message = extractErrorMessage(error);
-    const errorRecord = await markQuestionTerminalError(
-      recordPath,
-      'error',
-      'question_runtime_failed',
-      message,
-    );
-    await appendQuestionEvent(cwd, 'question-error', errorRecord, {
-      recordPath,
-      timeoutMs: waitTimeoutMs,
-    });
-    await finalizeDirectDeepInterviewObligation(
-      cwd,
-      policy.sessionId,
-      directDeepInterviewObligation,
-      { status: 'cleared' },
-    );
-    printJson({
-      ok: false,
-      question_id: record.question_id,
-      session_id: record.session_id,
-      error: {
-        code: 'question_runtime_failed',
+    let message = extractErrorMessage(error);
+    const code = error instanceof QuestionRendererLaunchError
+      ? error.code
+      : 'question_runtime_failed';
+    let errorRecord;
+    try {
+      errorRecord = await markQuestionTerminalError(
+        recordPath,
+        'error',
+        code,
         message,
-      },
-    }, parsed.json);
-    process.exitCode = 1;
-    return;
+      );
+    } catch (commitError) {
+      // The submit lock needs manual recovery: leave the lock and the record untouched,
+      // but still report the failure and release the deep-interview wait obligation.
+      const commitMessage = extractErrorMessage(commitError);
+      if (commitMessage !== message) message = `${message}; ${commitMessage}`;
+      errorRecord = (await readQuestionRecord(recordPath)) ?? record;
+    }
+    if (waitingForAnswer && errorRecord.status === 'answered') {
+      finalRecord = errorRecord;
+    } else {
+      await appendQuestionEvent(cwd, 'question-error', errorRecord, {
+        recordPath,
+        timeoutMs: waitTimeoutMs,
+      });
+      await finalizeDirectDeepInterviewObligation(
+        cwd,
+        policy.sessionId,
+        directDeepInterviewObligation,
+        { status: 'cleared' },
+      );
+      printJson({
+        ok: false,
+        question_id: record.question_id,
+        session_id: record.session_id,
+        error: {
+          code,
+          message,
+        },
+      }, parsed.json);
+      process.exitCode = 1;
+      return;
+    }
   }
 
   if (finalRecord.status !== 'answered' || !finalRecord.answer) {

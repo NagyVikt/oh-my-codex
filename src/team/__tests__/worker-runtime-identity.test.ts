@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, readFile, mkdir, chmod } from 'fs/promises';
 import { join } from 'path';
@@ -19,6 +19,17 @@ import {
 } from '../runtime.js';
 import { scaleUp } from '../scaling.js';
 import { resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
+
+const ORIGINAL_OMX_RUNTIME_BRIDGE = process.env.OMX_RUNTIME_BRIDGE;
+
+beforeEach(() => {
+  process.env.OMX_RUNTIME_BRIDGE = '0';
+});
+
+afterEach(() => {
+  if (typeof ORIGINAL_OMX_RUNTIME_BRIDGE === 'string') process.env.OMX_RUNTIME_BRIDGE = ORIGINAL_OMX_RUNTIME_BRIDGE;
+  else delete process.env.OMX_RUNTIME_BRIDGE;
+});
 
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
@@ -207,10 +218,10 @@ process.on('SIGTERM', () => process.exit(0));
       assert.ok(worker2Args, 'worker-2 argv capture file should be written');
       const worker1Joined = worker1Args!.join(' ');
       const worker2Joined = worker2Args!.join(' ');
-      assert.match(worker1Joined, /model_reasoning_effort="low"/);
-      assert.match(worker1Joined, /--model gpt-5\.6-luna/);
+      assert.match(worker1Joined, /model_reasoning_effort="medium"/);
+      assert.match(worker1Joined, /--model gpt-6-luna/);
       assert.match(worker2Joined, /model_reasoning_effort="low"/);
-      assert.match(worker2Joined, /--model gpt-5\.6-luna/);
+      assert.match(worker2Joined, /--model gpt-6-luna/);
 
       await shutdownTeam(runtime.teamName, cwd, { force: true });
       runtime = null;
@@ -315,7 +326,7 @@ process.on('SIGTERM', () => process.exit(0));
         join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'runtime', 'worker-2-startup.sh'),
         'utf-8',
       );
-      assert.match(startupScript, /gpt-5\.6-luna/);
+      assert.match(startupScript, /gpt-6-luna/);
       execFileSync('sh', ['-n', join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'runtime', 'worker-2-startup.sh')]);
       assert.match(startupScript, /model_reasoning_effort.*low/);
     } finally {

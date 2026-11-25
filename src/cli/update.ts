@@ -21,6 +21,7 @@ import {
 } from './setup-preferences.js';
 import {
   isCompletePackageManagerOwnership,
+  isWorkingTreeInstall,
   packageManagerOwnershipError,
   resolvePackageManagerOwnership,
   runNpmCommand,
@@ -32,6 +33,7 @@ import {
   writeUserInstallStamp,
   type UserInstallStamp,
 } from '../scripts/postinstall-advisory.js';
+import { hydrateOmxRuntimeNonFatal } from '../scripts/postinstall.js';
 export {
   isInstallVersionBump,
   readUserInstallStamp,
@@ -55,7 +57,7 @@ interface PackageManifest {
 }
 
 export interface UpdateExecutionResult {
-  status: 'updated' | 'scheduled' | 'up-to-date' | 'declined' | 'failed' | 'unavailable';
+  status: 'updated' | 'scheduled' | 'up-to-date' | 'declined' | 'failed' | 'skipped' | 'unavailable';
   currentVersion: string | null;
   latestVersion: string | null;
 }
@@ -82,7 +84,6 @@ const DEV_INSTALL_SOURCE = 'github:Yeachan-Heo/oh-my-codex#dev';
 const DEV_REPOSITORY_URL = 'https://github.com/Yeachan-Heo/oh-my-codex.git';
 const DEV_REPOSITORY_BRANCH = 'dev';
 const DEV_UPDATE_TIMEOUT_MS = 300000;
-const SKIP_NATIVE_AGENT_REFRESH_ENV = 'OMX_SKIP_NATIVE_AGENT_REFRESH';
 
 export function resolveUpdateChannelConfig(channel: UpdateChannel = 'stable'): UpdateChannelConfig {
   if (channel === 'dev') {
@@ -435,7 +436,7 @@ interface DeferredUpdatePayload {
   logPath: string;
   parentPid: number;
   ownership: PackageManagerOwnership;
-  setupArgs: string[];
+  setupArgs: string[] | null;
 }
 
 export function runDeferredGlobalUpdate(
@@ -455,7 +456,12 @@ export function runDeferredGlobalUpdate(
     stage = mkdtempSync(join(tmpdir(), 'omx-update-'));
     if (platform !== 'win32') chmodSync(stage, 0o700);
     const payloadPath = join(stage, 'transaction.json');
-    const payload: DeferredUpdatePayload = { cwd, logPath, parentPid, ownership, setupArgs: resolveSetupRefreshArgs(cwd) };
+    // A launcher like Cue owns the generated CODEX_HOME. Freeze its handoff
+    // in the same payload as ownership, not in the npm worker's environment.
+    const setupArgs = process.env.OMX_DEFERRED_UPDATE_SETUP === 'external'
+      ? null
+      : resolveSetupRefreshArgs(cwd);
+    const payload: DeferredUpdatePayload = { cwd, logPath, parentPid, ownership, setupArgs };
     const serialized = JSON.stringify(payload);
     writeFileSync(payloadPath, serialized, { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
     const canonicalStage = realpathSync(stage);
@@ -479,7 +485,7 @@ export function runDeferredGlobalUpdate(
     const workerFingerprint = createHash('sha256').update(readFileSync(workerPath)).digest('hex');
     const stagedDirectory = stage;
     const child = spawnProcess(process.execPath, [workerPath, payloadPath, payloadFingerprint, workerFingerprint], {
-      cwd, detached: true, env: { ...ownership.environment, [SKIP_NATIVE_AGENT_REFRESH_ENV]: '1' }, stdio: 'ignore', windowsHide: true,
+      cwd, detached: true, env: ownership.environment, stdio: 'ignore', windowsHide: true,
     });
     child.once('error', (error) => {
       try {
@@ -562,11 +568,13 @@ interface UpdateDependencies {
   getCurrentVersion: typeof getCurrentVersion;
   getInstalledVersionAfterUpdate: typeof getInstalledVersionAfterUpdate;
   getInstalledRevisionAfterUpdate: typeof getInstalledRevisionAfterUpdate;
+  isWorkingTreeInstall: () => boolean;
   readUserInstallStamp: typeof readUserInstallStamp;
   resolvePackageManagerOwnership: () => Promise<PackageManagerOwnership | null>;
   runGlobalUpdate: (installSource: string, ownership?: PackageManagerOwnership) => RunGlobalUpdateResult;
   runDeferredGlobalUpdate: (cwd: string, ownership?: PackageManagerOwnership) => RunDeferredUpdateResult;
   runSetupRefresh: (cwd: string, ownership?: PackageManagerOwnership) => Promise<RunSetupRefreshResult>;
+  hydrateRuntime: (ownership?: PackageManagerOwnership) => Promise<string | undefined>;
   writeUpdateState: typeof writeUpdateState;
 }
 
@@ -583,11 +591,16 @@ const defaultUpdateDependencies: UpdateDependencies = {
   getCurrentVersion,
   getInstalledVersionAfterUpdate,
   getInstalledRevisionAfterUpdate,
+  isWorkingTreeInstall: () => isWorkingTreeInstall(getPackageRoot()),
   readUserInstallStamp,
   resolvePackageManagerOwnership: resolveCurrentPackageManagerOwnership,
   runGlobalUpdate: (installSource, ownership) => runGlobalUpdate(installSource, spawnSync, process.platform, ownership),
   runDeferredGlobalUpdate: (cwd, ownership) => runDeferredGlobalUpdate(cwd, spawn, process.platform, process.pid, ownership),
   runSetupRefresh,
+  hydrateRuntime: (ownership) => hydrateOmxRuntimeNonFatal({
+    packageRoot: ownership?.packageRoot,
+    env: ownership?.environment,
+  }),
   writeUpdateState,
 }
 
@@ -747,8 +760,21 @@ async function runSetupRefresh(cwd: string, ownership?: PackageManagerOwnership)
     cwd,
     spawnSync,
     process.execPath,
-    { ...ownership.environment, [SKIP_NATIVE_AGENT_REFRESH_ENV]: '1' },
+    ownership.environment,
   );
+}
+
+function workingTreeInstallNotice(): string {
+  return `[omx] This build runs from a working tree (${getPackageRoot()}), which no package manager owns. Self-update is refused; pull and rebuild the checkout instead.`;
+}
+
+/** Stamp the cadence even when the check is skipped so an unowned build is not re-probed every launch. */
+async function recordUpdateCheck(dependencies: UpdateDependencies, cwd: string, nowMs: number): Promise<void> {
+  try {
+    await dependencies.writeUpdateState(cwd, { last_checked_at: new Date(nowMs).toISOString() });
+  } catch {
+    // Cadence bookkeeping must never block or fail a launch.
+  }
 }
 
 async function executeUpdate(
@@ -780,6 +806,11 @@ async function executeUpdate(
     ? await dependencies.resolvePackageManagerOwnership()
     : null;
   if (usesNativeTransaction && !ownership) {
+    if (dependencies.isWorkingTreeInstall()) {
+      if (immediate) console.log(workingTreeInstallNotice());
+      else await recordUpdateCheck(dependencies, cwd, nowMs);
+      return { status: 'skipped', currentVersion: null, latestVersion: null };
+    }
     console.log(packageManagerOwnershipError());
     return { status: 'failed', currentVersion: null, latestVersion: null };
   }
@@ -831,7 +862,13 @@ async function executeUpdate(
         return { status: 'up-to-date', currentVersion: current, latestVersion: latest };
       }
     }
-
+    // Same version, nothing to install — but the version-keyed native cache
+    // may still be empty (issue #3636: `omx update` on macOS arm64 reinstalled
+    // 0.21.3 yet never hydrated omx-runtime, so doctor kept failing). Repair
+    // the cache before reporting up-to-date so the check is not a no-op for
+    // this failure mode. Immediate and passive runs share the repair; the
+    // setup-refresh branch above returns before reaching it.
+    await dependencies.hydrateRuntime(ownership ?? undefined);
     if (immediate) {
       console.log(`[omx] oh-my-codex is already up to date (v${updateCheckBaseline}).`);
     }
@@ -876,6 +913,11 @@ async function executeUpdate(
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
 
+  // Installation already replaced the package with --ignore-scripts. Repair
+  // the version-keyed native cache before setup so a setup failure cannot
+  // strand the successfully installed package without omx-runtime.
+  await dependencies.hydrateRuntime(ownership ?? undefined);
+
   const setupRefreshResult = await dependencies.runSetupRefresh(cwd, ownership ?? undefined);
   if (!setupRefreshResult.ok) {
     console.log(
@@ -883,7 +925,6 @@ async function executeUpdate(
     );
     return { status: 'failed', currentVersion: current, latestVersion: latest };
   }
-
   const installedVersion = await dependencies.getInstalledVersionAfterUpdate(ownership ?? undefined);
   const installedRevision = channelConfig.channel === 'dev'
     ? ((await dependencies.getInstalledRevisionAfterUpdate(ownership ?? undefined)) ?? result.revision ?? null)

@@ -5,6 +5,7 @@ import {
 	recordDirectorySyncOutcome,
 	recordRegularFileSyncOutcome,
 	syncDirectory,
+	syncFileDescriptorSync,
 	syncRegularFile,
 	type RegularFileDurabilityTracker,
 } from "../file-durability.js";
@@ -60,6 +61,31 @@ for (const { description, platform, failure } of [
 	test(`regular-file sync preserves fatal error identity for ${description}`, async () => {
 		await assert.rejects(
 			syncRegularFile({ sync: async () => { throw failure; } }, platform),
+			(error: unknown) => error === failure,
+		);
+	});
+}
+
+test("synchronous descriptor sync returns the Windows EPERM durability outcome", () => {
+	const outcome = syncFileDescriptorSync(7, "win32", () => { throw errno("EPERM"); });
+	assert.equal(outcome, "unsupported-windows-eperm");
+});
+
+test("synchronous descriptor sync passes the descriptor through on success", () => {
+	const synced: number[] = [];
+	assert.equal(syncFileDescriptorSync(7, "win32", (fd) => { synced.push(fd); }), "synced");
+	assert.deepEqual(synced, [7]);
+});
+
+for (const { description, platform, failure } of [
+	{ description: "Linux EPERM", platform: "linux", failure: errno("EPERM") },
+	{ description: "Windows EACCES", platform: "win32", failure: errno("EACCES") },
+	{ description: "Windows non-string code", platform: "win32", failure: errno(1) },
+	{ description: "Windows message-only EPERM", platform: "win32", failure: new Error("EPERM") },
+] as const) {
+	test(`synchronous descriptor sync preserves fatal error identity for ${description}`, () => {
+		assert.throws(
+			() => syncFileDescriptorSync(7, platform, () => { throw failure; }),
 			(error: unknown) => error === failure,
 		);
 	});
@@ -123,6 +149,26 @@ test("durability warning names combined regular-file and directory degradation",
 	}
 	assert.deepEqual(warnings, [
 		"[omx] warning: Windows EPERM regular-file and directory fsync unsupported in native-hook setup; operation succeeded with degraded durability.\n",
+	]);
+});
+
+test("plugin cache publication treats Windows EPERM fsync as degraded success", () => {
+	const tracker: RegularFileDurabilityTracker = { degraded: false };
+	recordRegularFileSyncOutcome(tracker, "unsupported-windows-eperm");
+	recordDirectorySyncOutcome(tracker, "unsupported-windows-eperm");
+	const originalWrite = process.stderr.write;
+	const warnings: string[] = [];
+	process.stderr.write = ((value: string) => {
+		warnings.push(value);
+		return true;
+	}) as typeof process.stderr.write;
+	try {
+		emitDegradedDurabilityWarning("plugin cache publication", tracker);
+	} finally {
+		process.stderr.write = originalWrite;
+	}
+	assert.deepEqual(warnings, [
+		"[omx] warning: Windows EPERM regular-file and directory fsync unsupported in plugin cache publication; operation succeeded with degraded durability.\n",
 	]);
 });
 

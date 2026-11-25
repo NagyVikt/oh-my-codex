@@ -60,6 +60,7 @@ export interface WorkerHeartbeat {
 export interface WorkerStatus {
   state: 'idle' | 'working' | 'blocked' | 'done' | 'failed' | 'draining' | 'unknown';
   current_task_id?: string;
+  current_claim_token?: string;
   reason?: string;
   updated_at: string;
 }
@@ -116,6 +117,7 @@ export interface TeamTask {
   description: string;
   status: TeamTaskStatus;
   requires_code_change?: boolean;
+  verified_head?: string; // Set only by validated code completion.
   role?: string;
   owner?: string;
   result?: string;
@@ -137,6 +139,7 @@ export interface TeamTask {
 }
 
 export interface TeamTaskClaim {
+  claimed_at?: string;
   owner: string;
   token: string;
   leased_until: string;
@@ -188,6 +191,7 @@ export interface TeamDispatchRequest {
   inbox_correlation_key?: string;
   transport_preference: TeamDispatchTransportPreference;
   fallback_allowed: boolean;
+  creation_transport?: 'legacy-json';
   status: TeamDispatchRequestStatus;
   attempt_count: number;
   created_at: string;
@@ -303,9 +307,13 @@ export type ClaimTaskResult =
   | { ok: true; task: TeamTaskV2; claimToken: string }
   | { ok: false; error: 'claim_conflict' | 'blocked_dependency' | 'task_not_found' | 'already_terminal' | 'worker_not_found'; dependencies?: string[] };
 
+export type RenewTaskClaimResult =
+  | { ok: true; task: TeamTaskV2 }
+  | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'worker_not_found' };
+
 export type TransitionTaskResult =
   | { ok: true; task: TeamTaskV2 }
-  | { ok: false; error: 'claim_conflict' | 'invalid_transition' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'missing_delegation_compliance_evidence' | 'missing_coordination_compliance_evidence' };
+  | { ok: false; error: 'claim_conflict' | 'invalid_transition' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'missing_delegation_compliance_evidence' | 'missing_coordination_compliance_evidence' | 'invalid_completion_evidence'; reason?: string };
 
 export type ReleaseTaskClaimResult =
   | { ok: true; task: TeamTaskV2 }

@@ -6,7 +6,6 @@ import type {
 
 export const NON_NATIVE_AGENT_PROMPT_ASSETS = new Set([
   "explore-harness",
-  "sisyphus-lite",
   "team-orchestrator",
 ]);
 
@@ -34,16 +33,6 @@ export function getInstallableNativeAgentNames(
   return new Set(
     manifest.agents
       .filter((agent) => isNativeAgentInstallableStatus(agent.status))
-      .map((agent) => agent.name),
-  );
-}
-
-export function getNonInstallableNativeAgentNames(
-  manifest: Pick<CatalogManifest, "agents">,
-): Set<string> {
-  return new Set(
-    manifest.agents
-      .filter((agent) => !isNativeAgentInstallableStatus(agent.status))
       .map((agent) => agent.name),
   );
 }

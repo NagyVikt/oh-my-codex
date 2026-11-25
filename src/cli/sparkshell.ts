@@ -180,10 +180,13 @@ export async function resolveSparkShellBinaryPathWithHydration(
   const hydrated = await hydrateNativeBinary('omx-sparkshell', { packageRoot, env, platform, arch });
   if (hydrated) return hydrated;
 
+  const isDev = version.endsWith('-dev');
   throw new Error(
-    `[sparkshell] native binary not found. Checked cached/native candidates under ${packageRoot}, ${repoLocal}, and ${nestedRepoLocal}. `
-      + `${rejectedCache ? `Rejected managed cache entry ${rejectedCache.path} (${rejectedCache.state}). ` : ''}`
-      + `Reconnect to the network so OMX can fetch the release asset, or set ${OMX_SPARKSHELL_BIN_ENV} to override the path.`,
+    isDev
+      ? `[sparkshell] native binary unavailable for dev build. Set ${OMX_SPARKSHELL_BIN_ENV} to an existing binary path, or build the native binary locally.`
+      : `[sparkshell] native binary not found. Checked cached/native candidates under ${packageRoot}, ${repoLocal}, and ${nestedRepoLocal}. `
+        + `${rejectedCache ? `Rejected managed cache entry ${rejectedCache.path} (${rejectedCache.state}). ` : ''}`
+        + `Reconnect to the network so OMX can fetch the release asset, or set ${OMX_SPARKSHELL_BIN_ENV} to override the path.`,
   );
 }
 
@@ -294,6 +297,14 @@ function stripSparkShellWrapperOptions(args: readonly string[]): string[] {
   return [];
 }
 
+function parseTailLines(value: string): number {
+  const parsed = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isInteger(parsed) || parsed < 100 || parsed > 1000) {
+    throw new Error(`--tail-lines must be an integer between 100 and 1000.\n${SPARKSHELL_USAGE}`);
+  }
+  return parsed;
+}
+
 export function parseSparkShellFallbackInvocation(
   args: readonly string[],
   options: ParseSparkShellFallbackOptions = {},
@@ -343,21 +354,13 @@ export function parseSparkShellFallbackInvocation(
     if (token === '--tail-lines') {
       const next = args[index + 1];
       if (!next || next.startsWith('-')) throw new Error(`--tail-lines requires a numeric value.\n${SPARKSHELL_USAGE}`);
-      const parsed = Number.parseInt(next, 10);
-      if (!Number.isFinite(parsed) || parsed < 100 || parsed > 1000) {
-        throw new Error(`--tail-lines must be an integer between 100 and 1000.\n${SPARKSHELL_USAGE}`);
-      }
-      tailLines = parsed;
+      tailLines = parseTailLines(next);
       sawTailLines = true;
       index += 1;
       continue;
     }
     if (token.startsWith('--tail-lines=')) {
-      const parsed = Number.parseInt(token.slice('--tail-lines='.length), 10);
-      if (!Number.isFinite(parsed) || parsed < 100 || parsed > 1000) {
-        throw new Error(`--tail-lines must be an integer between 100 and 1000.\n${SPARKSHELL_USAGE}`);
-      }
-      tailLines = parsed;
+      tailLines = parseTailLines(token.slice('--tail-lines='.length));
       sawTailLines = true;
       continue;
     }

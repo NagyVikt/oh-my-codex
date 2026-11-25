@@ -218,7 +218,7 @@ function resolveInstalledNpmCommand(dependencies: Pick<PackageManagerOwnershipDe
       path.join(globalInstallRoot, 'npm', 'bin', 'npm-cli.js'),
       ...(dependencies.platform === 'win32'
         ? [path.join(path.dirname(node), 'node_modules', 'npm', 'bin', 'npm-cli.js')]
-        : []),
+        : [path.join(path.dirname(path.dirname(node)), 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')]),
     ];
     for (const candidate of candidates) {
       try {
@@ -374,6 +374,25 @@ export async function resolvePackageManagerOwnership(dependencies: Partial<Packa
     }
   }
   return candidates.length === 1 ? candidates[0]! : null;
+}
+
+/**
+ * A package root outside any `node_modules` directory is a working-tree build — a checkout run
+ * directly, or linked into a global root with `npm link` — so no package manager owns it and a
+ * self-update transaction would overwrite the developer's tree.
+ */
+export function isWorkingTreeInstall(
+  currentPackageRoot: string,
+  platform: NodeJS.Platform = process.platform,
+  realpath: (path: string) => string = realpathSync,
+): boolean {
+  try {
+    const path = platformPath(platform);
+    const packageRoot = realpath(currentPackageRoot);
+    return path.basename(path.dirname(packageRoot)).toLowerCase() !== 'node_modules';
+  } catch {
+    return false;
+  }
 }
 
 export function packageManagerOwnershipError(): string {

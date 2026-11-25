@@ -1,3 +1,5 @@
+mod lease_mutex;
+
 use fs2::FileExt;
 use omx_mux::{canonical_contract_summary, MuxAdapter, MuxOperation, MuxTarget, TmuxAdapter};
 use omx_runtime_core::{runtime_contract_summary, RuntimeCommand, RuntimeEngine};
@@ -25,6 +27,7 @@ fn run() -> Result<(), String> {
             if second == Some("--json") {
                 let summary = serde_json::json!({
                     "schema_version": omx_runtime_core::RUNTIME_SCHEMA_VERSION,
+                    "capabilities": omx_runtime_core::RUNTIME_CAPABILITIES,
                     "commands": omx_runtime_core::RUNTIME_COMMAND_NAMES,
                     "events": omx_runtime_core::RUNTIME_EVENT_NAMES,
                     "transport": "tmux",
@@ -68,7 +71,12 @@ fn run() -> Result<(), String> {
             }
             Ok(())
         }
-        Some("exec") => {
+        Some("exec") | Some("exec-scoped") => {
+            if first == Some("exec-scoped")
+                && !omx_runtime_core::RUNTIME_CAPABILITIES.contains(&"team-mailbox-scope-v1")
+            {
+                return Err("omx-runtime requires team-mailbox-scope-v1".to_string());
+            }
             let json_input = second.ok_or("exec requires a JSON command argument")?;
             let state_dir = args.iter().find_map(|a| a.strip_prefix("--state-dir="));
             let compact = args.iter().any(|a| a == "--compact");
@@ -117,12 +125,18 @@ fn run() -> Result<(), String> {
                     .map_err(|e| format!("compatibility view failed: {e}"))?;
             }
 
+            let mut response = serde_json::to_value(&event).map_err(|e| e.to_string())?;
+            if matches!(event, omx_runtime_core::RuntimeEvent::SnapshotCaptured) {
+                response["dispatch_records"] =
+                    serde_json::to_value(engine.dispatch_records()).map_err(|e| e.to_string())?;
+            }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&event).map_err(|e| e.to_string())?
+                serde_json::to_string_pretty(&response).map_err(|e| e.to_string())?
             );
             Ok(())
         }
+        Some("lease-mutex") => lease_mutex::run(&args[1..]),
         Some("fs-rename-no-replace") => run_fs_rename_no_replace(&args[1..]),
         Some("process-identity") => run_process_identity(&args[1..]),
         Some("init") => {
@@ -533,6 +547,8 @@ fn print_usage() {
         "  snapshot [--json] [--state-dir=DIR]  print a runtime snapshot\n",
         "  mux-contract                        print the mux boundary summary\n",
         "  exec <json> [--state-dir=DIR]       process a runtime command from JSON\n",
+        "  exec-scoped <json> [--state-dir=DIR]  require Team isolation in the executing process\n",
+        "  lease-mutex <absolute-canonical-dir> <expected-dev> <expected-ino> <safe-leaf>  hold native lease mutex over stdin JSON protocol\n",
         "  init <state-dir>                    initialize a fresh state directory\n",
     ));
 }

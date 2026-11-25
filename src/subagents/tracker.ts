@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, ftruncateSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fchmodSync, ftruncateSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { AGENT_DEFINITIONS } from '../agents/definitions.js';
 import { getBaseStateDir } from '../state/paths.js';
+import { isUnsupportedNativeSubagentEvidenceForScope } from '../leader/contract.js';
 
 
 import { codexAgentsDir, projectCodexAgentsDir } from '../utils/paths.js';
@@ -26,6 +27,8 @@ export interface TrackedSubagentThread {
   kind: 'leader' | 'subagent';
   first_seen_at: string;
   last_seen_at: string;
+  /** Descriptive HUD lifecycle marker; it never grants reopen authority. */
+  native_started_at?: string;
   completed_at?: string;
   last_turn_id?: string;
   last_completed_turn_id?: string;
@@ -78,6 +81,7 @@ export interface RecordSubagentTurnInput {
   agentNickname?: string;
   kind?: 'leader' | 'subagent';
   leaderThreadId?: string;
+  nativeStarted?: boolean;
   completed?: boolean;
   completionSource?: string;
   status?: SubagentAvailabilityStatus;
@@ -97,6 +101,7 @@ export interface NativeSubagentAuthorityObservation {
   authorityEvidence?: 'valid' | 'untrusted' | 'absent';
   implicatedChildThreadIds?: string[];
   mode?: string;
+  agentNickname?: string;
   timestamp?: string;
 }
 
@@ -312,6 +317,9 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
         kind,
         first_seen_at: firstSeenAt,
         last_seen_at: lastSeenAt,
+        ...(typeof candidate.native_started_at === 'string' && Number.isFinite(Date.parse(candidate.native_started_at))
+          ? { native_started_at: candidate.native_started_at }
+          : {}),
         ...(typeof candidate.last_turn_id === 'string' && candidate.last_turn_id.trim().length > 0 ? { last_turn_id: candidate.last_turn_id } : {}),
         ...(typeof candidate.completed_at === 'string' && candidate.completed_at.trim().length > 0 ? { completed_at: candidate.completed_at } : {}),
         ...(typeof candidate.last_completed_turn_id === 'string' && candidate.last_completed_turn_id.trim().length > 0
@@ -689,7 +697,7 @@ function crossProcessLockStagePath(resourcePath: string, token: string): string 
 }
 
 function createCrossProcessLockStage(stagePath: string): void {
-  const descriptor = openSync(stagePath, 'wx');
+  const descriptor = openSync(stagePath, 'wx', 0o600);
   closeSync(descriptor);
 }
 
@@ -797,6 +805,14 @@ export function withCrossProcessFileLockSync<T>(
           throw error;
         }
         try {
+          // Atomic replacement must retain the destination's permissions without exposing a private staged copy.
+          let mode = 0o600;
+          try {
+            mode = statSync(resourcePath).mode & 0o777;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+          fchmodSync(descriptor, mode);
           ftruncateSync(descriptor, 0);
           writeSync(descriptor, contents);
         } finally {
@@ -949,6 +965,11 @@ export function recordSubagentTurn(state: SubagentTrackingState, input: RecordSu
   const requestedKind = input.kind === 'leader' || input.kind === 'subagent' ? input.kind : undefined;
   const requestedLeaderThreadId = input.leaderThreadId?.trim();
   const existingThread = existingSession.threads[threadId];
+  // Native Stop and SubagentStop can describe the same child turn.
+  const completedTurnId = input.turnId?.trim();
+  if (input.completed && completedTurnId && input.completionSource === 'native_stop_event'
+    && existingThread?.completed_at && existingThread.completion_source === 'native_stop_event'
+    && existingThread.last_completed_turn_id === completedTurnId) return normalized;
   const existingKind = existingThread?.kind === 'leader' || existingThread?.kind === 'subagent' ? existingThread.kind : undefined;
   const existingLeaderThreadId = existingSession.leader_thread_id?.trim();
   // `leader_thread_id` is the session's top-level leader boundary.  A native
@@ -985,6 +1006,11 @@ export function recordSubagentTurn(state: SubagentTrackingState, input: RecordSu
     kind,
     first_seen_at: existingThread?.first_seen_at ?? timestamp,
     last_seen_at: timestamp,
+    ...(input.nativeStarted
+      ? { native_started_at: timestamp }
+      : !input.completed && existingThread?.native_started_at
+        ? { native_started_at: existingThread.native_started_at }
+        : {}),
     turn_count: (existingThread?.turn_count ?? 0) + 1,
     ...(input.turnId?.trim()
       ? { last_turn_id: input.turnId.trim() }
@@ -1077,6 +1103,35 @@ export async function recordSubagentTurnForSession(cwd: string, input: RecordSub
     return next;
   });
 }
+
+/**
+ * Records a turn in the canonical tracker session and every existing tracker
+ * partition that already records this thread as a subagent. Completion events
+ * must not bootstrap additional partitions on their own.
+ */
+export async function recordSubagentTurnForSessionPartitions(
+  cwd: string,
+  input: RecordSubagentTurnInput,
+): Promise<SubagentTrackingState> {
+  const primarySessionId = input.sessionId.trim();
+  const threadId = input.threadId.trim();
+  return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
+    const strict = readSubagentTrackingStateStrictSync(cwd);
+    if (!strict.ok) throw new Error('Malformed subagent tracker authority state');
+    const sessionIds = new Set(primarySessionId ? [primarySessionId] : []);
+    for (const [sessionId, session] of Object.entries(strict.state.sessions)) {
+      if (session.threads[threadId]?.kind === 'subagent') sessionIds.add(sessionId);
+    }
+    let next = strict.state;
+    for (const sessionId of sessionIds) {
+      next = recordSubagentTurn(next, { ...input, sessionId });
+    }
+    context.assertOwnership();
+    writeSubagentTrackingStateSync(cwd, next, context.publish);
+    return next;
+  });
+}
+
 export function recordNativeSubagentAuthorityObservation(
   cwd: string,
   observation: NativeSubagentAuthorityObservation,
@@ -1127,6 +1182,7 @@ export function recordNativeSubagentAuthorityObservation(
         kind: 'subagent',
         ...(parentThreadId && parentThreadId !== childThreadId ? { leaderThreadId: parentThreadId } : {}),
         mode: observation.mode,
+        agentNickname: observation.agentNickname,
         timestamp,
       });
       const thread = next.sessions[sessionId]?.threads[childThreadId];
@@ -1321,6 +1377,9 @@ export interface DirectChildReopenContext {
   sessionId: string;
   rootNativeSessionId: string;
   source: string;
+  availableTools?: readonly string[] | readonly { name?: string; tool_name?: string; toolName?: string }[] | null;
+  /** Explicit unsupported evidence for native subagent capabilities (e.g., from hook payload or persisted blockers). */
+  unsupportedNativeSubagentEvidence?: unknown;
 }
 
 function formatReopenMetadata(entry: SubagentLedgerEntry): string {
@@ -1350,6 +1409,47 @@ function persistedReopenLegacyNotice(excludedCount: number, source: string): str
     `- Notice: ${excludedCount} persisted subagent record(s) were excluded as non-authoritative or legacy; no resume authority or bookkeeping was granted.`,
     '- Silver rule: do not spawn a same-role/same-lane replacement solely because persisted reopen authority was unavailable; continue in the root or another compatible existing lane.',
   ].join('\n');
+}
+
+/**
+ * Tri-state availability of resume_agent tool:
+ * - 'available': explicitly advertised in tool inventory
+ * - 'unavailable': explicit negative capability evidence from hook payload or persisted support blockers
+ * - 'unknown': tool inventory missing or incomplete (resume_agent absent from partial list)
+ *
+ * Per src/leader/contract.ts availableToolsEvidence: "A present-but-incomplete tool inventory
+ * is NOT explicit negative evidence: collaboration/deferred tools can be absent from this hook
+ * payload while a spawn surface remains callable. Report `unknown` rather than persisting an
+ * `unsupported` false negative."
+ */
+type ResumeAgentAvailability = 'available' | 'unavailable' | 'unknown';
+
+function getResumeAgentAvailability(
+  tools: readonly string[] | readonly { name?: string; tool_name?: string; toolName?: string }[] | null | undefined,
+  unsupportedNativeSubagentEvidence?: unknown,
+): ResumeAgentAvailability {
+  // Explicit negative evidence (e.g., native_subagents_unsupported or multi_agent_v1_unavailable)
+  // makes resume_agent unavailable since it's part of the native subagent infrastructure.
+  if (isUnsupportedNativeSubagentEvidenceForScope(unsupportedNativeSubagentEvidence)) {
+    return 'unavailable';
+  }
+
+  // When tools list is not provided, we have no inventory: unknown.
+  if (!tools) return 'unknown';
+  
+  // Check if resume_agent is explicitly advertised in the inventory
+  const found = tools.some((tool) => {
+    const name = typeof tool === 'string' ? tool : (tool.name ?? tool.tool_name ?? tool.toolName ?? '');
+    // Match both fully qualified and flattened forms
+    return name === 'resume_agent' || name === 'collaborationresume_agent' || name.endsWith('.resume_agent');
+  });
+  
+  if (found) return 'available';
+  
+  // Tool not found in inventory. However, a present-but-incomplete inventory is not
+  // negative evidence. Only explicit negative capability evidence (from a capabilities
+  // block or support blocker) would make it unavailable. Absent from a partial list is unknown.
+  return 'unknown';
 }
 
 /**
@@ -1652,10 +1752,14 @@ export function consumeDirectChildReopenContext(
     const unavailableTargets = savedSubagents.filter((entry) => entry.status === 'unavailable');
     const failedTargets = savedSubagents.filter((entry) => entry.resumeFailedAt || entry.resumeFailureReason);
     const now = new Date().toISOString();
-    for (const target of reopenTargets) {
-      session.threads[target.threadId] = { ...session.threads[target.threadId]!, resume_requested_at: now };
+    const resumeAgentAvailability = getResumeAgentAvailability(context.availableTools, context.unsupportedNativeSubagentEvidence);
+    // Only record resume requests when the tool is provably available; unknown does not warrant recording intent to call
+    if (resumeAgentAvailability === 'available' && reopenTargets.length) {
+      for (const target of reopenTargets) {
+        session.threads[target.threadId] = { ...session.threads[target.threadId]!, resume_requested_at: now };
+      }
     }
-    if (reopenTargets.length || changed) {
+    if ((resumeAgentAvailability === 'available' && reopenTargets.length) || changed) {
       session.updated_at = now;
       lock.assertOwnership();
       writeSubagentTrackingStateSync(cwd, state, lock.publish);
@@ -1665,14 +1769,30 @@ export function consumeDirectChildReopenContext(
       `- SessionStart source: ${context.source}; saved subagent ids found: ${savedSubagents.length}.`,
     ];
     if (reopenTargets.length) {
-      lines.push('- Reopen these persisted subagents by id before continuing work or spawning any same-role/same-lane replacement:');
-      lines.push(...reopenTargets.slice(0, 12).map((entry) => `  - resume_agent(${JSON.stringify(entry.agentId)})${formatReopenMetadata(entry)}`));
-      if (reopenTargets.length > 12) lines.push(`  - ... ${reopenTargets.length - 12} more saved subagent id(s) omitted from this compact SessionStart context; consult .omx/state/subagent-tracking.json before spawning replacements.`);
+      if (resumeAgentAvailability === 'available') {
+        lines.push('- Reopen these persisted subagents by id before continuing work or spawning any same-role/same-lane replacement:');
+        lines.push(...reopenTargets.slice(0, 12).map((entry) => `  - resume_agent(${JSON.stringify(entry.agentId)})${formatReopenMetadata(entry)}`));
+        if (reopenTargets.length > 12) lines.push(`  - ... ${reopenTargets.length - 12} more saved subagent id(s) omitted from this compact SessionStart context; consult .omx/state/subagent-tracking.json before spawning replacements.`);
+      } else if (resumeAgentAvailability === 'unavailable') {
+        lines.push('- Warning: resume_agent tool is not available on this host; persisted reopen is unavailable.');
+        lines.push('- Persisted subagent ids are available: consult .omx/state/subagent-tracking.json for eligible resume targets.');
+        lines.push('- Do not spawn a same-role/same-lane replacement solely because persisted reopen was unavailable; continue in the root or another compatible existing lane.');
+      } else {
+        // unknown: guidance explicitly checks availability before requiring invocation
+        lines.push('- Unknown: resume_agent tool availability could not be determined from this host.');
+        lines.push('- Saved persisted subagent ids available for reopen:');
+        lines.push(...reopenTargets.slice(0, 12).map((entry) => `  - ${JSON.stringify(entry.agentId)}${formatReopenMetadata(entry)}`));
+        if (reopenTargets.length > 12) lines.push(`  - ... ${reopenTargets.length - 12} more saved subagent id(s) omitted from this compact SessionStart context; consult .omx/state/subagent-tracking.json.`);
+        lines.push('- If resume_agent is callable, use resume_agent(<id>) to reopen by id before continuing work or spawning replacements.');
+        lines.push('- If resume_agent is not callable, continue in the root or another compatible existing lane; do not spawn a same-role/same-lane replacement solely because reopen was unavailable.');
+      }
     } else {
       lines.push('- No compatible saved subagent id is currently marked reopenable; do not spawn a replacement merely because reopen was unavailable.');
     }
     lines.push('- Silver rule: when follow-up work targets an existing role/lane, reuse the matching reopened id; avoid duplicate same-type subagent spawns.');
-    lines.push('- If resume_agent fails, surface a clear warning with the id and reason, then continue in the root or another compatible existing lane; do not spawn a new agent solely because reopen failed.');
+    if (resumeAgentAvailability === 'available') {
+      lines.push('- If resume_agent fails, surface a clear warning with the id and reason, then continue in the root or another compatible existing lane; do not spawn a new agent solely because reopen failed.');
+    }
     const warnings = [...new Map([...unavailableTargets, ...failedTargets].map((entry) => [entry.agentId, entry])).values()];
     if (warnings.length) {
       lines.push('- Reopen warnings:');

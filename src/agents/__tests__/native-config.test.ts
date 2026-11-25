@@ -42,7 +42,7 @@ const isolatedCodexHome = join(
 beforeEach(() => {
   process.env.CODEX_HOME = isolatedCodexHome;
   delete process.env.OMX_DEFAULT_FRONTIER_MODEL;
-  process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-terra";
+  delete process.env.OMX_DEFAULT_STANDARD_MODEL;
   delete process.env.OMX_DEFAULT_SPARK_MODEL;
   delete process.env.OMX_SPARK_MODEL;
 });
@@ -76,7 +76,274 @@ afterEach(() => {
 });
 
 describe("agents/native-config", () => {
-  it("generates TOML with stripped frontmatter and escaped triple quotes", () => {
+  it("writes each role's tier default and reasoning effort", () => {
+    const expectedEfforts: Record<string, string> = {
+      executor: "medium",
+      "team-executor": "medium",
+      explore: "medium",
+      analyst: "medium",
+      planner: "medium",
+      architect: "xhigh",
+      debugger: "high",
+      verifier: "high",
+      "style-reviewer": "low",
+      "quality-reviewer": "medium",
+      "api-reviewer": "medium",
+      "security-reviewer": "medium",
+      "performance-reviewer": "medium",
+      "code-reviewer": "high",
+      "dependency-expert": "high",
+      "test-engineer": "medium",
+      "quality-strategist": "medium",
+      "build-fixer": "high",
+      designer: "high",
+      writer: "high",
+      "qa-tester": "low",
+      "git-master": "high",
+      "code-simplifier": "high",
+      researcher: "high",
+      "product-manager": "medium",
+      "ux-researcher": "medium",
+      "information-architect": "low",
+      "product-analyst": "low",
+      critic: "high",
+      vision: "low",
+    };
+    const expectedClasses = {
+      frontier: ["planner", "architect", "critic"],
+      fast: ["explore", "style-reviewer", "vision"],
+      standard: Object.keys(expectedEfforts).filter(
+        (role) => !["planner", "architect", "critic", "explore", "style-reviewer", "vision"].includes(role),
+      ),
+    } as const;
+    const defaultModels: Record<AgentDefinition["modelClass"], string> = {
+      frontier: "gpt-6.2-astra",
+      standard: "gpt-6.2-sol",
+      fast: "gpt-6-luna",
+    };
+
+    assert.deepEqual(Object.keys(AGENT_DEFINITIONS).sort(), Object.keys(expectedEfforts).sort());
+    for (const [modelClass, roles] of Object.entries(expectedClasses)) {
+      for (const role of roles) {
+        assert.equal(AGENT_DEFINITIONS[role].modelClass, modelClass, `${role} tier`);
+      }
+    }
+
+    for (const [role, effort] of Object.entries(expectedEfforts)) {
+      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
+      const parsed = parseToml(toml);
+      const expectedModel = defaultModels[AGENT_DEFINITIONS[role].modelClass];
+      assert.equal(parsed.model, expectedModel, `${role} model`);
+      assert.match(toml, new RegExp(`resolved_model: ${expectedModel}\\b`), `${role} metadata`);
+      assert.equal(parsed.model_reasoning_effort, effort, `${role} reasoning effort`);
+    }
+  });
+
+  it("applies configured tier environment defaults by role class", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-env-tiers-"));
+    try {
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        env: {
+          OMX_DEFAULT_FRONTIER_MODEL: "frontier-from-env",
+          OMX_DEFAULT_STANDARD_MODEL: "standard-from-env",
+          OMX_DEFAULT_SPARK_MODEL: "spark-from-env",
+        },
+      }));
+
+      for (const [role, expectedModel] of Object.entries({
+        planner: "frontier-from-env",
+        critic: "frontier-from-env",
+        executor: "standard-from-env",
+        researcher: "standard-from-env",
+        explore: "spark-from-env",
+        vision: "spark-from-env",
+      })) {
+        const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`, {
+          codexHomeOverride: codexHome,
+        });
+        assert.equal(parseToml(toml).model, expectedModel, role);
+        assert.match(toml, new RegExp(`resolved_model: ${expectedModel}\\b`), role);
+      }
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an agentModels override for only that role, ahead of its tier environment default", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-agent-model-override-"));
+    try {
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        env: {
+          OMX_DEFAULT_FRONTIER_MODEL: "frontier-from-env",
+          OMX_DEFAULT_STANDARD_MODEL: "standard-from-env",
+          OMX_DEFAULT_SPARK_MODEL: "spark-from-env",
+        },
+        agentModels: { planner: "planner-custom-model" },
+      }));
+
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(plannerToml).model, "planner-custom-model");
+      assert.match(plannerToml, /resolved_model: planner-custom-model/);
+
+      const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(architectToml).model, "frontier-from-env");
+      assert.match(architectToml, /model_reasoning_effort = "xhigh"/);
+
+      const executorToml = generateAgentToml(AGENT_DEFINITIONS.executor, "executor prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(executorToml).model, "standard-from-env");
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("does not use root or active profile models for agent tiers", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-main-model-"));
+    try {
+      await writeFile(join(codexHome, "config.toml"), [
+        'profile = "work-lane"',
+        'model = "gpt-5.2"',
+        'model_provider = "openai"',
+        "",
+        "[profiles.work-lane]",
+        'model = "profile-session-model"',
+        'model_provider = "openai-chatgpt"',
+      ].join("\n"));
+
+      const executorToml = generateAgentToml(AGENT_DEFINITIONS.executor, "executor prompt", {
+        codexHomeOverride: codexHome,
+      });
+      const executor = parseToml(executorToml);
+      assert.equal(executor.model, "gpt-6.2-sol");
+      assert.equal(executor.model_reasoning_effort, "medium");
+      assert.match(executorToml, /resolved_model: gpt-6\.2-sol/);
+
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(plannerToml).model, "gpt-6.2-astra");
+      assert.match(plannerToml, /resolved_model: gpt-6\.2-astra/);
+
+      const exploreToml = generateAgentToml(AGENT_DEFINITIONS.explore, "explore prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(exploreToml).model, "gpt-6-luna");
+      assert.match(exploreToml, /resolved_model: gpt-6-luna/);
+
+      await writeFile(join(codexHome, "config.toml"), 'model_provider = "openai-chatgpt"\n');
+      const noConfiguredModelToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(noConfiguredModelToml).model, "gpt-6.2-astra");
+      assert.match(noConfiguredModelToml, /resolved_model: gpt-6\.2-astra/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("omits tier models for custom providers unless a role override is configured", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-custom-provider-"));
+    try {
+      await writeFile(join(codexHome, "config.toml"), [
+        'model = "glm-custom-root"',
+        'model_provider = "custom-provider"',
+      ].join("\n"));
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        env: {
+          OMX_DEFAULT_FRONTIER_MODEL: "frontier-from-env",
+          OMX_DEFAULT_STANDARD_MODEL: "standard-from-env",
+          OMX_DEFAULT_SPARK_MODEL: "spark-from-env",
+        },
+        agentModels: { planner: "planner-custom-model" },
+      }));
+
+      for (const role of ["architect", "debugger", "explore"] as const) {
+        const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`, {
+          codexHomeOverride: codexHome,
+        });
+        assert.equal(parseToml(toml).model, undefined, role);
+        assert.match(toml, /resolved_model: glm-custom-root/, role);
+      }
+
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(plannerToml).model, "planner-custom-model");
+      assert.match(plannerToml, /resolved_model: planner-custom-model/);
+      assert.doesNotMatch(plannerToml, /model_provider\s*=/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("omits resolved model metadata for a custom provider without an effective model", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-custom-no-model-"));
+    try {
+      await writeFile(join(codexHome, "config.toml"), [
+        'model_provider = "custom-provider"',
+        "",
+        "[model_providers.custom-provider]",
+        'name = "Custom Provider"',
+        'base_url = "https://custom.example/v1"',
+        'wire_api = "responses"',
+      ].join("\n"));
+
+      const toml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(toml).model, undefined);
+      assert.doesNotMatch(toml, /resolved_model:/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("treats mixed-case built-in provider IDs as custom providers", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-mixed-case-provider-"));
+    try {
+      await writeFile(join(codexHome, "config.toml"), [
+        'model_provider = "OpenAI"',
+        'model = "mixed-case-provider-model"',
+      ].join("\n"));
+
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(plannerToml).model, undefined);
+      assert.match(plannerToml, /resolved_model: mixed-case-provider-model/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an active custom provider profile model only as resolved metadata", async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-custom-profile-"));
+    try {
+      await writeFile(join(codexHome, "config.toml"), [
+        'profile = "custom-lane"',
+        'model = "main-session-model"',
+        "",
+        "[profiles.custom-lane]",
+        'model_provider = "profile-custom-provider"',
+        'model = "profile-custom-model"',
+      ].join("\n"));
+
+      const toml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.equal(parseToml(toml).model, undefined);
+      assert.match(toml, /resolved_model: profile-custom-model/);
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("generates TOML with stripped frontmatter, escaped triple quotes, and the standard executor model", () => {
     const agent: AgentDefinition = {
       name: "executor",
       description: "Code implementation",
@@ -87,55 +354,25 @@ describe("agents/native-config", () => {
       tools: "execution",
       category: "build",
     };
-
     const prompt = `---\ntitle: demo\n---\n\nInstruction line\n\"\"\"danger\"\"\"`;
     const toml = generateAgentToml(agent, prompt);
+    const parsed = parseToml(toml);
 
     assert.match(toml, /# oh-my-codex agent: executor/);
-    assert.match(toml, /model = "gpt-5\.6-sol"/);
-    assert.match(toml, /model_reasoning_effort = "medium"/);
+    assert.equal(parsed.model, "gpt-6.2-sol");
+    assert.equal(parsed.model_reasoning_effort, "medium");
+    assert.match(toml, /resolved_model: gpt-6\.2-sol/);
     assert.ok(!toml.includes("title: demo"));
     assert.ok(toml.includes("Instruction line"));
     assert.ok(toml.includes("You are operating in the deep-worker posture."));
     assert.ok(toml.includes("- posture: deep-worker"));
 
-    const tripleQuoteBlocks = toml.match(/"""/g) || [];
-    assert.equal(
-      tripleQuoteBlocks.length,
-      2,
-      "only TOML delimiters should remain as raw triple quotes",
-    );
+    const tripleQuoteBlocks = toml.match(/\"\"\"/g) || [];
+    assert.equal(tripleQuoteBlocks.length, 2, "only TOML delimiters should remain as raw triple quotes");
   });
 
-  it("applies per-agent reasoning overrides when generating native TOML", async () => {
+  it("applies configured reasoning overrides and normalizes unsupported values", async () => {
     const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-reasoning-"));
-    try {
-      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
-        agentReasoning: {
-          architect: "xhigh",
-        },
-      }));
-      const agent: AgentDefinition = {
-        name: "architect",
-        description: "System design",
-        reasoningEffort: "high",
-        posture: "frontier-orchestrator",
-        modelClass: "frontier",
-        routingRole: "leader",
-        tools: "read-only",
-        category: "build",
-      };
-
-      const toml = generateAgentToml(agent, "Architect prompt", { codexHomeOverride: codexHome });
-
-      assert.match(toml, /model_reasoning_effort = "xhigh"/);
-    } finally {
-      await rm(codexHome, { recursive: true, force: true });
-    }
-  });
-
-  it("transports normalized per-agent max through exact native TOML and falls back from ultra", async () => {
-    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-max-reasoning-"));
     try {
       await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
         agentReasoning: {
@@ -144,220 +381,54 @@ describe("agents/native-config", () => {
         },
       }));
 
-      const maxToml = generateAgentToml(AGENT_DEFINITIONS.architect, "Architect prompt", {
+      const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt", {
         codexHomeOverride: codexHome,
       });
-      assert.match(maxToml, /model_reasoning_effort = "max"/);
-      assert.equal(
-        (parseToml(maxToml) as { model_reasoning_effort?: unknown }).model_reasoning_effort,
-        "max",
-      );
+      assert.equal(parseToml(architectToml).model_reasoning_effort, "max");
 
-      const fallbackToml = generateAgentToml(AGENT_DEFINITIONS.critic, "Critic prompt", {
+      const criticToml = generateAgentToml(AGENT_DEFINITIONS.critic, "critic prompt", {
         codexHomeOverride: codexHome,
       });
-      assert.match(fallbackToml, /model_reasoning_effort = "high"/);
-      assert.doesNotMatch(fallbackToml, /model_reasoning_effort = "ultra"/);
+      assert.equal(parseToml(criticToml).model_reasoning_effort, "high");
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }
   });
 
-  it("lets agentModels override exact pins without stale exact-mini guidance", async () => {
-    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-agent-models-"));
-    try {
-      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
-        agentModels: {
-          architect: "gpt-5.6-sol",
-        },
-        agentReasoning: {
-          architect: "xhigh",
-        },
-      }));
+  it("keeps posture overlays within read-only and advisory assignments", () => {
+    for (const role of ["architect", "planner", "researcher", "debugger"] as const) {
+      const toml = generateAgentToml(AGENT_DEFINITIONS[role], "Return a read-only analysis.");
+      const instructions = parseToml(toml).developer_instructions as string;
 
-      const toml = generateAgentToml(AGENT_DEFINITIONS.architect, "Architect prompt", {
-        codexHomeOverride: codexHome,
-      });
-
-      assert.match(toml, /model = "gpt-5\.6-sol"/);
-      assert.match(toml, /model_reasoning_effort = "xhigh"/);
-      assert.match(toml, /resolved_model: gpt-5\.6-sol/);
-      assert.doesNotMatch(toml, /model = "gpt-5\.6-terra"/);
-      assert.doesNotMatch(toml, /exact gpt-5\.6-terra model/);
-      assert.doesNotMatch(toml, /resolved_model: gpt-5\.6-terra/);
-    } finally {
-      await rm(codexHome, { recursive: true, force: true });
+      assert.match(instructions, /Return a read-only analysis\./);
+      assert.doesNotMatch(instructions, /requested work is implemented/);
+      assert.doesNotMatch(instructions, /diagnostics, tests, and build evidence are mandatory/);
+      assert.doesNotMatch(instructions, /Default to delegation and orchestration when specialists exist/);
     }
   });
 
-  it("applies Terra guidance when agentModels resolves exact-Sol roles to gpt-5.6-terra", async () => {
-    const codexHome = await mkdtemp(join(tmpdir(), "omx-native-config-terra-override-"));
-    try {
-      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
-        agentModels: {
-          planner: "gpt-5.6-terra",
-          architect: "gpt-5.6-terra",
-        },
-      }));
-
-      for (const role of ["planner", "architect"] as const) {
-        const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`, {
-          codexHomeOverride: codexHome,
-        });
-        assert.match(toml, /model = "gpt-5\.6-terra"/);
-        assert.match(toml, /exact gpt-5\.6-terra model/);
-      }
-
-      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
-        agentModels: { planner: "gpt-5.6-terra-tuned" },
-      }));
-      const tunedToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
-        codexHomeOverride: codexHome,
-      });
-      assert.match(tunedToml, /model = "gpt-5\.6-terra-tuned"/);
-      assert.doesNotMatch(tunedToml, /exact gpt-5\.6-terra model/);
-    } finally {
-      await rm(codexHome, { recursive: true, force: true });
-    }
-  });
-
-
-  it("pins planner and architect to exact gpt-5.6-sol while keeping researcher on exact Terra", () => {
-    process.env.OMX_DEFAULT_FRONTIER_MODEL = "gpt-5.6-sol";
-    process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-sol";
-
-    for (const role of ["planner", "architect"] as const) {
-      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
-      assert.match(toml, /model = "gpt-5\.6-sol"/, `${role} should use exact gpt-5.6-sol`);
-      assert.match(toml, /exact gpt-5\.6-sol model/, `${role} should receive exact-gpt-5.6-sol guidance`);
-      assert.match(toml, /strict execution order: inspect -> plan -> act -> verify/, `${role} should receive the exact-model guardrail`);
-      assert.match(toml, /resolved_model: gpt-5\.6-sol/, `${role} should record exact gpt-5.6-sol metadata`);
-    }
-
-    const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt");
-    assert.match(plannerToml, /model_reasoning_effort = "medium"/);
-
-    const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt");
-    assert.match(architectToml, /model_reasoning_effort = "xhigh"/);
-
-    const researcherToml = generateAgentToml(AGENT_DEFINITIONS.researcher, "researcher prompt");
-    assert.match(researcherToml, /model = "gpt-5\.6-terra"/, "researcher should keep exact Terra");
-    assert.match(researcherToml, /exact gpt-5\.6-terra model/, "researcher should receive exact-Terra guidance");
-    assert.match(researcherToml, /resolved_model: gpt-5.6-terra/, "researcher should record exact Terra metadata");
-    assert.match(researcherToml, /model_reasoning_effort = "high"/);
-
-    for (const role of [
-      "critic",
-      "debugger",
-      "scholastic",
-      "prometheus-strict-metis",
-      "prometheus-strict-momus",
-      "prometheus-strict-oracle",
-    ] as const) {
-      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
-      assert.match(toml, /model = "gpt-5\.6-sol"/, `${role} should stay on configured/root gpt-5.6-sol`);
-      assert.doesNotMatch(toml, /model = "gpt-5\.6-terra"/, `${role} must not inherit exact-Terra pins`);
-    }
-  });
-
-  it("applies exact-model Terra guidance only for resolved gpt-5.6-terra standard roles", () => {
-    const agent: AgentDefinition = {
-      name: "debugger",
-      description: "Root-cause analysis",
-      reasoningEffort: "medium",
-      posture: "deep-worker",
-      modelClass: "standard",
-      routingRole: "executor",
-      tools: "analysis",
-      category: "build",
-    };
-
-    const prompt = "Instruction line";
-    const exactMiniToml = generateAgentToml(agent, prompt, {
-      env: { OMX_DEFAULT_STANDARD_MODEL: "gpt-5.6-terra" } as NodeJS.ProcessEnv,
-    });
-    const frontierToml = generateAgentToml(agent, prompt, {
-      env: { OMX_DEFAULT_STANDARD_MODEL: "gpt-5.6-sol" } as NodeJS.ProcessEnv,
-    });
-    const tunedToml = generateAgentToml(agent, prompt, {
-      env: { OMX_DEFAULT_STANDARD_MODEL: "gpt-5.6-terra-tuned" } as NodeJS.ProcessEnv,
-    });
-
-    assert.match(exactMiniToml, /exact gpt-5\.6-terra model/);
-    assert.match(exactMiniToml, /strict execution order: inspect -> plan -> act -> verify/);
-    assert.match(exactMiniToml, /resolved_model: gpt-5\.6-terra/);
-    assert.doesNotMatch(frontierToml, /exact gpt-5\.6-terra model/);
-    assert.doesNotMatch(tunedToml, /exact gpt-5\.6-terra model/);
-  });
-
-  it("adds a leaf guard after delegation guidance in generated native agent instructions", () => {
+  it("places native leaf guards after role guidance and before metadata", () => {
     const codeReviewerToml = generateAgentToml(
       AGENT_DEFINITIONS["code-reviewer"],
       "code-reviewer prompt",
     );
-
     assert.match(codeReviewerToml, /<native_subagent_leaf_guard>/);
     assert.match(codeReviewerToml, /do not call Task, spawn_agent, or native child agents/);
     assert.match(codeReviewerToml, /report missing specialist coverage to the leader/);
 
-    const postureDelegationIndex = codeReviewerToml.indexOf(
-      "Default to delegation and orchestration when specialists exist.",
+    const postureIndex = codeReviewerToml.indexOf(
+      "Specialist coverage must stay within the assigned role and delegation authority.",
     );
-    const modelDelegationIndex = codeReviewerToml.indexOf("precise delegation.");
     const guardIndex = codeReviewerToml.indexOf("<native_subagent_leaf_guard>");
     const metadataIndex = codeReviewerToml.indexOf("## OMX Agent Metadata");
+    assert.ok(postureIndex >= 0, "role posture should be present");
+    assert.ok(guardIndex > postureIndex, "leaf guard should follow role guidance");
+    assert.ok(metadataIndex > guardIndex, "metadata should follow the leaf guard");
 
-    assert.ok(postureDelegationIndex >= 0, "frontier posture delegation text should exist");
-    assert.ok(modelDelegationIndex >= 0, "frontier model delegation text should exist");
-    assert.ok(guardIndex > postureDelegationIndex, "leaf guard should override posture delegation text");
-    assert.ok(guardIndex > modelDelegationIndex, "leaf guard should override model delegation text");
-    assert.ok(metadataIndex > guardIndex, "metadata should remain final non-policy bookkeeping");
-
-    const researcherToml = generateAgentToml(
-      AGENT_DEFINITIONS.researcher,
-      "researcher prompt",
-    );
-    const exactMiniIndex = researcherToml.indexOf(
-      "strict execution order: inspect -> plan -> act -> verify",
-    );
-    const researcherGuardIndex = researcherToml.indexOf("<native_subagent_leaf_guard>");
-    const researcherMetadataIndex = researcherToml.indexOf("## OMX Agent Metadata");
-
-    assert.ok(exactMiniIndex >= 0, "researcher should exercise the exact-mini overlay path");
-    assert.ok(
-      researcherGuardIndex > exactMiniIndex,
-      "leaf guard should override exact-mini overlay guidance",
-    );
-    assert.ok(
-      researcherMetadataIndex > researcherGuardIndex,
-      "metadata should remain final non-policy bookkeeping for exact-model roles",
-    );
-
-    const teamExecutorToml = generateAgentToml(
-      AGENT_DEFINITIONS["team-executor"],
-      "team-executor prompt",
-    );
-    assert.match(teamExecutorToml, /<native_subagent_leaf_guard>/);
-  });
-
-  it("keeps executor native agents as leaf implementation lanes", () => {
-    const executorToml = generateAgentToml(
-      AGENT_DEFINITIONS.executor,
-      "executor prompt",
-    );
-
-    assert.match(executorToml, /<native_subagent_leaf_guard>/);
-    assert.doesNotMatch(executorToml, /native_subagent_delegation: allowed/);
-  });
-
-  it("does not apply the leaf guard to roles with explicit native delegation contracts", () => {
-    const metisToml = generateAgentToml(
-      AGENT_DEFINITIONS["prometheus-strict-metis"],
-      "metis prompt",
-    );
-
-    assert.doesNotMatch(metisToml, /<native_subagent_leaf_guard>/);
-    assert.match(metisToml, /native_subagent_delegation: allowed/);
+    for (const role of ["researcher", "team-executor", "executor"] as const) {
+      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
+      assert.match(toml, /<native_subagent_leaf_guard>/, role);
+    }
   });
 
   it("keeps native-only leaf guards out of non-native role composition", () => {
@@ -377,11 +448,10 @@ describe("agents/native-config", () => {
     assert.doesNotMatch(unknownInstructions, /<native_subagent_leaf_guard>/);
   });
 
-  it("installs only catalog-installable agents and skips existing files without force", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omx-native-config-"));
+  it("installs only catalog-installable agents, writes tier models, and skips existing files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "omx-native-config-install-"));
     const promptsDir = join(root, "prompts");
     const outDir = join(root, "agents-out");
-
     try {
       await mkdir(promptsDir, { recursive: true });
       await writeFile(join(promptsDir, "executor.md"), "executor prompt");
@@ -397,11 +467,9 @@ describe("agents/native-config", () => {
       assert.equal(existsSync(join(outDir, "planner.toml")), true);
       assert.equal(existsSync(join(outDir, "style-reviewer.toml")), false);
 
-      const executorToml = await readFile(
-        join(outDir, "executor.toml"),
-        "utf8",
-      );
-      assert.match(executorToml, /model = "gpt-5\.6-sol"/);
+      const executorToml = await readFile(join(outDir, "executor.toml"), "utf8");
+      assert.equal(parseToml(executorToml).model, "gpt-6.2-sol");
+      assert.match(executorToml, /resolved_model: gpt-6\.2-sol/);
       assert.match(executorToml, /model_reasoning_effort = "medium"/);
 
       const skipped = await installNativeAgentConfigs(root, {
@@ -419,14 +487,11 @@ describe("agents/native-config", () => {
     const codexHome = join(root, ".codex");
     const promptsDir = join(root, "prompts");
     const outDir = join(codexHome, "agents");
-
     try {
       await mkdir(promptsDir, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
-        agentReasoning: {
-          architect: "xhigh",
-        },
+        agentReasoning: { architect: "xhigh" },
       }));
       await writeFile(join(promptsDir, "architect.md"), "architect prompt");
 
@@ -436,35 +501,33 @@ describe("agents/native-config", () => {
       });
 
       const architectToml = await readFile(join(outDir, "architect.toml"), "utf8");
-      assert.match(architectToml, /model_reasoning_effort = "xhigh"/);
+      assert.equal(parseToml(architectToml).model, "gpt-6.2-astra");
+      assert.equal(parseToml(architectToml).model_reasoning_effort, "xhigh");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("preserves active provider on native agents so websocket-capable Responses providers are inherited", async () => {
+  it("inherits custom provider settings without baking them into native TOML", async () => {
     const root = await mkdtemp(join(tmpdir(), "omx-native-config-provider-"));
     const codexHome = join(root, ".codex");
     const promptsDir = join(root, "prompts");
     const outDir = join(codexHome, "agents");
     const previousCodexHome = process.env.CODEX_HOME;
-
     try {
-      delete process.env.OMX_DEFAULT_STANDARD_MODEL;
       process.env.CODEX_HOME = codexHome;
       await mkdir(promptsDir, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await writeFile(join(codexHome, "config.toml"), [
-        'model = "gpt-5.6-sol"',
+        'model = "custom-session-model"',
         'model_provider = "cheapRouter"',
-        '',
-        '[model_providers.cheapRouter]',
+        "",
+        "[model_providers.cheapRouter]",
         'name = "Cheap Router"',
-        'base_url = "https://cheaprouter.uk/v1"',
+        'base_url = "https://cheaprouter.example/v1"',
         'wire_api = "responses"',
-        'supports_websockets = true',
-        '',
-      ].join('\n'));
+        "supports_websockets = true",
+      ].join("\n"));
       await writeFile(join(promptsDir, "executor.md"), "executor prompt");
 
       await installNativeAgentConfigs(root, {
@@ -472,138 +535,12 @@ describe("agents/native-config", () => {
         catalogManifest: manifestWithAgents(["executor"]),
       });
       const executorToml = await readFile(join(outDir, "executor.toml"), "utf8");
-      assert.match(executorToml, /model = "gpt-5\.6-sol"/);
-      assert.match(executorToml, /model_provider = "cheapRouter"/);
+      assert.equal(parseToml(executorToml).model, undefined);
+      assert.match(executorToml, /resolved_model: custom-session-model/);
+      assert.doesNotMatch(executorToml, /model_provider\s*=/);
     } finally {
       if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
       else delete process.env.CODEX_HOME;
-      process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-terra";
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("omits inherited custom provider for default Spark-lane native agents", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omx-native-config-spark-provider-"));
-    const codexHome = join(root, ".codex");
-    const promptsDir = join(root, "prompts");
-    const outDir = join(codexHome, "agents");
-    const previousCodexHome = process.env.CODEX_HOME;
-
-    try {
-      process.env.CODEX_HOME = codexHome;
-      await mkdir(promptsDir, { recursive: true });
-      await mkdir(codexHome, { recursive: true });
-      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
-        env: {
-          OMX_DEFAULT_SPARK_MODEL: "gpt-5.6-luna",
-        },
-      }));
-      await writeFile(join(codexHome, "config.toml"), [
-        'model = "gpt-5.6-sol"',
-        'model_provider = "OpenAI"',
-        '',
-      ].join('\n'));
-      await writeFile(join(promptsDir, "explore.md"), "explore prompt");
-
-      await installNativeAgentConfigs(root, {
-        agentsDir: outDir,
-        catalogManifest: manifestWithAgents(["explore"]),
-      });
-      const exploreToml = await readFile(join(outDir, "explore.toml"), "utf8");
-      assert.match(exploreToml, /model = "gpt-5\.6-luna"/);
-      assert.doesNotMatch(exploreToml, /model_provider = /);
-    } finally {
-      if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
-      else delete process.env.CODEX_HOME;
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("inherits a custom root model for standard agents when no standard override exists", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omx-native-config-root-model-"));
-    const codexHome = join(root, ".codex");
-    const promptsDir = join(root, "prompts");
-    const outDir = join(codexHome, "agents");
-    const previousCodexHome = process.env.CODEX_HOME;
-
-    try {
-      delete process.env.OMX_DEFAULT_STANDARD_MODEL;
-      process.env.CODEX_HOME = codexHome;
-      await mkdir(promptsDir, { recursive: true });
-      await mkdir(codexHome, { recursive: true });
-      await writeFile(join(codexHome, "config.toml"), 'model = "gpt-5.2"\n');
-      await writeFile(join(promptsDir, "debugger.md"), "debugger prompt");
-
-      await installNativeAgentConfigs(root, {
-        agentsDir: outDir,
-        catalogManifest: manifestWithAgents(["debugger"]),
-      });
-      const debuggerToml = await readFile(join(outDir, "debugger.toml"), "utf8");
-      assert.match(debuggerToml, /model = "gpt-5\.2"/);
-      assert.doesNotMatch(debuggerToml, /model = "gpt-5\.6-terra"/);
-    } finally {
-      if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
-      else delete process.env.CODEX_HOME;
-      process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-terra";
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("preserves explicit standard model override for standard agents", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omx-native-config-standard-override-"));
-    const codexHome = join(root, ".codex");
-    const promptsDir = join(root, "prompts");
-    const outDir = join(codexHome, "agents");
-    const previousCodexHome = process.env.CODEX_HOME;
-
-    try {
-      process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-terra";
-      process.env.CODEX_HOME = codexHome;
-      await mkdir(promptsDir, { recursive: true });
-      await mkdir(codexHome, { recursive: true });
-      await writeFile(join(codexHome, "config.toml"), 'model = "gpt-5.2"\n');
-      await writeFile(join(promptsDir, "debugger.md"), "debugger prompt");
-
-      await installNativeAgentConfigs(root, {
-        agentsDir: outDir,
-        catalogManifest: manifestWithAgents(["debugger"]),
-      });
-      const debuggerToml = await readFile(join(outDir, "debugger.toml"), "utf8");
-      assert.match(debuggerToml, /model = "gpt-5\.6-terra"/);
-      assert.doesNotMatch(debuggerToml, /model = "gpt-5\.2"/);
-    } finally {
-      if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
-      else delete process.env.CODEX_HOME;
-      process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-terra";
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it("keeps executor on the frontier lane so an explicit gpt-5.2 root model still applies there", async () => {
-    const root = await mkdtemp(join(tmpdir(), "omx-native-config-executor-model-"));
-    const codexHome = join(root, ".codex");
-    const promptsDir = join(root, "prompts");
-    const outDir = join(codexHome, "agents");
-    const previousCodexHome = process.env.CODEX_HOME;
-
-    try {
-      delete process.env.OMX_DEFAULT_STANDARD_MODEL;
-      process.env.CODEX_HOME = codexHome;
-      await mkdir(promptsDir, { recursive: true });
-      await mkdir(codexHome, { recursive: true });
-      await writeFile(join(codexHome, "config.toml"), 'model = "gpt-5.2"\n');
-      await writeFile(join(promptsDir, "executor.md"), "executor prompt");
-
-      await installNativeAgentConfigs(root, {
-        agentsDir: outDir,
-        catalogManifest: manifestWithAgents(["executor"]),
-      });
-      const executorToml = await readFile(join(outDir, "executor.toml"), "utf8");
-      assert.match(executorToml, /model = "gpt-5\.2"/);
-    } finally {
-      if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
-      else delete process.env.CODEX_HOME;
-      process.env.OMX_DEFAULT_STANDARD_MODEL = "gpt-5.6-terra";
       await rm(root, { recursive: true, force: true });
     }
   });

@@ -32,18 +32,16 @@ export const LEADER_CONDUCTOR_PHILOSOPHY =
   'Conductor Philosophy: The core principle of OMX is: You are the conductor, not the performer.';
 
 export const LEADER_CONDUCTOR_GOLDEN_RULE =
-  'When the Main agent is acting in Conductor mode, NEVER make plan or code changes directly. ALWAYS delegate implementation to specialized agents. Your role is to guide, review, and orchestrate.';
-
+  'When the Main agent is acting in Conductor mode, Main never writes plan, spec, source, package, git, or other product/implementation artifacts directly: Main owns orchestration, integration, and final judgment, and delegated performer lanes (typed subagents, Team workers, performer carve-outs) perform the bounded implementation and report back through their native result surface. Ordinary native reporting is completion, not a separate authority grant. Main-root orchestration metadata, transport, and ledger writes stay with Main and are never delegated away.';
 export const LEADER_CONDUCTOR_SILVER_RULE =
   'Silver Rule: When follow-up work targets an existing role/lane, reuse or resume the assigned specialized agent whenever available before spawning a replacement.';
-
 export const LEADER_CONDUCTOR_DELEGATION_NOTE =
-  'Delegation note: assign bounded implementation, planning, review, and verification work to the appropriate specialized agents; Main owns orchestration, integration, and final judgment only.';
+  'Delegation note: under ordinary native support with inherited permissions, assign bounded implementation, planning, review, and verification work to the appropriate specialized agents and let them implement, mutate, and report directly; Main owns orchestration, integration, and final judgment only. Where a genuinely mandatory extra authority check applies, establish it before Conductor execution is selected; otherwise emit an accurate unsupported-mode result with a supported recovery path. Never loosen real sandbox, approval, cross-session ownership, or privileged-operation boundaries, and never treat local state, task text, session fields, trackers, or child provenance as authority.';
 
 export const LEADER_CONDUCTOR_REUSE_AND_LEDGER_RULES = [
   'Conductor mode is a Main-root contract only; typed subagents never receive this block.',
   'Use .omx/state/subagent-tracking.json as the source of truth for saved subagent ids and recovery order.',
-  'On SessionStart, eagerly attempt resume_agent(<subagent id>) for every saved subagent id before spawning any replacement agent.',
+  'On SessionStart, if resume_agent is available, eagerly attempt resume_agent(<subagent id>) for every saved subagent id before spawning any replacement agent. If resume_agent is unavailable, continue in the root or another compatible existing lane; do not spawn a replacement solely because reopen is unavailable.',
   'ralplan consensus planning may activate Conductor; autopilot rework stays exempt.',
 ] as const;
 

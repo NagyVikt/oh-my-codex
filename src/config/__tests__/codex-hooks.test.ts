@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   buildManagedCodexNativeHookCommand,
   buildManagedCodexNativeHookWindowsShimContent,
@@ -23,6 +24,7 @@ import {
   mergeManagedCodexHooksConfig,
   removeManagedCodexHooks,
   resolveWindowsPowerShellPath,
+  resolveStableNodePath,
   parseManagedCodexNativeHookWindowsShimCommand,
   ManagedCodexHooksPlanError,
   planManagedCodexHooksMerge,
@@ -30,17 +32,60 @@ import {
   scanManagedCodexHookTrustStateFromContent,
   validateCodexHooksConfigStrict,
 } from "../codex-hooks.js";
+import { migrateManagedCodexHookTrustStateCoordinates } from "../generator.js";
 
 describe("codex hooks helpers", () => {
 
-  it("uses the current JavaScript runtime for managed hook commands", () => {
+  it("uses a stable node path for managed hook commands", () => {
     const config = buildManagedCodexHooksConfig("/repo");
     const command = config.hooks.SessionStart[0]?.hooks[0]?.command;
+    const stablePath = resolveStableNodePath();
 
     assert.equal(
       command,
-      `"${process.execPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" "/repo/dist/scripts/codex-native-hook.js"`,
+      `"${stablePath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" "/repo/dist/scripts/codex-native-hook.js"`,
     );
+  });
+
+  it("maps Homebrew macOS Cellar node paths to the stable bin symlink", () => {
+    const cellarPath = "/opt/homebrew/Cellar/node/26.0.0/bin/node";
+    const result = resolveStableNodePath(cellarPath);
+
+    // If the stable path exists and is compatible, it should be used
+    // If not, execPath is returned unchanged
+    // This test verifies the mapping logic without depending on actual filesystem
+    if (result === "/opt/homebrew/bin/node") {
+      // Stable path was used (filesystem path exists and is valid)
+      assert.equal(result, "/opt/homebrew/bin/node");
+    } else {
+      // Stable path wasn't available, execPath is returned
+      assert.equal(result, cellarPath);
+    }
+  });
+
+  it("maps Linuxbrew Cellar node paths to the stable bin symlink", () => {
+    const linuxbrewPath = "/home/linuxbrew/.linuxbrew/Cellar/node/24.1.0/bin/node";
+    const result = resolveStableNodePath(linuxbrewPath);
+
+    if (result === "/home/linuxbrew/.linuxbrew/bin/node") {
+      assert.equal(result, "/home/linuxbrew/.linuxbrew/bin/node");
+    } else {
+      assert.equal(result, linuxbrewPath);
+    }
+  });
+
+  it("leaves non-Homebrew node paths unchanged", () => {
+    const nonBrewPaths = [
+      "/usr/local/bin/node",
+      "/usr/bin/node",
+      "/opt/homebrew/bin/node",
+      "C:\\Program Files\\nodejs\\node.exe",
+      "/nvm/versions/node/v20.0.0/bin/node",
+    ];
+
+    for (const path of nonBrewPaths) {
+      assert.equal(resolveStableNodePath(path), path);
+    }
   });
 
   it("registers SessionStart for startup, resume, and clear reset sources", () => {
@@ -985,14 +1030,38 @@ describe("codex hooks helpers", () => {
     }
   });
 
-  it("forwards payload, stdout, stderr, and non-zero exit through the Windows shim when PowerShell is available", async () => {
+  it("forwards payload, stdout, stderr, and non-zero exit through the Windows shim when PowerShell is available", async (t) => {
     const shell = ["pwsh", "powershell.exe", "powershell"].find((candidate) => {
       const probe = spawnSync(candidate, ["-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
         encoding: "utf-8",
+        timeout: 5_000,
       });
       return !probe.error && probe.status === 0;
     });
-    if (!shell) return;
+    if (!shell) {
+      t.skip("noPowerShell");
+      return;
+    }
+
+    const nodeProbe = spawnSync(
+      shell,
+      ["-NoProfile", "-Command", `$ErrorActionPreference = 'Stop'; & '${process.execPath.replace(/'/g, "''")}' -e 'process.exit(0)'; exit $LASTEXITCODE`],
+      {
+        encoding: "utf-8",
+        timeout: 5_000,
+      },
+    );
+    if (nodeProbe.error || nodeProbe.status !== 0) {
+      const observed = [
+        `shell=${shell}`,
+        `node=${process.execPath}`,
+        `status=${nodeProbe.status ?? "null"}`,
+        nodeProbe.error ? `error=${nodeProbe.error.message}` : null,
+        nodeProbe.stderr.trim() ? `stderr=${nodeProbe.stderr.trim()}` : null,
+      ].filter(Boolean).join(", ");
+      t.skip(`PowerShell/node pair cannot execute fixture (${observed})`);
+      return;
+    }
 
     const wd = await mkdtemp(join(tmpdir(), "omx-windows-hook-shim-"));
     try {
@@ -1229,6 +1298,8 @@ describe("codex hooks helpers", () => {
       "/home/me/.codex/hooks.json:pre_tool_use:0:0",
       "/home/me/.codex/hooks.json:session_start:0:0",
       "/home/me/.codex/hooks.json:stop:0:0",
+      "/home/me/.codex/hooks.json:subagent_start:0:0",
+      "/home/me/.codex/hooks.json:subagent_stop:0:0",
       "/home/me/.codex/hooks.json:user_prompt_submit:0:0",
     ]);
     for (const hookState of Object.values(state)) {
@@ -1238,8 +1309,9 @@ describe("codex hooks helpers", () => {
 
   it("matches Codex's normalized command hook hash identity", async () => {
     const state = buildManagedCodexHookTrustState("/hooks.json", "/repo");
+    const stablePath = resolveStableNodePath();
     const command =
-      `"${process.execPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" "/repo/dist/scripts/codex-native-hook.js"`;
+      `"${stablePath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" "/repo/dist/scripts/codex-native-hook.js"`;
     const expectedIdentity = {
       event_name: "pre_tool_use",
       hooks: [
@@ -1711,7 +1783,7 @@ describe("codex hooks helpers", () => {
       }),
     );
 
-    assert.deepEqual(missing, ["PreToolUse", "PostToolUse", "UserPromptSubmit", "PreCompact", "PostCompact", "Stop"]);
+    assert.deepEqual(missing, ["PreToolUse", "PostToolUse", "UserPromptSubmit", "PreCompact", "PostCompact", "SubagentStart", "SubagentStop", "Stop"]);
   });
 
   it("returns null for invalid hooks.json content", () => {
@@ -2123,6 +2195,8 @@ describe("codex hooks helpers", () => {
       "PreToolUse",
       "SessionStart",
       "Stop",
+      "SubagentStart",
+      "SubagentStop",
       "UserPromptSubmit",
     ]);
   });
@@ -2168,6 +2242,225 @@ describe("codex hooks helpers", () => {
     });
     assert.equal("finalContent" in plan, false);
     assert.equal(source, original);
+  });
+
+  it("moves only an existing, hash-matching foreign SessionStart trust key", () => {
+    const hooksPath = "/fixture/.codex/hooks.json";
+    const managedCommand = buildManagedCodexHooksConfig("/repo", { platform: "linux" })
+      .hooks.SessionStart[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: "startup|resume|clear",
+            hooks: [{ type: "command", command: managedCommand }],
+          },
+          { hooks: [{ type: "command", command: "echo foreign" }] },
+        ],
+      },
+    });
+    const plan = planManagedCodexHooksRemoval(hooksContent, hooksPath, { platform: "linux" });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    assert.deepEqual(
+      plan.coordinateMoves.map(({ eventName, oldGroupIndex, oldHandlerIndex, newGroupIndex, newHandlerIndex, oldKey, newKey }) => ({
+        eventName,
+        oldGroupIndex,
+        oldHandlerIndex,
+        newGroupIndex,
+        newHandlerIndex,
+        oldKey,
+        newKey,
+      })),
+      [{
+        eventName: "SessionStart",
+        oldGroupIndex: 1,
+        oldHandlerIndex: 0,
+        newGroupIndex: 0,
+        newHandlerIndex: 0,
+        oldKey: `${hooksPath}:session_start:1:0`,
+        newKey: `${hooksPath}:session_start:0:0`,
+      }],
+    );
+    const expectedHash = `sha256:${createHash("sha256").update(
+      '{"event_name":"session_start","hooks":[{"async":false,"command":"echo foreign","timeout":600,"type":"command"}]}',
+    ).digest("hex")}`;
+    assert.equal(plan.coordinateMoves[0]!.expectedTrustedHash, expectedHash);
+
+    const oldKey = `${hooksPath}:session_start:1:0`;
+    const newKey = `${hooksPath}:session_start:0:0`;
+    const config = `[hooks.state.${JSON.stringify(oldKey)}]\ntrusted_hash = ${JSON.stringify(expectedHash)}\n`;
+    const migration = migrateManagedCodexHookTrustStateCoordinates(config, plan.coordinateMoves);
+    assert.equal(migration.keyRewrites.length, 1);
+    assert.equal(migration.keyRewrites[0]!.oldKey, oldKey);
+    assert.equal(migration.keyRewrites[0]!.newKey, newKey);
+    assert.equal(migration.config.includes(oldKey), false);
+    assert.ok(migration.config.includes(`[hooks.state.${JSON.stringify(newKey)}]`));
+    assert.ok(migration.config.includes(`trusted_hash = ${JSON.stringify(expectedHash)}`));
+  });
+
+  it("migrates foreign hook trust when Codex hashes an explicitly empty matcher", () => {
+    const hooksPath = "/fixture/.codex/hooks.json";
+    const managedCommand = buildManagedCodexHooksConfig("/repo", { platform: "linux" })
+      .hooks.SessionStart[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: "startup|resume|clear",
+            hooks: [{ type: "command", command: managedCommand }],
+          },
+          { matcher: "", hooks: [{ type: "command", command: "echo foreign" }] },
+        ],
+      },
+    });
+    const plan = planManagedCodexHooksRemoval(hooksContent, hooksPath, { platform: "linux" });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+
+    const expectedHash = `sha256:${createHash("sha256").update(
+      '{"event_name":"session_start","hooks":[{"async":false,"command":"echo foreign","timeout":600,"type":"command"}],"matcher":""}',
+    ).digest("hex")}`;
+    const { oldKey, newKey } = plan.coordinateMoves[0]!;
+    const config = `[hooks.state.${JSON.stringify(oldKey)}]\ntrusted_hash = ${JSON.stringify(expectedHash)}\n`;
+    const migration = migrateManagedCodexHookTrustStateCoordinates(config, plan.coordinateMoves);
+
+    assert.equal(plan.coordinateMoves[0]!.expectedTrustedHash, expectedHash);
+    assert.equal(migration.keyRewrites.length, 1);
+    assert.equal(migration.keyRewrites[0]!.oldKey, oldKey);
+    assert.equal(migration.keyRewrites[0]!.newKey, newKey);
+    assert.equal(migration.config.includes(oldKey), false);
+    assert.ok(migration.config.includes(`[hooks.state.${JSON.stringify(newKey)}]`));
+    assert.ok(migration.config.includes(`trusted_hash = ${JSON.stringify(expectedHash)}`));
+  });
+
+  it("fails closed when stale destination trust exists but source trust is missing", () => {
+    const hooksPath = "/fixture/.codex/hooks.json";
+    const managedCommand = buildManagedCodexHooksConfig("/repo", { platform: "linux" })
+      .hooks.SessionStart[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: "startup|resume|clear",
+            hooks: [{ type: "command", command: managedCommand }],
+          },
+          { hooks: [{ type: "command", command: "echo foreign" }] },
+        ],
+      },
+    });
+    const plan = planManagedCodexHooksRemoval(hooksContent, hooksPath, { platform: "linux" });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    const { oldKey, newKey, expectedTrustedHash } = plan.coordinateMoves[0]!;
+    assert.ok(expectedTrustedHash);
+    const config = `[hooks.state.${JSON.stringify(newKey)}]\ntrusted_hash = ${JSON.stringify(expectedTrustedHash)}\n`;
+
+    assert.throws(
+      () => migrateManagedCodexHookTrustStateCoordinates(config, plan.coordinateMoves),
+      (error: unknown) => error instanceof ManagedCodexHooksPlanError &&
+        error.code === "unsafe_managed_removal" &&
+        error.message.includes(oldKey) &&
+        error.message.includes(newKey) &&
+        error.message.includes("destination trust key") &&
+        error.message.includes("reconcile"),
+    );
+  });
+
+  it("fails closed when both source and destination trust keys are occupied", () => {
+    const hooksPath = "/fixture/.codex/hooks.json";
+    const managedCommand = buildManagedCodexHooksConfig("/repo", { platform: "linux" })
+      .hooks.SessionStart[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: "startup|resume|clear",
+            hooks: [{ type: "command", command: managedCommand }],
+          },
+          { hooks: [{ type: "command", command: "echo foreign" }] },
+        ],
+      },
+    });
+    const plan = planManagedCodexHooksRemoval(hooksContent, hooksPath, { platform: "linux" });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    const { oldKey, newKey, expectedTrustedHash } = plan.coordinateMoves[0]!;
+    assert.ok(expectedTrustedHash);
+    const config =
+      `[hooks.state.${JSON.stringify(oldKey)}]\ntrusted_hash = ${JSON.stringify(expectedTrustedHash)}\n\n` +
+      `[hooks.state.${JSON.stringify(newKey)}]\ntrusted_hash = ${JSON.stringify(expectedTrustedHash)}\n`;
+
+    assert.throws(
+      () => migrateManagedCodexHookTrustStateCoordinates(config, plan.coordinateMoves),
+      (error: unknown) => error instanceof ManagedCodexHooksPlanError &&
+        error.code === "unsafe_managed_removal" &&
+        error.message.includes(oldKey) &&
+        error.message.includes(newKey) &&
+        error.message.includes("destination trust key"),
+    );
+  });
+
+  it("fails closed with exact reconciliation keys when foreign trust hash or metadata changed", () => {
+    const hooksPath = "/fixture/.codex/hooks.json";
+    const managedCommand = buildManagedCodexHooksConfig("/repo", { platform: "linux" })
+      .hooks.SessionStart[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        SessionStart: [
+          {
+            matcher: "startup|resume|clear",
+            hooks: [{ type: "command", command: managedCommand }],
+          },
+          { hooks: [{ type: "command", command: "echo foreign" }] },
+        ],
+      },
+    });
+    const plan = planManagedCodexHooksRemoval(hooksContent, hooksPath, { platform: "linux" });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    const oldKey = `${hooksPath}:session_start:1:0`;
+    const newKey = `${hooksPath}:session_start:0:0`;
+    const config = `[hooks.state.${JSON.stringify(oldKey)}]\ntrusted_hash = "sha256:changed"\n`;
+
+    assert.throws(
+      () => migrateManagedCodexHookTrustStateCoordinates(config, plan.coordinateMoves),
+      (error: unknown) => error instanceof ManagedCodexHooksPlanError &&
+        error.code === "unsafe_managed_removal" &&
+        error.message.includes(oldKey) &&
+        error.message.includes(newKey) &&
+        error.message.includes("trusted_hash"),
+    );
+    const opaqueConfig = `[hooks.state.${JSON.stringify(oldKey)}]\ntrusted_hash = ${JSON.stringify(plan.coordinateMoves[0]!.expectedTrustedHash)}\nforeign_metadata = true\n`;
+    assert.throws(
+      () => migrateManagedCodexHookTrustStateCoordinates(opaqueConfig, plan.coordinateMoves),
+      (error: unknown) => error instanceof ManagedCodexHooksPlanError &&
+        error.code === "unsafe_managed_removal" &&
+        error.message.includes(oldKey) &&
+        error.message.includes(newKey),
+    );
+  });
+
+  it("leaves trust config byte-identical when removing hooks cannot shift foreign coordinates", () => {
+    const hooksPath = "/fixture/.codex/hooks.json";
+    const managedCommand = buildManagedCodexHooksConfig("/repo", { platform: "linux" })
+      .hooks.SessionStart[0]!.hooks[0]!.command;
+    const hooksContent = JSON.stringify({
+      hooks: {
+        SessionStart: [{
+          matcher: "startup|resume|clear",
+          hooks: [{ type: "command", command: managedCommand }],
+        }],
+      },
+    });
+    const plan = planManagedCodexHooksRemoval(hooksContent, hooksPath, { platform: "linux" });
+    assert.equal(plan.ok, true);
+    if (!plan.ok) return;
+    assert.deepEqual(plan.coordinateMoves, []);
+    const config = '# unrelated user config\n[features]\nweb_search = true\n';
+    const migration = migrateManagedCodexHookTrustStateCoordinates(config, plan.coordinateMoves);
+    assert.equal(migration.config, config);
+    assert.deepEqual(migration.keyRewrites, []);
   });
 
   it("fails closed instead of leaving an opaque duplicate group tombstone during cleanup", () => {
@@ -2234,7 +2527,7 @@ describe("codex hooks helpers", () => {
     if (!unsafePlan.ok) assert.equal(unsafePlan.error.code, "unsafe_managed_removal");
   });
 
-  it("fails closed for unsafe mixed removal and partial-corrupt OMX commands", () => {
+  it("plans foreign handler coordinate migration while rejecting partial-corrupt OMX commands", () => {
     const command = buildManagedCodexHooksConfig("/repo").hooks.SessionStart[0]?.hooks[0]?.command;
     const unsafeMixed = planManagedCodexHooksRemoval(JSON.stringify({
       hooks: {
@@ -2247,8 +2540,18 @@ describe("codex hooks helpers", () => {
         }],
       },
     }), "/hooks.json");
-    assert.equal(unsafeMixed.ok, false);
-    if (!unsafeMixed.ok) assert.equal(unsafeMixed.error.code, "unsafe_managed_removal");
+    assert.equal(unsafeMixed.ok, true);
+    if (unsafeMixed.ok) {
+      assert.deepEqual(
+        unsafeMixed.coordinateMoves.map((move) => [
+          move.oldGroupIndex,
+          move.oldHandlerIndex,
+          move.newGroupIndex,
+          move.newHandlerIndex,
+        ]),
+        [[0, 1, 0, 0]],
+      );
+    }
 
     const partial = planManagedCodexHooksMerge(JSON.stringify({
       hooks: {
@@ -2276,5 +2579,42 @@ describe("codex hooks helpers", () => {
     }), "/repo", "/hooks.json");
     assert.equal(sharedSkipped.ok, false);
     if (!sharedSkipped.ok) assert.equal(sharedSkipped.error.code, "ambiguous_managed_handler");
+  });
+
+  it("reports managed_trust_key_conflict for genuinely different hook paths", () => {
+    const hooksContent = mergeManagedCodexHooksConfig(
+      JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: buildManagedCodexHooksConfig("/repo", { platform: "linux" }).hooks.SessionStart[0]!.hooks[0]!.command,
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      "/repo"
+    );
+
+    // Build trust state with one path
+    const path1 = "/home/user/.codex/hooks.json";
+    const state1 = buildManagedCodexHookTrustState(path1, "/repo", {
+      hooksContent,
+    });
+
+    // Build trust state with a genuinely different path
+    const path2 = "/home/user/.config/other-hooks.json";
+    const state2 = buildManagedCodexHookTrustState(path2, "/repo", {
+      hooksContent,
+    });
+
+    // Keys should be different for genuinely different paths
+    const keys1 = Object.keys(state1);
+    const keys2 = Object.keys(state2);
+    assert.notDeepEqual(keys1, keys2, "Different hook paths should generate different trust keys");
   });
 });

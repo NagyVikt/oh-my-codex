@@ -4,6 +4,1123 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.22.25] - 2026-11-25
+
+Patch release fixes a regression in Autopilot Deep Interview mode that prevented valid questions from being asked when running in exact-session autopilot mode.
+
+### Fixed
+
+- **ALLOW AUTOPILOT DEEP INTERVIEW QUESTIONS (#4182):** Fixes #4183. When running in Autopilot mode with an exact-session `autopilot-state.json` file that lacks the autopilot marker, the mode is now correctly inferred as autopilot, allowing Deep Interview questions to proceed. The fix ensures that Deep Interview questions are not incorrectly blocked when autopilot state is present but the marker is missing, and normalizeSessionId is now properly exported for session identifier handling.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.24...v0.22.25
+
+## [0.22.24] - 2026-11-25
+
+Patch release improves native manifest handling for dev versions by respecting explicit environment overrides, and enhances documentation clarity for workflow runtime prerequisites and template validation checks.
+
+### Fixed
+
+- **NATIVE MANIFEST HYDRATION RESPECTS ENV OVERRIDES FOR DEV VERSIONS (#4179):** Fixes #4166 regression. When OMX runs a dev version, the manifest request is now correctly skipped only when neither `OMX_NATIVE_MANIFEST_URL` nor `OMX_NATIVE_RELEASE_BASE_URL` environment variables are set. If either override is explicitly set, the manifest is loaded as requested, allowing dev builds to work with custom manifest endpoints. Error messages in sparkshell and api were also improved to suggest local builds or binary path overrides for dev versions instead of network reconnection.
+
+### Changed
+
+- **DOCS: CLARIFY WORKFLOW RUNTIME PREREQUISITES (#4176):** Template documentation now clarifies the runtime requirements and expectations for workflow execution, helping users understand setup and execution environment requirements.
+
+- **DOCS: SCOPE TEMPLATE VALIDATION TO APPLICABLE CHECKS (#4178):** Template validation guidance is now scoped to checks that apply in the current context, reducing noise and improving clarity for template maintainers and validators.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.23...v0.22.24
+
+## [0.22.23] - 2026-11-25
+
+Patch release improves the update flow to automatically refresh native agents after package updates, switches the notify fallback watcher to file-system events, removes redundant agent refresh suppression logic, restores rollout replay during reconciliation, and clarifies Team and native model routing in the AGENTS.md templates.
+
+### Fixed
+
+- **OMX UPDATE REFRESHES NATIVE AGENTS AFTER PACKAGE UPDATES (#4167):** Fixes #4166. When OMX packages are updated via npm, the setup command now automatically refreshes native agent TOMLs without requiring manual re-setup. The update hook detects package changes and triggers native agent refresh.
+
+- **NOTIFY FALLBACK WATCHER USES FS.WATCH INSTEAD OF POLLING (#4170):** Improves notify watcher performance by switching from polling to file-system events. The fallback notify watcher now uses `fs.watch()` for more efficient real-time file monitoring when native fsevents are unavailable.
+
+- **REMOVE AGENT REFRESH SUPPRESSION FLAG (#4172):** Removes the `OMX_SKIP_NATIVE_AGENT_REFRESH` environment variable and associated suppression logic, simplifying the native agent refresh flow during updates.
+
+- **REPLAY ROLLOUTS FOUND DURING RECONCILIATION (#4173):** Restores rollout replay functionality during reconciliation. Rollouts that were paused or incomplete are now replayed when their parent task is reconciled.
+
+### Changed
+
+- **DOCS: CLARIFY TEAM AND NATIVE MODEL ROUTING IN AGENTS.MD TEMPLATES (#4174):** Template documentation in AGENTS.md now clarifies how Team executor, native model routing, and agent discovery interact. This helps users understand model tier selection and agent resolution behavior.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.22...v0.22.23
+
+## [0.22.22] - 2026-11-25
+
+Patch release enhances the setup command to refresh stale model, provider, and reasoning pins when configurations change.
+
+### Fixed
+
+- **REFRESH AGENTS WHEN ONLY MODEL CHANGES (#4165):** The setup command now detects and refreshes stale model/provider/reasoning pins while preserving other user edits. Users can keep custom workflows and other configuration intact while updating agent definitions based on the latest model capabilities. Fixes #3919 (partial, option A).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.21...v0.22.22
+
+## [0.22.21] - 2026-11-24
+
+Patch release fixes repeated Stop hook invocations for blocked team workers, ensuring deterministic worker lifecycle management.
+
+### Fixed
+
+- **SUPPRESS REPEATED STOP HOOK FOR BLOCKED TEAM WORKERS (#4162):** Fixes #4156. Team workers in blocked state were triggering repeated Stop hooks due to improper state management. The fix restores correct stateDir handling throughout resolveTeamWorkerStopDecision and adds dedupeStateDir field to TeamWorkerStopDecision.blocked variant.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.20...v0.22.21
+
+## [0.22.20] - 2026-11-24
+
+Patch release maps Homebrew Cellar node paths to stable symlinks to ensure managed codex hooks survive node upgrades.
+
+### Fixed
+
+- **MAP HOMEBREW CELLAR NODE PATHS TO STABLE SYMLINKS (#4155):** Fixes #4153. Homebrew stores node in a version-pinned Cellar path. When persisted in `~/.codex/hooks.json`, hooks break after node upgrades. The `resolveStableNodePath()` helper now detects Homebrew Cellar paths and maps them to stable symlinks, allowing hooks to survive upgrades.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.19...v0.22.20
+
+## [0.22.19] - 2026-11-24
+
+Patch release makes the env tier variables the single source of truth for agent models and prints the exit resume block for resume launches.
+
+### Changed
+
+- **ENV TIER VARS AS SINGLE SOURCE OF TRUTH (#4146):** Fixes #4133, #4149. Behavior change, see migration note below.
+
+### Fixed
+
+- **PRINT EXIT RESUME BLOCK FOR RESUME LAUNCHES (#4144):** Fixes #4060.
+
+### Migration (#4146)
+
+- The `exactModel` pins are removed.
+- `OMX_DEFAULT_FRONTIER_MODEL`, `OMX_DEFAULT_STANDARD_MODEL` and `OMX_DEFAULT_SPARK_MODEL` drive all agents.
+- Defaults: frontier `gpt-6.2-astra` (planner/architect/critic), standard `gpt-6.2-sol`, spark `gpt-6-luna` (explore/style-reviewer/vision).
+- The `config.toml` root `model` no longer affects agent tiers.
+- Re-run `omx setup --force` to regenerate the agent TOML.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.18...v0.22.19
+
+## [0.22.18] - 2026-11-24
+
+Patch release ships the runtime spark/explore resolution fix that was intended for v0.22.17 but was not included in the published v0.22.17 package.
+
+### Fixed
+
+- **MAKE SPARK/EXPLORE RUNTIME RESOLUTION FOLLOW CONFIGURED MODEL (#4138):** Fixes #4133: runtime spark/explore resolution follows the configured main model; planner/architect/researcher astra pins unchanged pending owner decision.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.17...v0.22.18
+
+## [0.22.17] - 2026-11-24
+
+Patch release enhances the ralplan workflow with improved Architect/Critic quality gates, lane reuse strategy, and fixes spark model inversion. See [release notes](docs/release-notes-0.22.17.md) for exact scope and evidence. Note: v0.22.16 was published without code changes; this release ships them.
+
+### Improved
+
+- **RALPLAN RE-REVIEW ARCHITECT/CRITIC/QUALITY-GATE LANE REUSE (#4130, #4131):** Improved ralplan workflow with better Architect/Critic quality gates and enhanced lane reuse strategy, fixing plan review cycle issues (#4129).
+
+### Fixed
+
+- **PREVENT SPARK MODEL INVERSION WHEN CHEAPER FRONTIER MODEL CONFIGURED (#4135):** Fixed setup model table selection logic to only update generated AGENTS.md; runtime spark resolution remains unchanged and is fixed in this release (#4138).
+- **MAKE SPARK/EXPLORE RUNTIME RESOLUTION FOLLOW CONFIGURED MODEL (#4138):** Fixed spark and explore model runtime resolution to respect configured model settings, completing the fix for #4133.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.15...v0.22.17
+
+## [0.22.16] - 2026-11-24
+
+Version bump release containing only package metadata updates. The planned code changes (#4130, #4131, #4129, #4135, #4138) were not included in this release; they ship in v0.22.17 instead.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.15...v0.22.16
+
+## [0.22.15] - 2026-11-22
+
+Patch release improves vision model guidance for CSS advice. See [release notes](docs/release-notes-0.22.15.md) for exact scope and evidence.
+
+### Improved
+
+- **REQUIRE RELIABLE VIEWPORT EVIDENCE FOR CSS ADVICE (#4123):** Vision model styling recommendations now require reliable viewport evidence, preventing CSS advice on components when viewport context cannot be verified. This ensures recommendations reflect the actual rendering environment and reduces false-positive style suggestions.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.14...v0.22.15
+
+## [0.22.14] - 2026-11-22
+
+Patch release ships part A of exit-block improvements and a regression fix. See [release notes](docs/release-notes-0.22.14.md) for exact scope and evidence.
+
+### Fixed
+
+- **EXIT-BLOCK REATTACH SUGGESTION FOR ACTIVE SESSION OWNERS (#4117 Part A):** Exit-block now suggests `tmux attach` or `psmux attach` when a detached session owner is still alive, reducing the need for manual session recovery. Part B (alternative attach paths) remains open. Fixes #4117 (partial).
+- **PRESERVE RESUME HINT FOR COMPLETED FOREGROUND LAUNCHES (#4120):** Fixed a regression from #4118 where the omx resume hint was being dropped for completed foreground launches. Resume hints are now correctly preserved throughout the launch lifecycle. Fixes #4119.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.13...v0.22.14
+
+## [0.22.13] - 2026-11-22
+
+Patch release ships a fix for safely resuming verified OMX session owners. See [release notes](docs/release-notes-0.22.13.md) for exact scope and evidence.
+
+### Fixed
+
+- **SAFELY RESUME VERIFIED OMX SESSION OWNERS (#3965):** Fixed session resumption logic to safely handle verified session owners, preventing dead-pointer issues during session reactivation. Also updated notification fixtures to use the canonical session pointer contract. Fixes #3964.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.12...v0.22.13
+
+## [0.22.12] - 2026-11-21
+
+Patch release ships a fix for recovering quarantined live-pin lock links from JSONL record streams. See [release notes](docs/release-notes-0.22.12.md) for exact scope and evidence.
+
+### Fixed
+
+- **RECOVER QUARANTINED LIVE-PIN LOCK LINKS (#4112):** Fixed deserialization of live-pin tracking data from JSONL streams. Quarantined lock links in team state were not being properly recovered due to incomplete deserialization logic. Lock recovery now correctly processes all stored JSONL records. Fixes #4111.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.11...v0.22.12
+
+## [0.22.11] - 2026-11-18
+
+Patch release ships fixes for preserving custom developer instructions during setup and canonicalizing CODEX_HOME for symlink consistency. See [release notes](docs/release-notes-0.22.11.md) for exact scope and evidence.
+
+### Fixed
+
+- **PRESERVE CUSTOM DEVELOPER_INSTRUCTIONS DURING LEGACY SETUP (#4107):** Legacy setup mode now correctly preserves user-customized `developer_instructions` from existing configurations instead of overwriting them with defaults. Fixes #4105.
+- **CANONICALIZE CODEX_HOME FOR SYMLINK CONSISTENCY (#4108):** Doctor hook and setup logic now canonicalize `CODEX_HOME` paths to handle symlink aliases consistently, ensuring symlinked home directories are treated with uniform trust and identity. Fixes #4106.
+
+### Dependencies
+
+- @biomejs/biome updated from 2.6.6 to 2.6.7 (#4103)
+- @napi-rs/lzma updated from 1.4.1 to 1.4.5 (#4104)
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.10...v0.22.11
+
+## [0.22.10] - 2026-11-17
+
+Patch release ships updated ralplan skill guidance aligned with warn-and-skip runtime policy for unavailable custom gates. See [release notes](docs/release-notes-0.22.10.md) for exact scope and evidence.
+
+### Changed
+
+- **ALIGN RALPLAN CUSTOM-GATE GUIDANCE WITH WARN-AND-SKIP POLICY (#4097):** Ralplan skill guidance now documents that unavailable custom gates are warned about and skipped at runtime, not an error condition. The skill no longer references or requires missing custom gates in its examples or expected workflow paths. Fixes #4096.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.9...v0.22.10
+
+## [0.22.9] - 2026-11-17
+
+Minor release ships updated code-review skill with source-bound continuation and repair receipts. See [release notes](docs/release-notes-0.22.9.md) for exact scope and evidence.
+
+### Added
+
+- **CODE-REVIEW SKILL: SOURCE-BOUND CONTINUATION AND REPAIR RECEIPTS (#4098):** The code-review skill now captures source identity (commit, uncommitted changes, file hashes) in review receipts, tracks scope, requirements, gates, and validation results independently for each review lane, and prevents unverifiable approval of changed source or invalidated evidence. Receipt structure distinguishes fresh review, missing-lane resumption, missing-validation collection, repair re-review, and complete evidence termination cases. Fixes #4095.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.8...v0.22.9
+
+## [0.22.8] - 2026-11-16
+
+Patch release ships critical fixes for team lock recovery and Stop hook stability. The native Stop hook no longer loops on stale team membership locks, preventing Codex API quota exhaustion. See [release notes](docs/release-notes-0.22.8.md) for exact scope and evidence.
+
+### Fixed
+
+- **STOP HOOK STABILITY WITH TEAM LOCK RECOVERY (#4087, #4090):** Stop hook now properly detects `team_lock_recovery_required` errors and terminates cleanly with `continue:false` instead of looping. Stale team membership locks are correctly identified as terminal stops, preventing indefinite continuation attempts that could exhaust the Codex API quota. Fixes #4086.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.7...v0.22.8
+
+## [0.22.7] - 2026-11-15
+
+Patch release ships updated agent guidance: prioritizing complete, maintainable repairs over minimal-diff patches. See [release notes](docs/release-notes-0.22.7.md) for exact scope and evidence.
+
+### Changed
+
+- **PRIORITIZE COMPLETE, MAINTAINABLE REPAIRS IN AGENT GUIDANCE (#4083):** Agent repair guidelines now emphasize choosing complete, correct solutions at natural ownership boundaries instead of minimizing diff size. This aligns agent behavior with maintainability practices: deletion over addition, boundary repair over new layers, and documented mitigations where appropriate. Updated guidance appears in system prompts, agent templates, and skill documentation. Fixes #4082.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.6...v0.22.7
+
+## [0.22.6] - 2026-11-10
+
+Patch release ships three fixes: team lock recovery preservation, cleanup logic that protects active temporary directories, and question terminal state preservation for reliable answer handling. See [release notes](docs/release-notes-0.22.6.md) for exact scope and evidence.
+
+### Fixed
+
+- **PRESERVE SHARED LOCKS DURING RECOVERY (#4075):** Team membership, scaling, task-claim, mailbox, and shared dispatch locks now preserve stale locks and report `team_lock_recovery_required` instead of deleting another operation's replacement lock. After a crash, confirm all users of the lock have stopped before manually removing the reported directory; automatic crash recovery is intentionally disabled.
+- **PRESERVE ACTIVE TEMPORARY DIRECTORIES DURING CLEANUP (#4076):** `omx cleanup` now preserves temporary directories and only reaps orphaned OMX MCP processes. A directory name and modification time do not establish ownership, and matching temporary directories may contain active projects or uncommitted work.
+- **PRESERVE THE FIRST TERMINAL QUESTION STATE (#4077):** A stale question UI, renderer replacement, or timeout handler could overwrite an accepted answer or report it as a failure. Question state transitions are now serialized and the first terminal state is preserved across API, UI, error, and supersede paths. Only the winning answer runs answer side effects; terminal records survive late submissions and cancellation.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.5...v0.22.6
+
+## [0.22.5] - 2026-11-09
+
+Patch release ships two critical team runtime safety improvements: fail-closed task-read error handling and memory/secrets/API preservation across state mutations. See [release notes](docs/release-notes-0.22.5.md) for exact scope and evidence.
+
+### Fixed
+
+- **FAIL CLOSED ON TASK READS AND STALE REPLY TARGETS (#4067):** Team runtime now fails closed on task read failures, handling corrupted task files and unresolvable reply targets instead of silently ignoring them. This prevents task loss and state inconsistency during malformed or id-mismatched operations.
+- **PRESERVE MEMORY WRITES, SECRETS, AND API AVAILABILITY (#4068):** Integration and worker operations now preserve memory writes, API availability state, and secret values across state mutations. Previous mutations could lose in-flight writes, reset API state during recovery, or drop configured secrets, causing workflows to restart or fail. This fix ensures state consistency across all operations.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.4...v0.22.5
+
+## [0.22.4] - 2026-11-09
+
+Patch release ships three improvements to the resume command: exit-time resume hints for better workflow continuation, fixes for directory overrides in resume commands, and corrections to quote escaping. See [release notes](docs/release-notes-0.22.4.md) for exact scope and evidence.
+
+### Added
+
+- **PRINT RESUME BLOCK ON EXIT FOR WORKFLOW CONTINUATION (#4061, #4060):** The CLI now prints a resume-hint block when exiting after a work session, enabling users to resume their previous workflow context. The `omx resume --last` command errors appropriately when no previous session exists, providing clear guidance instead of silently succeeding with empty context.
+
+### Fixed
+
+- **HONOR DIRECTORY OVERRIDES IN RESUME COMMANDS (#4062):** The resume hint now respects the `-C`/`--cd` directory override flags and worktree-specific Codex home paths, ensuring session resolution uses the correct context when launched with directory overrides.
+- **RESTORE APOSTROPHE ESCAPING IN SHELLQUOTE (#4063):** Fixed quote-escaping regression where apostrophes in shell-quoted values were incorrectly escaped, causing shell syntax errors in paths and identifiers containing apostrophes.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.3...v0.22.4
+
+## [0.22.3] - 2026-11-08
+
+Patch release ships Plan and Ralplan skill guidance that matches the tools the host actually exposes. See [release notes](docs/release-notes-0.22.3.md) for exact scope and evidence.
+
+### Fixed
+
+- **ALIGN PLAN AND RALPLAN WITH AVAILABLE HOST TOOLS (#3998):** The Plan and Ralplan skills no longer reference unavailable `ask_codex` syntax or a nonexistent `$plan` consensus mode. Plan asks questions through `omx question` in attached tmux (with the return pane preserved) and through native structured input elsewhere, uses only the host's exposed reviewer subagents, and reports a missing independent review instead of claiming approval. A "skip planning" request now continues through direct execution while keeping active workflow gates, instead of always handing off to `$ultragoal`. Ralplan owns the consensus sequence and its quality gates.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.2...v0.22.3
+
+## [0.22.2] - 2026-11-08
+
+Patch release ships a team-runtime safety fix: integration and cleanup now preserve manual Git operations, corrupted task state, and completion evidence instead of aborting, dropping, or deleting them. See [release notes](docs/release-notes-0.22.2.md) for exact scope and evidence.
+
+### Fixed
+
+- **PRESERVE WORK AND STATE ACROSS TEAM INTEGRATION AND CLEANUP (#4053):** Team integration and shutdown no longer abort a manual Git operation (rebase, merge, cherry-pick, revert, bisect) in the leader or a worker worktree; they stop and report it, and only abort a merge or cherry-pick they started themselves. A malformed, id-mismatched or unreadable task file now fails with `team_task_read_failed` instead of silently vanishing from completion and cleanup gates. Valid ignored completion-evidence reports are archived under the git common dir (`omx-completion-evidence/`) before worktree removal, so cleanup no longer refuses or deletes them; unknown files still block removal.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.1...v0.22.2
+
+## [0.22.1] - 2026-11-08
+
+Patch release ships critical fixes for the omx question command when stdin is closed, adds readline close event handling for EOF detection, reapplies verified handoffs and safe drains after v0.22.0, accepts aliased Codex homes for external live pins, and addresses three Codex findings from the v0.22.0 release review. See [release notes](docs/release-notes-0.22.1.md) for exact scope and evidence.
+
+### Fixed
+
+- **ACCEPT ALIASED CODEX HOMES FOR EXTERNAL LIVE PINS (#3939):** Accept either spelling of the configured Codex home when validating live pin cache paths, enabling external Codex home links and symlinks to resolve correctly while maintaining no-follow traversal security. This fixes live pin resolution when Codex homes are aliased or redirected.
+- **FIX EOF DETECTION FOR CLOSED STDIN IN OMX QUESTION --UI (#4048, #4046):** Replaced input stream listeners with readline close event for more reliable EOF detection when stdin is closed. Handle closed stdin in `omx question --ui` with proper error handling to prevent crashes when the command is invoked without stdin.
+- **PRESERVE NON-FORCE DRAINS AND REQUIRE VERIFIED CODE HANDOFF (#4034):** Non-force team drains no longer interrupt in-flight worker Git operations, and worker code handoff to the leader requires verified evidence before integration. This change was held out of v0.22.0.
+- **ADDRESS CODEX FINDINGS FROM v0.22.0 RELEASE REVIEW (#4047):** Fixes for issues identified in Codex review of release PR #4042. Herdr team shutdown now fails closed when workspace teardown fails, so team state and worktrees are preserved instead of removed while workers may still run. Scale-up honors a team's persisted Herdr launch mode, and startup readiness evidence is tracked per worker instead of leaking across concurrent startups.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.22.0...v0.22.1
+
+## [0.22.0] - 2026-11-08
+
+Minor release ships the Herdr team runtime backend Phase 2 with worker capacity management and task claim renewal, improves conflict handling in team operations, and adds session execution comparisons and regression gates for reliable task tracking. See [release notes](docs/release-notes-0.22.0.md) for exact scope and evidence.
+
+### Added
+
+- **SESSION EXECUTION COMPARISONS AND REGRESSION GATES (#3915):** Capture execution snapshots during session transitions, compare sessions against baselines, and gate further work when regressions are detected. This enables robust regression detection during multi-agent workflows and task execution validation.
+
+### Fixed
+
+- **HERDR TEAM RUNTIME BACKEND PHASE 2 (#4006):** Implement the Herdr team runtime backend continuation, including native session pane coordination, detached-launch design notes, and improved tmux integration patterns. This solidifies the team runtime foundation with enhanced reliability and design clarity.
+- **RESERVE WORKER CAPACITY, RENEW TASK CLAIMS, AND GATE DELIVERY COMPLETION (#4036):** Fix followup bounds, implement claim renewal, gate delivery success, close lease gaps, recover pending receipts, bound lease shutdown, surface renewal errors, and recognize terminal handoffs. Support system Bash and renewal on tool activity; fix scope root reactivation to delivery debt and renew leases despite heartbeat persistence failures. Reserve worker capacity before assignment and compare persisted assignment snapshots for validation.
+- **FAIL CLOSED ON GIT CONFLICTS AND HAND OFF PERSISTED TASK CLAIMS (#4035):** Remove automatic conflict resolution strategies (-X theirs/-X ours), make conflicts visible and require manual resolution, preserve conflict state during integration retries, align task assignment protocol with leader's atomic preclaim, and expand conflict-scenario test coverage.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.48...v0.22.0
+
+## [0.21.48] - 2026-11-07
+
+Patch release stores live Codex pins outside the plugin fingerprint root so live-pin writes no longer change the fingerprint Codex approved, and drops role-based reasoning-effort defaults from seven role prompts, ensuring Vision stays extraction-only unless reassessment is justified. See [release notes](docs/release-notes-0.21.48.md) for exact scope and evidence.
+
+### Fixed
+
+- **LIVE PINS OUTSIDE CODEX PLUGIN FINGERPRINT ROOT (#4010, fixes #3898):** OMX wrote mutable live-pin files inside Codex's fingerprinted plugin-version directory, so every pin write changed the plugin fingerprint and Codex repeatedly invalidated hook approval. Live pins now live in `<cacheBase>/.omx-pins/<version>`, outside the fingerprint root, so pin writes no longer change the approved plugin fingerprint (#4010; reporter: @AkiraLan; reviewer: @iqdoctor).
+- **ROLE-BASED REASONING-EFFORT DEFAULTS (#4020, #4021):** #4021 replaced fixed 'Default effort: low/medium' role defaults with task-based effort recommendations that preserve the leader's selected effort. Vision prompt is updated to make effort recommendations conditional: 'If reassessment is justified from task demands, remaining uncertainty, available proof, and resource limits, recommend a supported reasoning effort and briefly compare plausible alternatives without a role-based default; otherwise preserve extraction-only output.' The modification ensures all role prompts correctly preserve extraction-only output and deference to leader effort selection.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.47...v0.21.48
+
+## [0.21.47] - 2026-11-07
+
+Patch release keeps psmux worker panes alive on native Windows by embedding the split receipt safely in tmux commands for all platforms. See [release notes](docs/release-notes-0.21.47.md) for exact scope and evidence.
+
+### Fixed
+
+- **PSMUX WINDOWS WORKER LAUNCH (#4008, fixes #4007):** On native Windows with psmux, `omx team` workers exited at launch because OMX appended a `# omx_source_...` receipt to the worker command. The receipt is now appended as a final '; # <receipt>' statement inside the PowerShell script before -EncodedCommand encoding; POSIX keeps ' # <receipt>' inside the sh -c string; and paneHasReceipt decodes encoded commands for ambiguous-split reconciliation.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.46...v0.21.47
+
+## [0.21.46] - 2026-11-02
+
+Patch release preserves assignment scope in generated native-agent overlays and bounds Git Master's history and write authority. See [release notes](docs/release-notes-0.21.46.md) for exact scope and evidence.
+
+### Fixed
+
+- **ASSIGNMENT-SCOPED NATIVE AGENT OVERLAYS (#3989):** Keep posture and exact-model guidance aligned with the assigned scope, so read-only and advisory roles are not told to implement or always run builds.
+- **GIT MASTER AUTHORITY BOUNDARIES (#3997):** Require task authority for history rewrites and remote writes, preserve unrelated dirty work, and split commits by independent concern.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.45...v0.21.46
+
+## [0.21.45] - 2026-11-01
+
+Patch release fixes `omx doctor` incorrectly rejecting trust for unchanged foreign Codex hook groups whose matcher is the empty string. The hash input now preserves an explicitly empty matcher, matching Codex's identity representation. See [release notes](docs/release-notes-0.21.45.md) for exact scope and evidence.
+
+### Fixed
+
+- **EMPTY FOREIGN HOOK MATCHER TRUST (#3985, fixes #3984):** Include an explicitly empty-string matcher in the foreign hook trust hash input so unchanged trusted hook groups no longer appear to have an unsafe trust migration. The separate reported SessionEnd outlier is not addressed.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.44...v0.21.45
+
+## [0.21.44] - 2026-10-31
+
+Patch release fixes native runtime hydration timeout/abort failures reported in #3968. Postinstall hydration now allows a 120-second window, diagnostics preserve actionable errors, and `omx native-runtime hydrate` provides a foreground retry; `omx doctor` points to that command for the affected readiness state. The release-coupled package, lock, Cargo, and plugin versions were already synchronized to `0.21.44` by #3976. See [release notes](docs/release-notes-0.21.44.md) for exact scope and evidence.
+
+### Fixed
+
+- **NATIVE RUNTIME HYDRATION TIMEOUT (#3977, fixes #3968):** Increase the postinstall hydration timeout from 15 to 120 seconds, report timeout and nested failure context with redacted URLs, add `omx native-runtime hydrate` for foreground retries, and update the affected `omx doctor` hint. This addresses the hydration-timeout/abort path without claiming to eliminate unrelated causes of provider unavailability.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.43...v0.21.44
+
+## [0.21.43] - 2026-10-30
+
+Patch release corrects `omx doctor` guidance for unavailable native process identity: `omx update` repairs the native runtime cache; `omx setup` is no longer suggested as a cache repair. The session-pointer recovery note remains (7 commits, 12 files, +173/−37; PRs #3967, #3969–#3972). See [release notes](docs/release-notes-0.21.43.md) for the compare-range inventory, validation, and known gaps.
+
+### Fixed
+
+- **PROCESS IDENTITY DOCTOR GUIDANCE:** Remove `omx setup` from the native process identity recovery hint; `omx update` hydrates the release-asset runtime cache, while session pointer recovery remains available without the native runtime (#3971). This corrects the remedy text and does not establish a root cause for the separate provider-unavailable report in #3968.
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.42...v0.21.43
+
+## [0.21.42] - 2026-10-30
+
+Patch release makes Team and tmux status inspection read-only and improves native Codex goal reconciliation (8 commits, 30 files, +867/−116; PRs #3959–#3964).
+
+### Fixed
+
+- **READ-ONLY TEAM AND TMUX STATUS:** `omx team status` no longer runs monitor maintenance, writes state, or recovers claims; it remains usable with a read-only OMX root. When the team name is omitted, status resolves only a unique current-leader match. `omx tmux-hook status` reports missing configuration without initializing it (#3963).
+- **NATIVE CODEX GOAL RESPONSES:** Normalize structured and serialized `get_goal` response envelopes, distinguish an unavailable native tool from database/schema/context errors, and permit truthful non-terminal blocked checkpoints when goal verification is unavailable without fabricating completion (#3964).
+- **HISTORY MUTATION DETECTION:** Detect same-inode history content changes even when size and modification time are restored; do not publish the altered artifact (#3959).
+
+### Test reliability
+
+- Stabilize detached-launch and Windows platform fixtures, including per-fixture sidecar isolation (#3963).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.42.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.41...v0.21.42
+
+## [0.21.41] - 2026-10-29
+
+Patch release adds per-stage custom quality gates for deep-interview, Ralplan, and code review, plus same-mtime history-mutation detection (8 commits, 35 files, +1998/−84; PRs #3951–#3954, #3956, and #3958 plus release preparation).
+
+### Added
+
+- **CONFIGURABLE CUSTOM QUALITY GATES:** Configure additional skill-based reviewers in `.omx-config.json` under `qualityGates.deep-interview`, `qualityGates.ralplan`, and `qualityGates.code-review`. Plain skill names default to blocking; objects can select blocking/advisory mode and a model override. Configured reviewers supplement the built-in review flow; advisory results are recorded without blocking, and blocking Ralplan `reject`/`iterate` verdicts feed its revise loop (#3956; requested in #3955 by @iqdoctor).
+
+### Fixed
+
+- Include file change time when validating history artifacts during project-launch publication, so same-inode, same-size content mutations with a restored modification time are discarded (#3958).
+
+### Documentation
+
+- Align model-selection documentation with the implemented precedence rules (#3951).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.41.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.40...v0.21.41
+
+## [0.21.40] - 2026-10-29
+
+Patch release fixes managed Codex daemon ownership of the OMX session pointer and preserves interleaved tmux shim records (8 commits, 19 files, +777/−91; PRs #3941, #3943–#3945, and #3949 plus release preparation).
+
+### Fixed
+
+- **MANAGED CODEX SESSION POINTER OWNERSHIP:** Do not let a long-lived `codex app-server --managed-daemon` block OMX session resume or fresh launches; add fail-closed pointer recovery and doctor guidance while preserving protection for live interactive OMX owners (#3949; fixes #3946, reported by @nascyimento).
+
+### Test reliability
+
+- Preserve completed non-tail tmux shim records when command writes interleave, while still discarding an incomplete final segment (#3941).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.40.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.39...v0.21.40
+
+## [0.21.39] - 2026-10-28
+
+Patch release for GPT-6.1 Terra model catalog recognition and canonical detached-session state roots (7 commits, 25 files, +628/−99; PR #3931, #3933, and #3935–#3938 plus release preparation).
+
+### Added
+
+- **GPT-6.1 TERRA MODEL RECOGNITION:** recognize `gpt-6.1-terra` in the known Codex model catalog (#3933).
+
+### Fixed
+
+- **DETACHED SESSION STATE ROOTS:** publish the canonical state root in detached leader records so strict session reuse accepts aliased roots (#3935).
+
+### Test reliability
+
+- Isolate each test file's home directory, wait for VSCode log stream completion, and synchronize tmux/team fixture event boundaries (#3936–#3938).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.39.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.38...v0.21.39
+
+## [0.21.38] - 2026-10-27
+
+Patch release for setup refresh self-healing stale OMX-owned plugin hook trust keys (8 commits, 9 files, +279/−23; PR #3924 plus release-train PRs #3926–#3929).
+
+### Fixed
+
+- **PLUGIN HOOK TRUST REFRESH:** After a plugin cache rebuild, setup refresh retires stale trusted hashes from canonical OMX plugin-scoped Codex hook trust records instead of failing with `managed_trust_key_conflict`. Third-party and malformed trust state remains fail-closed (#3924; fixes #3918).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.38.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.37...v0.21.38
+
+## [0.21.37] - 2026-10-27
+
+Patch release for npm global-install ownership detection and clearer plugin-cache completion-marker diagnostics (source range: 10 commits, 11 files, +423/−58; PRs #3922 and #3923).
+
+### Fixed
+
+- **NPM GLOBAL OWNERSHIP:** Recognize npm-managed global installs when npm's configured global prefix differs from the active Node runtime path, while retaining fail-closed ownership validation (#3922; fixes #3920).
+- **PLUGIN-CACHE DIAGNOSTICS:** Distinguish malformed completion markers, marker-version mismatches, and claim-digest mismatches in setup/doctor output. This changes diagnostics only; provenance semantics are unchanged (#3923; fixes #3921).
+
+### Dependencies
+
+- Update the MCP SDK runtime dependency to 1.32.2 (#3917).
+- Update Biome to 2.6.2 as a development dependency (#3916).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.37.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.36...v0.21.37
+
+## [0.21.36] - 2026-10-25
+
+Patch release for native-hook CLI diagnostic log routing (5 commits, 12 files, +373/−32; PR #3909).
+
+### Fixed
+
+- **NATIVE HOOK LOGGING:** Route native-hook CLI error diagnostics through `omxLogsDir`, honoring `OMX_ROOT` (which takes precedence) or `OMX_STATE_ROOT` while preserving the project `.omx/logs` default when neither is set (#3909, @Yeachan-Heo; fixes #3908).
+
+Full inventory, compatibility notes, and verification: [release notes](docs/release-notes-0.21.36.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.35...v0.21.36
+
+## [0.21.34] - 2026-10-24
+
+Patch release for worker worktree shutdown preservation (1 commit, 7 files, +1413/−57; PR #3896).
+
+### Fixed
+
+- **SHUTDOWN RESILIENCE:** Preserve worker worktrees when shutdown cannot save work due to checkpointing failure, merge failure, or ignored files in the working directory. Shutdown failures no longer erase worker worktrees; recovery state is retained for retries. Submodule handling, report provenance, and partial pane/prompt cleanup proceed independently (#3896, @shenyankm; resolves #3897).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.34.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.33...v0.21.34
+
+## [0.21.33] - 2026-10-23
+
+Patch release for team dispatch finalization recovery (1 commit, 4 files, +251/−8; PR #3893).
+
+### Fixed
+
+- **CRASH RECOVERY:** Recover team dispatch finalizations from torn journal lines in `runtime-finalizations.jsonl`. After a crash mid-append, the journal could contain truncated JSON lines that blocked reconciliation and caused subsequent receipts to be lost. The fix adds tolerant parsing via `parseRuntimeFinalizationJournal()` to skip malformed lines and recover all valid commands, and uses newline-isolated appends to protect new entries from torn tails (#3893, @shenyankm).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.33.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.32...v0.21.33
+
+## [0.21.32] - 2026-10-23
+
+Patch release for setup scope validation regression fix (13 commits, 4 files, +664/−112; PR #3890).
+
+### Fixed
+
+- **REGRESSION FIX:** Canonicalize scope roots and fix symlink path comparison in `omx setup`, resolving a v0.21.31 regression that rejected valid destinations as "outside managed scope" when HOME/CODEX_HOME crosses a symlink (e.g., macOS /var -> /private/var; #3890, @gajae-gajae).
+- Validate project .codex and OMX_ROOT dirs against their own roots, preventing rejection of valid nested configurations (#3890).
+- Migrate legacy user-scope skill receipt during setup upgrade (#3890).
+- Sanitize Windows cross-drive backup paths through unified helper (#3890).
+- Detect dangling symlinks before canonicalization and refuse them with clear error messages (#3890).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.32.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.31...v0.21.32
+
+## [0.21.31] - 2026-10-22
+
+Patch release for setup symlink safety and dispatch read reliability (PRs #3881, #3883).
+
+### Fixed
+
+- Refuse symlinked managed destinations in `omx setup`, preventing unintended writes outside the repository when a committed `.gitignore` or prompt path is a symlink (#3881, @shenyankm).
+- Unified setup symlink guard: single authoritative helper validates all managed scope writes before reading/comparing and before mkdir operations (#3887).
+- Fix dispatch read failures by improving state machine transitions in delivery-recovery (#3883, @shenyankm).
+- Correct test hook timing to run after mailbox discovery instead of before, ensuring comprehensive test coverage of dispatch race conditions (#3883, @shenyankm).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.31.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.30...v0.21.31
+
+## [0.21.30] - 2026-10-22
+
+Patch release for Team monitor-path dispatch serialization (4 commits, 10 files, +324/−78; PRs #3879, #3880, #3882).
+
+### Fixed
+
+- Extend monitor-path dispatch serialization to serialize wake acknowledgments, preventing premature wake closure in the monitor delivery path (#3879, @shenyankm).
+- Fix race condition in monitor mailbox delivery where acknowledgements can race with dispatch requests, leaving messages undelivered (#3880, @shenyankm).
+- Detect and skip stale monitor notifications after acknowledgement, proving the race condition is resolved across both primary and monitor paths (#3882, @shenyankm).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.30.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.29...v0.21.30
+
+## [0.21.29] - 2026-10-22
+
+Patch release for Team dispatch state recovery and Codex startup UI protection (1 commit, 16 files, +616/−68; PR #3876).
+
+### Fixed
+
+- Recover dispatch retry consistency by using durable JSON projections instead of in-memory state, preventing request duplication, coalescing, or loss during worker retirement (#3876, @shenyankm).
+- Ensure mailbox wake acknowledgment only after all messages from that wake are complete, preventing premature wake closure that leaves messages undelivered (#3876, @shenyankm).
+- Treat damaged or unreadable per-worker mailboxes as undeliverable instead of empty, preventing silent message loss and worker proliferation (#3876, @shenyankm).
+- Prevent inbox/notification text from being injected into Codex startup or folder-trust screens, improving UI safety and startup flow clarity (#3876, @shenyankm).
+- Improve readiness record accuracy by correctly identifying Codex startup and folder-trust screens instead of misidentifying them as ready prompts (#3876, @shenyankm).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.29.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.28...v0.21.29
+
+## [0.21.28] - 2026-10-21
+
+Patch release for JetBrains terminal trackpad scrolling diagnostic (1 commit, 3 files, +167/−0; PR #3873).
+
+### Fixed
+
+- Emit startup diagnostic naming the `omx --no-alt-screen` workaround for JetBrains terminals, where trackpad scrolling causes the input field to be populated with previous prompts instead of scrolling output. The diagnostic now covers both direct (non-tmux) launches and hotswap launches (#3873, fixes #3872; credit @BohdanLavrinenko for the report).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.28.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.27...v0.21.28
+
+## [0.21.27] - 2026-10-21
+
+Patch release for subagents tri-state resume_agent availability (3 commits, 10 files, +317/−30; PRs #3867, #3868).
+
+### Fixed
+
+- Cover hosts without `resume_agent` in SessionStart reopen guidance, providing accurate fallback instructions when the tool is absent instead of treating absence as unknown tool state (#3867).
+- Implement tri-state `resume_agent` availability (available / absent / unknown) and wire it through the native hook contract, enabling recovery guidance to distinguish between unsupported hosts and transient unavailability (#3868, follows #3866).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.27.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.26...v0.21.27
+
+## [0.21.26] - 2026-10-20
+
+Patch release for team dispatch state isolation and dependency updates (7 commits, 19 files, +722/−269; PRs #3859, #3862, #3863).
+
+### Fixed
+
+- Isolate degraded dispatch state from runtime projections in team delivery, preventing stale state from contaminating recovery paths and ensuring fresh ledger reads across retries (#3862, @shenyankm).
+
+### Performance
+
+- Load the dispatch identity ledger once per merge instead of per recovery attempt, reducing redundant reads and improving team mailbox efficiency (#3863, @Yeachan-Heo).
+
+### Maintenance
+
+- Bump zod from 4.6.5 to 4.6.7 for dependency currency (#3859, @dependabot).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.26.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.25...v0.21.26
+
+## [0.21.25] - 2026-10-20
+
+Patch release for team mailbox isolation hardening (2 commits, 3 files, +205/−4; PR #3857).
+
+### Fixed
+
+- Fail closed on unconfirmed mailbox creation in team delivery, rejecting runtime state, persistence, timeout, and invalid acknowledgement failures instead of publishing a successful JSON-only mailbox creation. Reconciles partially persisted creation events before assigning another ID and deduplicates against the same verified projection across refresh races (#3857, @shenyankm, @gajae-gajae).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.25.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.24...v0.21.25
+
+## [0.21.24] - 2026-10-20
+
+Patch release for setup plugin-cache repair hardening (9 commits, 5 files, +365/−28; PRs #3851, #3852, #3853, #3854).
+
+### Fixed
+
+- Require `removalSafe` field validation in dry-run repair and fail closed when safety cannot be verified. The repair command no longer recommends removal when eligibility cannot be determined (#3851, @Yeachan-Heo).
+- Derive `removalSafe` only from verified managed+unpinned repair eligibility, preventing false-safe recommendations for live-pinned or unverified caches (#3853, @Yeachan-Heo).
+- Keep identical caches unchanged in repair dry-runs, returning `unchanged` status to mirror actual repair behavior and improve test predictability (#3854, @Yeachan-Heo).
+
+### Tests
+
+- Add comprehensive removalSafe field tests for late-pin scenarios, validating hardening logic against edge cases in pinned-cache handling (#3849, @Yeachan-Heo).
+
+### Maintenance
+
+- Ignore gjc runtime session state in .gitignore to reduce noise in untracked-file listings (#3852, @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.24.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.23...v0.21.24
+
+## [0.21.23] - 2026-10-19
+
+Patch release for evidence requirements in generated team tasks and non-directory plugin cache recovery guidance (5 commits, 14 files, +914/−58; PRs #3840, #3846).
+
+### Fixed
+
+- Require evidence for generated coding tasks in team decomposition, respecting explicit role DAG flags and treating unknown roles conservatively. Task decomposition now preserves analysis context while enforcing completion gates for implementation requests (#3840, @shenyankm).
+- Extend `omx setup --plugin --repair-plugin-cache` guidance to cover non-directory entries (symlinks and other non-directory types) alongside pinned snapshots, emitting fail-closed recommendations when safe recovery cannot be determined (#3846, @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.23.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.22...v0.21.23
+
+## [0.21.22] - 2026-10-19
+
+Patch release for fail-closed cache recovery guidance in setup repair (3 commits, 13 files, +178/−28; PR #3842). Also includes doc corrections for v0.21.21 release stats.
+
+### Fixed
+
+- Fix `omx setup --repair-plugin-cache` to avoid recommending users delete plugin snapshots pinned by live Codex sessions or non-directory symlink entries. The repair now emits fail-closed guidance instead of suggesting blind removal (#3842, @gajae-gajae).
+
+### Documentation
+
+- Correct v0.21.21 release range stats from (10 files, +190/−128) to accurate (7 files, +174/−104).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.22.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.21...v0.21.22
+
+## [0.21.21] - 2026-10-19
+
+Patch release for Windows shim path generation on POSIX systems, stale-launcher warning diagnostics, team worker readiness enforcement, and dynamic version handling in tests (5 commits, 7 files, +174/−104; PRs #3833, #3835, #3837).
+
+### Fixed
+
+- Fix path generation for Windows shims on POSIX systems to use host paths instead of stray backslash-prefixed paths, preventing unintended `\tmp\…` entries from filesystem writes in setup/uninstall/codex-hooks (#3833, @Yeachan-Heo).
+- Enforce the configured readiness deadline (`OMX_TEAM_READY_TIMEOUT_MS`) on the final readiness poll, preventing team worker readiness from reporting ready after the timeout expires. Incompatibility markers remain fail-closed (#3835, @Yeachan-Heo).
+- Restore test coverage and split stale-launcher diagnostic messaging by provenance reason (missing-launcher vs. incompatible provenance), improving diagnostic specificity (#3837, @Yeachan-Heo).
+- Replace hardcoded version literals in tests with dynamic version reading from package.json to prevent test failures on future version bumps (test fix for #3839, @gajae-gajae).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.21.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.20...v0.21.21
+
+## [0.21.20] - 2026-10-19
+
+Patch release for team worker readiness deadline enforcement during final poll (2 commits, 8 files, +110/−18; PR #3835).
+
+### Fixed
+
+- Enforce the configured readiness deadline (`OMX_TEAM_READY_TIMEOUT_MS`) on the final readiness poll, preventing team worker readiness from reporting ready after the timeout expires. Incompatibility markers remain fail-closed (#3835, follow-up to #3829/#3832; @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.20.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.19...v0.21.20
+
+## [0.21.19] - 2026-10-19
+
+Patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (19 commits, 16 files, +925/−41; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
+
+### Fixed
+
+- Don't bake `exactModel` pins for third-party provider agents, so providers can rotate models and agents remain resolvable (#3824, fixes #3823, reported by @hetingyi; implemented by @Yeachan-Heo).
+- Align `omx doctor` spark-lane model check with runtime-inherited agent models, eliminating false "stale install" positives on valid configurations (#3825, fixes #3822, reported by @hetingyi; implemented by @Yeachan-Heo).
+- Honor profile-scoped model overrides and guidance in agent runtime config (#3827, @Yeachan-Heo).
+- Resolve the active profile model before root fallbacks, keep exact pins when built-in providers omit models, and avoid claiming fallback models for provider-only configs (#3831, @Yeachan-Heo).
+- Normalize provider IDs consistently to preserve case sensitivity in generated configs while applying the same classification for exact pins and metadata (#3832, @Yeachan-Heo).
+- Bound the final readiness poll to the configured timeout to prevent startup blocking when the remaining budget is exhausted (#3832, @Yeachan-Heo).
+
+### Maintenance
+
+- Make MDM-marker readiness termination deterministic by removing timing-sensitive sleeps for adaptive backoff (#3828, @Yeachan-Heo).
+- Always take a final readiness poll before the readiness deadline (#3829, @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.19.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.18...v0.21.19
+
+## [0.21.18] - 2026-10-17
+
+Patch release for the frozen range `v0.21.17..8edbeb8686a9f7288b45f03d8f553a72216832f1` (2 commits, 4 files, +358/−27; PR #3819).
+
+### Fixed
+
+- Bound managed hook-trust marker ranges and deduplicate repeated fences so foreign approved hook trust remains intact while tampered managed hashes remain fail-closed (#3819, reported in #3818 by @hetingyi; implemented by @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.18.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.17...v0.21.18
+
+## [0.21.17] - 2026-10-17
+
+## [0.21.16] - 2026-10-16
+
+Patch release for the frozen range `v0.21.15..00d06af4cac8663f409e66576f1719da28199ff0` (43 commits, 15 files, +6,158/−267; PRs #3792 and #3813).
+
+### Fixed
+
+- Pin live Codex sessions to the plugin-cache snapshots they use and preserve live-pinned snapshots during cache recovery; provide scoped repair for verified, managed, unpinned snapshots (#3792, fixing #3790; implemented by @Yeachan-Heo and reported by @spicysharkco).
+
+### Integration
+
+- Back-merge v0.21.15 from main into dev to preserve main ancestry (#3813, authored by @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.16.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.15...v0.21.16
+
+## [0.21.15] - 2026-10-16
+
+Patch release for the frozen range `v0.21.14..38bbaab4c818cadcfe2b69de22c52cf56e670ca0` (6 commits, 39 files, +2,199/−152; PRs #3798, #3806, #3807, #3808, #3809, and #3811).
+
+### Fixed
+
+- Record native `SubagentStop` completion events and route nested native subagent lifecycles through tracked parents, preventing completed children from being left without completion records (#3798, #3809; authored by @shenyankm and @Yeachan-Heo).
+- Bound startup Wiki context and suppress memory already present in session instructions, avoiding duplicate or oversized startup context (#3808, authored by @shenyankm).
+
+### Maintenance
+
+- Make collector latency assertions deterministic by injecting a clock and removing timing-sensitive sleeps (#3811, authored by @Yeachan-Heo).
+
+### Integration
+
+- Back-merge v0.21.14 into dev and restore the normal main-to-dev ancestry after the squash merge (#3806, #3807; authored by @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.15.md) and [release readiness](docs/qa/release-readiness-0.21.15.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.14...v0.21.15
+
+## [0.21.14] - 2026-10-15
+
+Patch release for the frozen range `v0.21.13..7fd6e95a839c0c0c14de67a7bc976c4d9134b923` (3 commits, 9 files, +1,480/−71; PRs #3793 and #3803).
+
+### Added
+
+- Add `omx session timeline <session-id>` to reconstruct tool execution, turn boundaries, and context compactions from active or archived transcripts, with tool diagnostics including observed durations, exit codes, failures, and incomplete calls (#3793, authored by @hiSandog).
+
+### Integration
+
+- Back-merge the v0.21.13 release into dev (#3803, authored by @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.14.md) and [release readiness](docs/qa/release-readiness-0.21.14.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.13...v0.21.14
+
+## [0.21.13] - 2026-10-15
+
+Patch release for the frozen range `v0.21.12..51fa7eed6877b91706629174a2deeff83d1ce08f` (6 commits, 10 files, +576/−52; PRs #3787, #3795, #3796).
+
+### Fixed
+
+- Bound HUD reconciliation processes spawned by hooks with a timeout, so hung children cannot block later reconciliation (#3787, fixes #3785; authored by @Yeachan-Heo).
+
+### Maintenance
+
+- Update `serde_json` from 1.0.151 to 1.0.154 (#3795, @dependabot).
+- Update `@types/node` from 26.6.4 to 26.6.5 (#3796, @dependabot).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.13.md) and [release readiness](docs/qa/release-readiness-0.21.13.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.12...v0.21.13
+
+## [0.21.12] - 2026-10-15
+
+Patch release for the frozen range `v0.21.11..6937884f4d09a485d5b4f16498517bcd05384e06` (6 commits, 15 files, +998/−19; PRs #3786, #3788, #3789, #3791, #3794, #3797).
+
+### Highlights
+
+- Require claim-bound completion evidence before implementation tasks marked `requires_code_change: true` can complete (#3797, authored by @shenyankm). Existing clients completing these tasks must provide a report and structured verification summary.
+- Keep HUD branch labels cached until HEAD, refs, or git config changes, and bound watcher repair children so a hung reconcile cannot block later repairs (#3791, #3786; authored by @spicysharkco).
+
+### Maintenance
+
+- Update `@modelcontextprotocol/sdk` from 1.32.0 to 1.32.1 (#3794, @dependabot).
+- Make the HUD watcher resize and real-tmux test fixtures hermetic (#3788, #3789; authored by @spicysharkco).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.12.md) and [release readiness](docs/qa/release-readiness-0.21.12.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.11...v0.21.12
+
+## [0.21.11] - 2026-10-13
+
+Patch release for `v0.21.10..7e0b5f2330b9d85c5fdb9709ec0104e099836f4c` (3 commits, 2 files, +68/−5, PR #3781, fixes #3779).
+
+### Fixed
+
+- Stop writing inherited `model_provider` defaults into native agent TOMLs. Provider changes in `config.toml` now take effect without `omx setup --force`, while explicit per-agent model overrides remain supported (#3781, fixes #3779; authored by @Yeachan-Heo, co-authored by @gaebal-gajae).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.11.md) and [release readiness](docs/qa/release-readiness-0.21.11.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.10...v0.21.11
+
+## [0.21.10] - 2026-10-12
+
+Patch release for `v0.21.9..72fee0236cf8a4b45e6dd9b3d826871f402b84ae` (16 commits, 15 files, +1067/−82, PRs #3765/#3768/#3771/#3772/#3774/#3775/#3777, linked issues #3655/#3766/#3776).
+
+### Highlights
+
+- TOML configuration merge robustness: multi-line arrays in the `[tui]` configuration section are now correctly preserved during config merge operations, preventing loss of array elements and enabling complex TUI customization without manual repair (#3777, fixes #3776).
+- Astra-defaults evaluation infrastructure: the astra-defaults RunRecord collector gains base URL support for flexible test fixture hosting and implements repository cloning with fixture context, enabling live cost and quality evaluation across model configurations. Collector is now hermetic with bounded Codex v0.162+ JSON-line parsing and includes CI integration (#3655, #3765, #3768, #3772).
+- npm registry-visibility diagnostics: registry-visibility checks now include extended timeout windows and improved diagnostics to surface transient publication issues earlier and support troubleshooting of npm registry visibility failures in CI pipelines (#3771).
+
+### Added
+
+- Astra-defaults collector base URL support and repository cloning with fixture context (#3765, #3772).
+- npm registry-visibility check extended timeout and improved diagnostics (#3771).
+
+### Fixed
+
+- Preserve multi-line arrays in TOML `[tui]` configuration sections during merge operations (#3777, fixes #3776).
+- Harden astra-defaults collector for hermetic operation with correct handling of Codex v0.162+ JSON-line output format (#3772, #3774).
+- astra-defaults eval test failures and add to CI (#3768, fixes #3766).
+
+### Maintenance
+
+- astra-defaults evaluation results recorded for live-suite baseline (#3775).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.10.md) and [release readiness](docs/qa/release-readiness-0.21.10.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.9...v0.21.10
+
+## [0.21.9] - 2026-10-12
+
+Patch release for `v0.21.8..e4653cd8e115f923014be72cf0f7fb6645384246` (10 commits, 24 files, +1693/−96, PRs #3751/#3753/#3754/#3755/#3757/#3760/#3761/#3762/#3763/#3764, linked issues #3655/#3729).
+
+### Highlights
+
+- Session token usage: `omx session usage` summarizes cumulative per-session token counters from local Codex rollout logs, with filtering, sorting, and JSON output (#3760, authored by @hiSandog).
+- Native subagent lifecycle evidence: a native subagent's Stop event now records bounded completion evidence (`completed_at`, `completion_source: native_stop_event`) in subagent tracking for doctor diagnostics (#3761, fixes #3729).
+- Astra-defaults evaluation: a RunRecord collector and `collect-astra-defaults` script gather live evaluation-suite records, with GPT-6 Sol control, GPT-6.1 Sol candidate, and Luna-uniform comparison configs (#3764, part of #3655; no evaluation results are published in this release).
+
+### Added
+
+- `omx session usage` command and `docs/session-usage.md` (#3760, authored by @hiSandog).
+- Live evaluation RunRecord collector for the astra-defaults suite (#3764).
+
+### Fixed
+
+- Record typed completion evidence for native subagent Stop events in subagent tracking (#3761, fixes #3729).
+
+### Maintenance
+
+- Dependencies: `libc` 0.2.190 (#3751), `@biomejs/biome` 2.5.15 (#3753), `@types/node` 26.6.4 (#3754), `@modelcontextprotocol/sdk` 1.32.0 (#3755), `tar-stream` 3.2.2 / `@types/tar-stream` 3.1.5 (#3757).
+- #3762 (synthetic evaluation records presented as #3655 results) was reverted by #3763; net zero change.
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.9.md) and [release readiness](docs/qa/release-readiness-0.21.9.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.8...v0.21.9
+
+## [0.21.8] - 2026-10-06
+
+### Highlights
+
+- Windows binary path compatibility: platform-specific `.exe` suffix is now correctly applied to omx-runtime binary paths on Windows, resolving resolution failures (#3736, #3737).
+- Session management robustness: thread identity resolution for native `$ralplan --advisory` is improved with dedicated `readPayloadSessionId` helper (#3740, #3741); `writeAtomic` Windows EPERM errors are handled correctly (#3744, #3746).
+- Legacy configuration support: support for legacy v0.21.6 AGENTS.md backup paths is restored via git rev-parse (#3739, #3742).
+- Session export capability: local sessions can now be exported as Markdown or JSON format (#3745, authored by @hiSandog).
+- Diagnostic improvements: warning messages for non-OMX Codex sessions are clarified (#3747, #3749).
+
+### Fixed
+
+- Windows path handling: apply platform-specific `.exe` suffix to omx-runtime binary paths (#3736, #3737); handle `writeAtomic` Windows EPERM errors correctly by using `syncRegularFile` (#3744, #3746).
+- Session management: resolve native `$ralplan --advisory` thread identity from `session_id` when hook payload carries no thread field (#3740, #3741).
+- Legacy backup support: support legacy v0.21.6 AGENTS.md backup path via git rev-parse (#3739, #3742); resolve absolute `--git-path` in linked worktrees; prefer team-state backup over legacy git-dir backup when both exist.
+- Diagnostic output: clarify warning message for non-OMX Codex sessions to avoid confusion about session authority and management state (#3747, #3749).
+
+### Added
+
+- Session export: export local sessions as Markdown or JSON format for integration with external systems and documentation (#3745, authored by @hiSandog).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.8.md) and [release readiness](docs/qa/release-readiness-0.21.8.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.7...v0.21.8
+
+## [0.21.7] - 2026-10-01
+
+### Highlights
+
+- Expand GPT-6 model recognition: support GPT-6 Sol and Luna, and add gpt-6.1-sol to model catalogs (#3701, #3716).
+- Resolve plugin skill contract resolution, template provenance, and hook trust preservation: fix plugin-skill links in snapshot context, validate templates/AGENTS.md in cache provenance, and preserve foreign hook trust during legacy migration (#3707, #3708, #3704).
+- Fix HUD idle CPU storm and correctness: reconcile hook metadata atomicity, stop noisy reconcile failures, and align native fixtures with authority frames (#3706, #3711).
+
+### Fixed
+
+- Plugin integrity and template validation: validate templates directory structure and AGENTS.md in plugin cache provenance checks (#3707); fix plugin skill contract links to resolve inside the plugin snapshot (#3708); preserve foreign hook trust during legacy hook migration (#3704).
+- Team runtime robustness: make queued leader notices safe after shutdown (#3692); keep non-Team guidance available when Team is disabled (#3699, #3700); Team worker instructions are written to a per-worker file passed via `OMX_MODEL_INSTRUCTIONS_FILE`, so they are no longer committed into the leader's `AGENTS.md` (#3717, #3718); `omx setup` no longer writes Codex's removed `features.child_agents_md` flag and strips existing copies (#3719, #3720).
+- HUD and tmux correctness: keep hook metadata atomic and verify idle CPU (#3706); stop idle reconciliation CPU storm (#3706); fix tmux question probe error handling (#3711); align native hook fixtures with authority frames (#3706); distinguish matching-but-unverified selectors in identity-indeterminate bindings (#3725, #3726); include stderr summary and exit status in detached leader failure reports (#3723, #3727).
+- Doctor and notifications: show resolved config path when missing (#3693); strip OSC terminal escapes in notifications (#3694); clarify fresh config doctor evidence (#3691).
+- Session management: native `$ralplan --advisory` resolves thread identity from `session_id` when the hook payload carries no thread field (#3721, #3722); deliver exec follow-ups in session-scoped Stop path (#3724, #3728); omx exec --help no longer attempts session establishment with an active owner (#3731, #3732); add 'ultragoal' to supported state read modes (#3733, #3734).
+- Configuration: preserve hashes in quoted TOML values (#3712).
+
+### Maintenance
+
+- Refresh dependency locks: `zod` 4.6.5, `@biomejs/biome` 2.5.14, `@types/node` 26.6.3, `@modelcontextprotocol/sdk` 1.30.1 (#3696, #3697, #3698, #3713, #3714).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.7.md) and [release readiness](docs/qa/release-readiness-0.21.7.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.6...v0.21.7
+
+## [0.21.6] - 2026-09-21
+
+### Highlights
+
+- Ship a reusable default-model cost/quality evaluation suite with deterministic stage-transition records, supplied-record reporting, and documented declaration/validation limits (#3663, #3665, #3666, #3667).
+- Make the tmux HUD lifecycle self-terminating and leak-free: skip stale Team leader panes during reconciliation, stop orphan watchers and noisy reconcile failures, and close the HUD when its tmux leader pane exits (#3660, #3683, #3685).
+- Correct AGENTS scope handling: stop duplicating durable AGENTS into session instructions and preserve global AGENTS in project-scoped launches (#3678, #3684).
+
+### Fixed
+
+- Harden auth storage, TOML boundaries, PATH resolution, and stderr redaction (#3662); stop oversized stderr suppression from eating the next record (#3676).
+- Survive Windows `EPERM` fsync during Team startup (#3661) and skip non-directory entries when draining Team dispatch (#3680).
+- Strip complete ANSI CSI sequences in notifications (#3668).
+
+### Maintenance
+
+- Keep ordinary requests out of optional workflow machinery (#3648) and remove confirmed unused internal exports without new machinery (#3649).
+- Close remaining 0.21 capability-parity documentation gaps (#3634).
+- Refresh dependency locks: `zod` 4.6.2, `@biomejs/biome` 2.5.13, `@types/node` 26.5.1 (#3673, #3674, #3675).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.6.md) and [release readiness](docs/qa/release-readiness-0.21.6.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.5...v0.21.6
+
+## [0.21.5] - 2026-09-10
+
+### Highlights
+
+- Show active Team identity and per-worker progress in the tmux HUD, preserving narrow layouts, selected runtime roots, leader space, and exact resize ownership (#3644).
+- Align plugin-hook diagnostics/setup/uninstall with current Codex capabilities; preserve explicit reasoning effort and verify the real packed hook lifecycle against Codex 0.153.4 (#3627, #3631, #3632, #3650).
+- Allow ordinary native implementation/reporting under inherited permissions and remove active guidance handoffs to retired workflows (#3637, #3647).
+
+### Fixed
+
+- Keep project runtime-home credentials ephemeral and export child-safe CODEX_HOME for Team workers (#3633).
+- Make Team startup preflight side-effect free and actionable (#3643); restore portable session recovery and hydrated native runtime lookup (#3638, #3639).
+- Respect TOML array-of-tables boundaries (#3645) and POSIX PATH edge cases in command discovery (#3644).
+- Fix a real bootstrap-sentinel ABA race in canonical mode-binding lease acquisition, found via post-merge concurrency stress testing; serialize the full lease lifecycle with a new descriptor-bound native OS advisory mutex (#3650, #3652).
+- Correct cross-platform dogfood fixtures without skipping adversarial identity, trust, or no-follow checks; preserve literal tmux receipt hashes and close retained fixture handles (#3650).
+
+### Maintenance
+
+- Refresh dependency locks (#3640, #3641, #3642), add MIT LICENSE, and measure maintenance growth without additional runtime machinery (#3646).
+- Reconcile published main documentation/history before freezing the new release range (#3651).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.5.md) and [release readiness](docs/qa/release-readiness-0.21.5.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.4...v0.21.5
+
+## [0.21.4] - 2026-09-06
+
+Patch release for the frozen range `v0.21.3..b08eceeecc7a7379f041ceca51260f073d8a95bb` (3 commits, 35 changed files, +364/−195; PRs #3615/#3618/#3622).
+
+### Changed
+
+- **Astra defaults across OMX agent tiers** — leaders, specialists, standard and fast agents, low-complexity workers, Team children, exact planning/research roles, new-agent configuration, subscription defaults, and SparkShell summaries now default to `gpt-6-astra`. Explicit model configuration, profiles, per-agent overrides, CLI/environment selections, provider-specific names, and established reasoning-effort defaults remain authoritative (#3622).
+
+### Documentation
+
+- **Agent catalog and workflow alignment** — the generated catalog now exposes only active/internal roles as directly invocable, documents merged and deprecated role replacements, and aligns the primary workflow wording with `$deep-interview` → `$ralplan` → `$ultragoal`; `$team` remains conditional parallel execution (#3618).
+
+### Compatibility
+
+- Patch release with no intentional breaking CLI or package-layout changes. The Astra defaults apply only when no explicit model choice already exists.
+- **Known gap:** #3623 remains open, separately owned, unmerged, and outside this release. On Codex CLI 0.153.4, doctor/setup still use the removed `plugin_hooks` feature flag for plugin-hook inference and generated configuration, causing misleading diagnostics and obsolete config. Native `hooks/list` recognized the installed plugin hooks in the report, so a runtime hook outage has not been demonstrated.
+
+### Release train
+
+- #3615 advanced synchronized package/plugin/Cargo development metadata to 0.21.4 after v0.21.3. It is included in the compare inventory but is not a separate user-facing headline.
+
+## [0.21.3] - 2026-09-03
+
+Patch release for `v0.21.2..3902573ef309e54534d7388579f2a7243ca7f465` (15 commits, 20 changed files, +1,285/−101, PRs #3604/#3605/#3606/#3608/#3610/#3612, linked issues #3609/#3611).
+
+### Fixed
+
+- **Duplicate Team wakes** — Team no longer re-wakes on already-terminal projections; terminal projections are retired instead of lingering (#3608).
+- **Long responses lost from tmux scrollback** — the detached leader scrollback clamp was 500 lines, so long sessions discarded multi-line assistant responses from the pane while the session still held them (`/copy` returned the full text). The clamp is now 5000 lines with an `OMX_TMUX_HISTORY_LIMIT` override, range 500–200000, unparseable values falling back to the default (#3612, fixes #3611).
+
+### Documentation
+
+- **Composer drift triage and scrollback semantics** — `docs/troubleshooting.md` gains the prompt-drift symptom entry with the measured repro matrix and `tmux resize-pane` recovery, plus the note that `history-limit` is fixed at pane creation (#3610, documents #3609).
+
+### Dependencies
+
+- `@types/node` 26.2.0 → 26.4.0 (#3606), `zod` 4.4.3 → 4.5.2 (#3605), `@biomejs/biome` 2.5.10 → 2.5.11 (#3604).
+
+## [0.21.2] - 2026-09-01
+
+Patch release for `v0.21.1..04533ebfc887643586e37180ec3270473948115a` (11 commits, 29 files, +1,245/−10).
+
+### Added
+
+- **Optional GitGuardex HUD finish progress** — live review/autofix progress with project-root configuration, bounded stream discovery, and animation that advances at the one-second HUD watch cadence (#3601).
+- **Bahasa Indonesia README** — Indonesian translation with synchronized localized language navigation (#3599).
+
+### Fixed
+
+- **macOS arm64 `omx-runtime` hydration** — global install/reinstall and immediate/deferred script-suppressed updates hydrate the verified versioned native cache, with bounded non-fatal network waits (#3602).
+
+## [0.21.1] - 2026-08-31
+
+Patch release for `v0.21.0..abf2393af1e1f9355adfe43166432462a86d2e54` (125 commits, 116 changed files, +23,996/−1,141, 28 commit-subject references plus linked issues #3587/#3589).
+
+### Added
+
+- **Ralplan Advisory / Contract A** — cooperative Planner → Architect → Critic planning evidence without granting execution authority, installing a global tool fence, suppressing unrelated workflows, or automatically handing off to implementation (#3594).
+
+### Changed
+
+- **Trusted release publication** — tag publication is bound to `main` ancestry and exact SHA, native release assets are verified, npm uses trusted publishing, and the retired manual token path is unavailable (#3552, #3566, #3570, #3571, #3572).
+- **Canonical state and process ownership** — state leases, locks, session pointers, and recovery distinguish exact process incarnations and preserve Windows/macOS durability and path semantics.
+
+### Fixed
+
+- **Detached HUD and session lifecycle** — exact owner-pane cleanup, refresh rendering, split and non-split tmux layout reconciliation, stable hook cleanup identity, and contention re-arming (#3577, #3578, #3584, #3587, #3588, #3595).
+- **Team legacy HUD startup** — recognizes and safely removes both same-session-only and leader-only legacy HUD panes before topology freeze (#3597).
+- **Plugin/cache/launcher provenance** — symlink, namespace, and stale launcher confusion fail closed (#3558, #3561).
+- **Runtime and configuration reliability** — Ralph native-app deadlock recovery, SparkShell tail-line validation, empty hooks-state recovery, and generated configuration trust checks (#3589, #3590, #3592).
+
+## [0.21.0] - 2026-08-22
+
+Minor release for the exact 99-commit range `v0.20.5..0f2bbb704b83f94a69622b1915f555498e0dd283` (310 files, +31,779/−69,216). This is the post-epic consolidation train: deprecated skills are removed with migration stubs, hard workflow gates are replaced by advisory guidance, state becomes a single-source-of-truth with a read-only MCP surface, and `omx autopilot` returns as the canonical staged orchestrator. Consumers invoking removed skills or MCP writer tools receive explicit migration errors — this is an intentional breaking change with migration paths.
+
+### Removed
+
+- **Deprecated skills and prompts** — 25 removed skills now fail fast through a uniform sunset-stub resolver with direct replacements: `$ralph` → `$ultragoal` (`omx ralph` CLI and persistence runtime unaffected), `$ultrawork`/`$ecomode`/`$swarm` → `$team`, `$prometheus-strict` → `$plan`, `$review`/`$security-review` → `$code-review`, `$ask-claude`/`$ask-gemini` → `$ask`, `$deepsearch` → `$analyze`, `$frontend-ui-ux` → `$design`, `$visual-verdict`/`$web-clone` → `$visual-ralph`, `$help` → `$omx-setup`; `$tdd`, `$note`, `$trace`, and `$build-fix` removed without a direct replacement. Prompts `prometheus-strict-metis`, `momus`, `oracle`, `scholastic`, and `sisyphus-lite` and their agents are deregistered (#3506, #3502, #3508).
+- **MCP state writer tools** — `state_write` and `state_clear` are removed from the MCP surface and now return explicit deprecation errors; durable writes route exclusively through the CLI/programmatic state operations (#3507, #3498).
+- **Hard workflow gates** — the Autopilot/Ralplan consensus-receipt gate and the planning-gate requirement are removed; workflow transitions no longer require a host-issued consensus receipt (#3492).
+- **Merged-away execution loops** — the standalone autopilot/pipeline loops are merged into the unified planning/execution surfaces (#3502, #3508).
+
+### Added
+
+- **`omx autopilot` canonical orchestrator** — first-class CLI command restoring the staged `$deep-interview` → `$ralplan` → `$ultragoal` orchestration as the canonical chain (#3518, #3517).
+- **Ultragoal ordinary/strict modes** — the completion cohort gate is advisory in ordinary mode and strict in strict mode (#3500, #3505).
+- **Upgrade fixture and drift tests** — a 0.20.x → 0.21 upgrade fixture plus generator `--check` surfaces are promoted into `npm test` (#3509).
+- **Setup flags** — `--disable-hooks` (disable only OMX-owned hook registrations, preserving foreign hooks) and `omx doctor --repair-state` (archive stale state projections under `.omx/archive/`) (#3497, #3507).
+
+### Changed
+
+- **State single source of truth** — a sole-writer state model with read-only MCP projection, shared handoff-carrier invariants for every writer, explicit stale-projection retirement, and fail-closed handling of corrupt or laundered carriers (#3507, #3498 follow-ups).
+- **Hooks simplified; PreToolUse advisory-only** — conductor PreToolUse write guards are replaced by advisory guidance with Codex App capability warnings (#3497, #3492).
+- **Prompt architecture slimmed** — invariants are centralized and the prompt surface reduced (#3513).
+- **Bounded plugin lifecycle** — plugin snapshots are bounded with a hook escape hatch, unpinned historical snapshots retired, and deprecated-skill retirement keyed to install badges (#3499, #3512).
+- **Team worker provenance** — team workers on external OMX state roots are authorized through evidence-returning provenance verification shared by the native hook and `omx doctor --team` (#3537).
+- **Session pointer authority split** — read semantics and write authority are separated on platforms without process-birth evidence; identity-indeterminate live pointers count as occupied evidence but never grant write authority, with bounded unproven-pointer adoption and verified-dead pointer quarantine (#3527, #3541, #3528).
+- **Dependencies** — `@biomejs/biome` 2.5.6→2.5.8 (#3532) and `@types/node` 26.1.2→26.2.0 (#3485).
+
+### Fixed
+
+- **Detached `--madmax` root identity on macOS** — path-alias canonicalization, post-create root re-resolution, and path-alias-insensitive launch-context keys; regression-locked by #3550/#3551.
+- **Detached tmux owner race** — post-tag owner mutation is retried under an unchanged authority fence (#3540, #3541).
+- **macOS arm64 runtime hydration** — `omx-runtime` hydrates and is discovered on arm64 npm installs (#3519, #3520).
+- **URL reader false truncation** — content at an exact size limit is no longer reported truncated (#3546).
+- **Notification durations** — zero and invalid durations are handled (#3544).
+- **Worker triggers** — submitted with tmux named `Enter` instead of raw `C-m`, with Claude 2.1.x prompt detection (#3531).
+- **Team scale-down claim boundary** — synchronization coverage made load-tolerant (#3548, #3549).
+- **Guarded tmux split receipts** — format-string injection is rejected (#3489).
+- **Ralplan → Ultragoal handoff** — reachable via user-authorized execution handoff (#3463, #3483).
+- **Conductor delegation lanes** — unblocked under typed, positively-supported native spawn surfaces (#3482).
+- **HUD Fish parsing** — tmux parsing no longer breaks on Fish `export` (#3480).
+- **Version display** — `OMX_VERSION_REVISION` takes precedence over `OMX_GIT_REVISION` (#3417).
+- **Canonical contracts** — workflow and hook recovery contracts aligned (#3514, #3486).
 ## [0.20.5] - 2026-08-10
 
 Patch release for the exact 68-commit range `v0.20.4..13c08f84cb6c27750b8f5c4a4d5105faad074196`. No intentional breaking CLI or package-layout changes.

@@ -14,7 +14,9 @@ import { readFile, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join, resolve } from "path";
 import TOML from "@iarna/toml";
-import { DEFAULT_FRONTIER_MODEL } from "./models.js";
+import { analyzeTomlSource, type TomlSourceLexicalAnalysis } from "../utils/toml-source.js";
+import { canonicalizeComparablePath } from "../utils/paths.js";
+import { DEFAULT_LEADER_MODEL } from "./models.js";
 import type { UnifiedMcpRegistryServer } from "./mcp-registry.js";
 import {
   DEFAULT_CODEX_HOOK_FEATURE_FLAG,
@@ -23,6 +25,7 @@ import {
   formatCodexHookFeatureFlagLine,
   normalizeCodexHookFeatureFlag,
   type CodexHookFeatureFlag,
+  type CodexPluginHookFeatureFlag,
 } from "./codex-feature-flags.js";
 import {
   OMX_FIRST_PARTY_MCP_SERVER_NAMES,
@@ -35,6 +38,7 @@ import {
   type CodexHooksJsonTrustStateEntry,
   type ManagedCodexHookTrustState,
   type ManagedCodexHookOptions,
+  type ManagedCodexHookCoordinateMove,
 } from "./codex-hooks.js";
 
 import type { HudPreset } from "../hud/types.js";
@@ -61,6 +65,12 @@ interface MergeOptions {
   notifyCommand?: string[] | false;
   includeFirstPartyMcp?: boolean;
   preserveExistingFirstPartyMcp?: boolean;
+  /**
+   * Preserve an existing root `model_reasoning_effort` instead of rewriting it
+   * to the managed default. Setup passes true so an explicit user choice
+   * (direct edit or `omx reasoning <mode>`) survives setup/update (issue #3630).
+   */
+  preserveReasoningEffort?: boolean;
 }
 
 function escapeTomlString(value: string): string {
@@ -82,7 +92,7 @@ const OMX_TOP_LEVEL_KEYS = [
   "developer_instructions",
 ] as const;
 
-export const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
+export const DEFAULT_SETUP_MODEL = DEFAULT_LEADER_MODEL;
 
 const LEGACY_SEEDED_MODEL_CONTEXT_WINDOW = 250000;
 const LEGACY_SEEDED_MODEL_AUTO_COMPACT_TOKEN_LIMIT = 200000;
@@ -93,6 +103,22 @@ const OMX_SEEDED_BEHAVIORAL_DEFAULTS_END_MARKER =
 
 export const OMX_DEVELOPER_INSTRUCTIONS =
   "You have oh-my-codex installed. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing, $name workflow invocation, and role-specialized subagents; when the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable` and adapted Ralplan authority is requested, do not fabricate `agent_type`; run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Ordinary work remains under its own workflow gates. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail. Native subagents live in .codex/agents and may handle independent parallel subtasks within one Codex session or team pane. Skills load from .codex/skills, not native-agent TOMLs. Treat installed prompts as narrower execution surfaces under AGENTS.md authority.";
+
+/**
+ * Historically shipped OMX developer_instructions values.
+ * When upgrading, any value matching one of these is treated as OMX-managed and refreshed
+ * to the current version. Only values NOT in this set are preserved as user-customizations.
+ * This allows users to get default updates across OMX releases while still preserving
+ * genuinely custom developer_instructions.
+ */
+const KNOWN_OMX_DEVELOPER_INSTRUCTIONS_VALUES: ReadonlySet<string> = new Set([
+  OMX_DEVELOPER_INSTRUCTIONS,
+  // Previous OMX versions before AGENTS.md orchestration guidance:
+  "You have oh-my-codex installed. AGENTS.md is your orchestration brain and the main orchestration surface. Use skill/keyword routing like $name plus spawned role-specialized subagents for specialized work. Codex native subagents are available via .codex/agents and may be used for independent parallel subtasks within a single session or team pane. Skills are loaded from installed SKILL.md files under .codex/skills, not from native agent TOMLs. Use workflow skills via $name when explicitly invoked or clearly routed by AGENTS.md. Treat installed prompts as narrower internal execution surfaces under AGENTS.md authority, even when user-facing docs prefer $name keywords.",
+  // Earlier version with simplified guidance
+  "You have oh-my-codex installed. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing and $name workflow invocation. When the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable` and adapted Ralplan authority is requested, do not fabricate `agent_type`; run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Ordinary work remains under its own workflow gates. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed; native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. User-installed skills may still live under ~/.codex/skills. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail.",
+]);
+
 export const OMX_PLUGIN_DEVELOPER_INSTRUCTIONS =
   '<omx version="1">You have oh-my-codex installed through Codex plugin mode. AGENTS.md is the orchestration brain and main control surface. Follow AGENTS.md for skill/keyword routing and $name workflow invocation. When the native surface exposes `agent_type` role routing, set `agent_type` to an installed role and never omit it for OMX work. When it reports `role_routing_unavailable` and adapted Ralplan authority is requested, do not fabricate `agent_type`; run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Ordinary work remains under its own workflow gates. Never fake the role via a prompt label or infer authority from session/thread/pointer/transcript/cwd state. Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed; native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. User-installed skills may still live under ~/.codex/skills. Use outcome-first, concise progress updates: state the target result, constraints, validation evidence, and stop condition before adding process detail.</omx>';
 const SHARED_MCP_REGISTRY_MARKER = "oh-my-codex (OMX) Shared MCP Registry Sync";
@@ -327,7 +353,29 @@ function stripLegacyOmxTeamRunTable(config: string): string {
 }
 
 function unwrapTomlString(value: string | undefined): string | undefined {
-  return value?.match(/^"(.*)"$/)?.[1];
+  if (!value) return undefined;
+  if (value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1);
+  }
+  return undefined;
+}
+
+/**
+ * Properly parse a TOML-formatted string value to extract its actual string content.
+ * Handles basic strings (double-quoted), literal strings (single-quoted), and multiline variants.
+ * Uses TOML parser to ensure correct handling of escapes and special characters.
+ */
+function parseTomlStringValue(tomlValue: string): string | undefined {
+  if (!tomlValue) return undefined;
+  try {
+    // Create a temporary TOML document to parse the value correctly
+    // Use a unique key name to avoid collisions
+    const parsed = TOML.parse(`key = ${tomlValue}`) as Record<string, unknown>;
+    const val = parsed.key;
+    return typeof val === "string" ? val : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function getRootModelName(config: string): string | undefined {
@@ -572,16 +620,29 @@ function getOmxTopLevelLines(
   existingConfig = "",
   modelOverride?: string,
   notifyCommand: string[] | false = getDefaultNotifyCommand(pkgRoot),
+  preservedReasoningEffort?: string,
+  preservedDeveloperInstructions?: string,
 ): string[] {
   const rootValues = parseRootKeyValues(existingConfig);
+
+  const reasoningEffortLine =
+    preservedReasoningEffort !== undefined
+      ? `model_reasoning_effort = ${preservedReasoningEffort}`
+      : 'model_reasoning_effort = "medium"';
+
+  // Preserve custom developer_instructions if provided, otherwise use OMX default
+  const developerInstructionsValue =
+    preservedDeveloperInstructions !== undefined
+      ? preservedDeveloperInstructions
+      : `"${escapeTomlString(OMX_DEVELOPER_INSTRUCTIONS)}"`;
 
   const lines = [
     "# oh-my-codex top-level settings (must be before any [table])",
     ...(notifyCommand === false
       ? []
       : [`notify = ${formatTomlStringArray(notifyCommand)}`]),
-    'model_reasoning_effort = "medium"',
-    `developer_instructions = "${escapeTomlString(OMX_DEVELOPER_INSTRUCTIONS)}"`,
+    reasoningEffortLine,
+    `developer_instructions = ${developerInstructionsValue}`,
   ];
 
   const existingModel = rootValues.get("model");
@@ -874,12 +935,13 @@ function upsertPluginScopedHookFeatureFlagInSection(
   lines: string[],
   featuresStart: number,
   sectionEnd: number,
+  featureFlag: CodexPluginHookFeatureFlag,
 ): { sectionEnd: number; featureFlagIndex: number } {
   return upsertFeatureFlagLineInSection(
     lines,
     featuresStart,
     sectionEnd,
-    CODEX_PLUGIN_SCOPED_HOOKS_FEATURE_FLAG,
+    featureFlag,
     isAnyPluginModeHookFeatureFlagLine,
   );
 }
@@ -900,7 +962,6 @@ function upsertFeatureFlags(
     const base = config.trimEnd();
     const featureBlock = [
       "[features]",
-      "child_agents_md = true",
       hookFeatureFlagLine,
       "goals = true",
       "",
@@ -919,26 +980,12 @@ function upsertFeatureFlags(
     }
   }
 
-  // Remove deprecated collab and unreleased singular goal flags.
+  // Remove deprecated collab, singular goal flags, and obsolete child_agents_md (Codex 0.159.2+).
   for (let i = sectionEnd - 1; i > featuresStart; i--) {
-    if (/^\s*(?:collab|goal)\s*=/.test(lines[i])) {
+    if (/^\s*(?:collab|goal|child_agents_md)\s*=/.test(lines[i])) {
       lines.splice(i, 1);
       sectionEnd -= 1;
     }
-  }
-
-  let childAgentsIdx = -1;
-  for (let i = featuresStart + 1; i < sectionEnd; i++) {
-    if (/^\s*child_agents_md\s*=/.test(lines[i])) {
-      childAgentsIdx = i;
-    }
-  }
-
-  if (childAgentsIdx >= 0) {
-    lines[childAgentsIdx] = "child_agents_md = true";
-  } else {
-    lines.splice(sectionEnd, 0, "child_agents_md = true");
-    sectionEnd += 1;
   }
 
   ({ sectionEnd } = upsertCodexHookFeatureFlagInSection(
@@ -1538,95 +1585,6 @@ interface HookTrustStateStripResult {
 
 type ManagedHookTrustStateExpectations = ReadonlyMap<string, ReadonlySet<string>>;
 
-type TomlSourceStringMode =
-  | "basic"
-  | "literal"
-  | "multiline-basic"
-  | "multiline-literal";
-
-interface TomlSourceLexicalAnalysis {
-  lines: string[];
-  lineStartsOutsideMultiline: boolean[];
-  lineHasTomlComment: boolean[];
-  isUnambiguous: boolean;
-}
-
-function isMultilineTomlString(mode: TomlSourceStringMode | undefined): boolean {
-  return mode === "multiline-basic" || mode === "multiline-literal";
-}
-
-/**
- * Tracks only lexical boundaries needed to safely associate source lines with
- * TOML statements. TOML's parser gives us semantics; this prevents source
- * repair from treating table-like text in a multiline value as syntax.
- */
-function analyzeTomlSource(config: string): TomlSourceLexicalAnalysis {
-  const lines = config.split(/\r?\n/);
-  const lineStartsOutsideMultiline: boolean[] = [];
-  const lineHasTomlComment: boolean[] = [];
-  let mode: TomlSourceStringMode | undefined;
-  let isUnambiguous = true;
-
-  for (const line of lines) {
-    lineStartsOutsideMultiline.push(!isMultilineTomlString(mode));
-    let hasComment = false;
-
-    for (let index = 0; index < line.length; index += 1) {
-      const character = line[index]!;
-      if (mode === "basic") {
-        if (character === "\\") {
-          index += 1;
-        } else if (character === "\"") {
-          mode = undefined;
-        }
-        continue;
-      }
-      if (mode === "literal") {
-        if (character === "'") mode = undefined;
-        continue;
-      }
-      if (mode === "multiline-basic" || mode === "multiline-literal") {
-        const delimiter = mode === "multiline-basic" ? "\"" : "'";
-        if (mode === "multiline-basic" && character === "\\") {
-          index += 1;
-          continue;
-        }
-        if (character !== delimiter) continue;
-
-        let runEnd = index + 1;
-        while (line[runEnd] === delimiter) runEnd += 1;
-        if (runEnd - index >= 3) {
-          // TOML permits one or two delimiter characters immediately before
-          // the closing triple delimiter as string content.
-          mode = undefined;
-          index = runEnd - 1;
-        }
-        continue;
-      }
-
-      if (character === "#") {
-        hasComment = true;
-        break;
-      }
-      if (character !== "\"" && character !== "'") continue;
-
-      const isMultiline =
-        line[index + 1] === character && line[index + 2] === character;
-      if (isMultiline) {
-        mode = character === "\"" ? "multiline-basic" : "multiline-literal";
-        index += 2;
-      } else {
-        mode = character === "\"" ? "basic" : "literal";
-      }
-    }
-
-    lineHasTomlComment.push(hasComment);
-    if (mode === "basic" || mode === "literal") isUnambiguous = false;
-  }
-
-  if (isMultilineTomlString(mode)) isUnambiguous = false;
-  return { lines, lineStartsOutsideMultiline, lineHasTomlComment, isUnambiguous };
-}
 
 interface TomlSourceKeySegment {
   key?: string;
@@ -1788,7 +1746,6 @@ interface TomlSourceArrayTableOpener {
   firstKey: TomlSourceKeySegment | undefined;
   openerOnly: boolean;
 }
-
 /**
  * Detects a potential array-table opener without accepting malformed spacing
  * or extra opening brackets as TOML syntax. Array tables rooted at `hooks`
@@ -1995,6 +1952,50 @@ interface ManagedHookTrustStateSourceRepresentation {
   insideManagedMarkerBlock: boolean;
 }
 
+// Plugin trust hashes can refer to a previous versioned cache snapshot. Clear
+// only canonical OMX-namespace entries so Codex can re-evaluate current hooks;
+// malformed state and every other plugin namespace remain fail-closed.
+const OMX_PLUGIN_HOOK_TRUST_KEY_PREFIX =
+  "oh-my-codex@oh-my-codex-local:hooks/hooks.json:";
+
+function isOmxPluginHookTrustKey(key: string): boolean {
+  return key.startsWith(OMX_PLUGIN_HOOK_TRUST_KEY_PREFIX) &&
+    /^[a-z][a-z0-9_]*:\d+:\d+$/.test(key.slice(OMX_PLUGIN_HOOK_TRUST_KEY_PREFIX.length));
+}
+
+function isExactOmxPluginHookTrustRepresentation(
+  key: string,
+  representation: ManagedHookTrustStateSourceRepresentation,
+): boolean {
+  const value = representation.value;
+  return isOmxPluginHookTrustKey(key) &&
+    representation.stateEntryCount === 1 &&
+    !representation.hasComment &&
+    representation.hasExactSemanticScope &&
+    isPlainTomlRecord(value) &&
+    Object.keys(value).length === 1 &&
+    typeof value.trusted_hash === "string" &&
+    /^sha256:[a-f0-9]{64}$/.test(value.trusted_hash);
+}
+
+/**
+ * Normalize a managed hook trust key by canonicalizing the hooksPath portion.
+ * This ensures that the same hooks accessed through different paths (alias vs canonical)
+ * generate equivalent keys for comparison purposes.
+ * @param key Trust key in format "<hooksPath>:<eventName>:<groupIndex>:<handlerIndex>"
+ * @returns Normalized key with canonicalized hooksPath
+ */
+function normalizeManagedhookTrustKey(key: string): string {
+  const match = /^(.*):([a-z_]+):(\d+):(\d+)$/.exec(key);
+  if (!match) return key;
+  const hooksPath = match[1];
+  const eventName = match[2];
+  const groupIndex = match[3];
+  const handlerIndex = match[4];
+  const canonicalPath = canonicalizeComparablePath(hooksPath);
+  return `${canonicalPath}:${eventName}:${groupIndex}:${handlerIndex}`;
+}
+
 function managedHookTrustStateExpectations(
   ...states: Array<ManagedCodexHookTrustStateMap | undefined>
 ): ManagedHookTrustStateExpectations {
@@ -2002,17 +2003,53 @@ function managedHookTrustStateExpectations(
   for (const state of states) {
     if (!state) continue;
     for (const [key, entry] of Object.entries(state)) {
-      const hashes = expectations.get(key) ?? new Set<string>();
+      // Normalize the key to handle symlink aliases and canonical paths equivalently
+      const normalizedKey = normalizeManagedhookTrustKey(key);
+      const hashes = expectations.get(normalizedKey) ?? new Set<string>();
       hashes.add(entry.trusted_hash);
-      expectations.set(key, hashes);
+      expectations.set(normalizedKey, hashes);
     }
   }
   return expectations;
 }
 
-function managedHookTrustCoordinateFamily(key: string): string | undefined {
-  const match = /^(.*):([a-z_]+):\d+:\d+$/.exec(key);
-  return match ? `${match[1]}:${match[2]}` : undefined;
+interface ManagedHookTrustCoordinate {
+  family: string;
+  groupIndex: number;
+  handlerIndex: number;
+}
+
+function managedHookTrustCoordinate(key: string): ManagedHookTrustCoordinate | undefined {
+  const match = /^(.*):([a-z_]+):(\d+):(\d+)$/.exec(key);
+  if (!match) return undefined;
+  return {
+    family: `${match[1]}:${match[2]}`,
+    groupIndex: Number(match[3]),
+    handlerIndex: Number(match[4]),
+  };
+}
+
+/** Rejects family fallback for handler coordinates beyond OMX's managed range. */
+function isForeignHookTrustCoordinateBeyondManagedFamily(
+  expectations: ManagedHookTrustStateExpectations,
+  key: string,
+): boolean {
+  const normalizedKey = normalizeManagedhookTrustKey(key);
+  const candidate = managedHookTrustCoordinate(normalizedKey);
+  if (!candidate || expectations.has(normalizedKey)) return false;
+
+  let maxGroupIndex = -1;
+  let maxHandlerIndex = -1;
+  let hasManagedFamily = false;
+  for (const expectedKey of expectations.keys()) {
+    const expected = managedHookTrustCoordinate(expectedKey);
+    if (expected?.family !== candidate.family) continue;
+    hasManagedFamily = true;
+    maxGroupIndex = Math.max(maxGroupIndex, expected.groupIndex);
+    maxHandlerIndex = Math.max(maxHandlerIndex, expected.handlerIndex);
+  }
+  return hasManagedFamily &&
+    (candidate.groupIndex > maxGroupIndex || candidate.handlerIndex > maxHandlerIndex);
 }
 
 function expectedManagedHookTrustHashes(
@@ -2020,16 +2057,27 @@ function expectedManagedHookTrustHashes(
   key: string,
   allowCoordinateDrift: boolean,
 ): ReadonlySet<string> | undefined {
-  const exact = expectations.get(key);
+  const normalizedKey = normalizeManagedhookTrustKey(key);
+  const exact = expectations.get(normalizedKey);
   if (exact || !allowCoordinateDrift) return exact;
-  const family = managedHookTrustCoordinateFamily(key);
-  if (!family) return undefined;
+  const coordinate = managedHookTrustCoordinate(normalizedKey);
+  if (!coordinate) return undefined;
   const hashes = new Set<string>();
+  let maxGroupIndex = -1;
+  let maxHandlerIndex = -1;
   for (const [expectedKey, expectedHashes] of expectations) {
-    if (managedHookTrustCoordinateFamily(expectedKey) !== family) continue;
+    const expectedCoordinate = managedHookTrustCoordinate(expectedKey);
+    if (expectedCoordinate?.family !== coordinate.family) continue;
+    maxGroupIndex = Math.max(maxGroupIndex, expectedCoordinate.groupIndex);
+    maxHandlerIndex = Math.max(maxHandlerIndex, expectedCoordinate.handlerIndex);
     for (const hash of expectedHashes) hashes.add(hash);
   }
-  return hashes.size > 0 ? hashes : undefined;
+  if (
+    hashes.size === 0 ||
+    coordinate.groupIndex > maxGroupIndex ||
+    coordinate.handlerIndex > maxHandlerIndex
+  ) return undefined;
+  return hashes;
 }
 
 function tomlHooksStateValue(
@@ -2132,6 +2180,7 @@ function collectMarkerRanges(
       isInsideInertAssignment(start) ||
       source.lines[start]?.trim() !== startMarker
     ) continue;
+    // Repeated start banners are part of the same block; the first end closes it.
     const end = source.lines.findIndex(
       (line, index) =>
         index > start &&
@@ -2139,15 +2188,17 @@ function collectMarkerRanges(
         !isInsideInertAssignment(index) &&
         line.trim() === endMarker,
     );
-    const nestedStart = source.lines.findIndex(
-      (line, index) =>
-        index > start &&
-        source.lineStartsOutsideMultiline[index] &&
-        !isInsideInertAssignment(index) &&
-        line.trim() === startMarker,
-    );
-    if (end === -1 || (nestedStart !== -1 && nestedStart < end)) {
-      if (includeUnterminatedRange) ranges.push({ start, end: source.lines.length });
+    if (end === -1) {
+      const hasRepeatedStartMarker = source.lines.some(
+        (line, index) =>
+          index !== start &&
+          source.lineStartsOutsideMultiline[index] &&
+          !isInsideInertAssignment(index) &&
+          line.trim() === startMarker,
+      );
+      if (includeUnterminatedRange && !hasRepeatedStartMarker) {
+        ranges.push({ start, end: source.lines.length });
+      }
       continue;
     }
     ranges.push({ start, end });
@@ -2159,19 +2210,102 @@ function collectMarkerRanges(
 function recordManagedMarkerHooksStateSourceSpan(
   spans: SourceSpan[],
   invalidSpans: SourceSpan[],
+  source: TomlSourceLexicalAnalysis,
   start: number,
   end: number,
   parsed: Record<string, unknown> | undefined,
   insideManagedMarkerBlock: boolean,
+  emptyParentHeaderTolerance?: ManagedMarkerHooksStateSpanTolerance,
 ): void {
   if (!insideManagedMarkerBlock) return;
   const state = tomlHooksStateValue(parsed);
   if (state === undefined) return;
+  if (
+    emptyParentHeaderTolerance !== undefined &&
+    !emptyParentHeaderTolerance.emptyParentHeaderSeen &&
+    emptyParentHeaderTolerance.uniqueEmptyParentHeader &&
+    isPlainTomlRecord(state) &&
+    Object.keys(state).length === 0 &&
+    isEmptyParentHeaderStatementSpan(source, start, end)
+  ) {
+    emptyParentHeaderTolerance.emptyParentHeaderSeen = true;
+    // A bare empty parent header such as `[hooks.state]` is semantically empty TOML
+    // structure: it owns no trust entries, and child tables restate `hooks.state` in
+    // their own headers. It cannot hide unmanaged state, so it is not a conflict.
+    return;
+  }
   const span = { start, end };
   spans.push(span);
   if (!isPlainTomlRecord(state) || Object.keys(state).length === 0) {
     invalidSpans.push(span);
   }
+}
+
+/**
+ * Eligibility gate for tolerating one bare empty `[hooks.state]` parent header inside
+ * the managed marker block. `emptyParentHeaderSeen` grants the tolerance at most once;
+ * `uniqueEmptyParentHeader` is proven file-wide before any span is tolerated, so a
+ * second definition (a real TOML duplicate-table error) never qualifies. Absence of a
+ * tolerance object — for example for plain assignments — never authorizes a skip.
+ */
+interface ManagedMarkerHooksStateSpanTolerance {
+  emptyParentHeaderSeen: boolean;
+  uniqueEmptyParentHeader: boolean;
+}
+
+/**
+ * Accepts only the exact whole-statement parse of a bare empty parent table header,
+ * `[hooks.state]` (quoted-key variants included). Anything beyond that shape — empty
+ * assignments or inline tables, a `[hooks]` scope holding an empty `state`, nested
+ * tables under a deeper header, or unrelated statements — stays fail-closed.
+ */
+function isExactlyEmptyHooksStateParentHeader(
+  parsed: Record<string, unknown> | undefined,
+): boolean {
+  if (!parsed) return false;
+  return Object.keys(parsed).length === 1 &&
+    isPlainTomlRecord(parsed.hooks) &&
+    Object.keys(parsed.hooks).length === 1 &&
+    Object.hasOwn(parsed.hooks, "state") &&
+    isPlainTomlRecord(parsed.hooks.state) &&
+    Object.keys(parsed.hooks.state).length === 0;
+}
+
+/**
+ * Proves a span's statements reduce to exactly one lexically real empty `[hooks.state]`
+ * table header line plus blank/comment lines. Parsed-shape equality alone is not
+ * enough: `hooks.state = {}`, `hooks = { state = {} }`, and `[hooks]` scopes holding
+ * `state = {}` parse to the same object but are not parent headers.
+ */
+function isEmptyParentHeaderStatementSpan(
+  source: TomlSourceLexicalAnalysis,
+  start: number,
+  end: number,
+): boolean {
+  let sawHeader = false;
+  for (let index = start; index < end; index += 1) {
+    if (!source.lineStartsOutsideMultiline[index]) return false;
+    const line = source.lines[index] ?? "";
+    if (isTomlSourceBlankOrComment(line)) continue;
+    if (sawHeader) return false;
+    const header = parseTomlSourceTableHeader(line);
+    if (!header || !isExactlyEmptyHooksStateParentHeader(header.parsed)) return false;
+    sawHeader = true;
+  }
+  return sawHeader;
+}
+
+function countExactEmptyParentHeaderLines(
+  source: TomlSourceLexicalAnalysis,
+): number {
+  let count = 0;
+  for (const [index, line] of source.lines.entries()) {
+    if (!source.lineStartsOutsideMultiline[index]) continue;
+    if (isTomlSourceBlankOrComment(line)) continue;
+    const header = parseTomlSourceTableHeader(line);
+    if (header && isExactlyEmptyHooksStateParentHeader(header.parsed)) count += 1;
+  }
+  return count;
 }
 
 function addManagedHookTrustStateSourceRepresentations(
@@ -2185,14 +2319,17 @@ function addManagedHookTrustStateSourceRepresentations(
   insideManagedMarkerBlock: boolean,
   containingTableScope?: TomlSourceTableScope,
   fallbackKeys: readonly string[] = [],
+  emptyParentHeaderTolerance?: ManagedMarkerHooksStateSpanTolerance,
 ): void {
   recordManagedMarkerHooksStateSourceSpan(
     markerContainedHooksStateSpans,
     invalidMarkerContainedHooksStateSpans,
+    source,
     start,
     end,
     parsed,
     insideManagedMarkerBlock,
+    emptyParentHeaderTolerance,
   );
   const state = tomlHooksStateEntries(parsed);
   const hasComment = sourceRangeHasTomlComment(source, start, end);
@@ -2283,6 +2420,11 @@ function collectManagedHookTrustStateSourceRepresentations(
   const markerContainedHooksStateSpans: SourceSpan[] = [];
   const invalidMarkerContainedHooksStateSpans: SourceSpan[] = [];
   const parsedStatementSpans: SourceSpan[] = [];
+  const emptyParentHeaderTolerance: ManagedMarkerHooksStateSpanTolerance = {
+    emptyParentHeaderSeen: false,
+    uniqueEmptyParentHeader: countExactEmptyParentHeaderLines(source) === 1 &&
+      safeParseToml(config) !== undefined,
+  };
 
   const managedMarkerRanges = [
     ...collectMarkerRanges(
@@ -2313,6 +2455,7 @@ function collectManagedHookTrustStateSourceRepresentations(
       if (
         !source.lineStartsOutsideMultiline[cursor] ||
         line.trim().length === 0 ||
+        isTomlSourceBlankOrComment(line) ||
         line.trim() === OMX_HOOK_TRUST_START_MARKER ||
         line.trim() === OMX_CONFIG_START_MARKER
       ) {
@@ -2363,10 +2506,12 @@ function collectManagedHookTrustStateSourceRepresentations(
     recordManagedMarkerHooksStateSourceSpan(
       markerContainedHooksStateSpans,
       invalidMarkerContainedHooksStateSpans,
+      source,
       index,
       end,
       tableScope.parsed,
       insideManagedMarkerBlock,
+      emptyParentHeaderTolerance,
     );
     const headerState = tomlHooksStateEntries(header.parsed);
     const directKeys = Object.keys(headerState ?? {});
@@ -2397,6 +2542,179 @@ function collectManagedHookTrustStateSourceRepresentations(
     parsedStatementSpans,
     parsedAssignmentSpans,
   };
+}
+
+export interface ManagedCodexHookTrustStateKeyRewrite {
+  oldKey: string;
+  newKey: string;
+  trustedHash: string;
+}
+
+export interface ManagedCodexHookTrustStateCoordinateMigration {
+  config: string;
+  keyRewrites: ManagedCodexHookTrustStateKeyRewrite[];
+}
+
+function formatHookCoordinateMove(move: ManagedCodexHookCoordinateMove): string {
+  return `${move.eventName} [${move.oldGroupIndex},${move.oldHandlerIndex}] -> ` +
+    `[${move.newGroupIndex},${move.newHandlerIndex}] ` +
+    `([hooks.state."${escapeTomlBasicString(move.oldKey)}"] -> ` +
+    `[hooks.state."${escapeTomlBasicString(move.newKey)}"])`;
+}
+
+function unsafeHookTrustCoordinateMigration(
+  moves: readonly ManagedCodexHookCoordinateMove[],
+  reason: string,
+): ManagedCodexHooksPlanError {
+  const moveText = moves.map(formatHookCoordinateMove).join("; ");
+  return new ManagedCodexHooksPlanError(
+    "unsafe_managed_removal",
+    `Cannot safely migrate foreign Codex hook trust state: ${reason}. ` +
+      `Coordinate reorder and [hooks.state] keys to reconcile: ${moveText}. ` +
+      "Verify each hook definition and reconcile only its existing trusted_hash; do not copy trust to a new or changed hook.",
+    {
+      reason,
+      coordinateMoves: moves,
+      keys: moves.flatMap((move) => [move.oldKey, move.newKey]),
+    },
+  );
+}
+
+/**
+ * Rewrites only existing foreign trust tables whose stored hash still proves
+ * the current hook definition. Missing trust remains missing; ambiguous or
+ * opaque TOML and mismatched hashes fail closed.
+ */
+export function migrateManagedCodexHookTrustStateCoordinates(
+  config: string,
+  moves: readonly ManagedCodexHookCoordinateMove[],
+): ManagedCodexHookTrustStateCoordinateMigration {
+  if (moves.length === 0) return { config, keyRewrites: [] };
+
+  const parsed = safeParseToml(config);
+  if (!parsed) {
+    throw unsafeHookTrustCoordinateMigration(
+      moves,
+      "config.toml is not unambiguously parseable",
+    );
+  }
+  const entries = tomlHooksStateEntries(parsed);
+  if (!entries) {
+    if (tomlHooksStateValue(parsed) !== undefined) {
+      throw unsafeHookTrustCoordinateMigration(moves, "[hooks.state] is not a plain table");
+    }
+    return { config, keyRewrites: [] };
+  }
+
+  const inventory = collectManagedHookTrustStateSourceRepresentations(config);
+  if (!inventory.source.isUnambiguous) {
+    throw unsafeHookTrustCoordinateMigration(
+      moves,
+      "config.toml contains ambiguous or opaque TOML source metadata",
+    );
+  }
+  const movesByOldKey = new Map<string, ManagedCodexHookCoordinateMove>();
+  const targetKeys = new Set<string>();
+  for (const move of moves) {
+    if (movesByOldKey.has(move.oldKey) || targetKeys.has(move.newKey)) {
+      throw unsafeHookTrustCoordinateMigration(moves, "hook coordinates are not uniquely mapped");
+    }
+    movesByOldKey.set(move.oldKey, move);
+    targetKeys.add(move.newKey);
+  }
+
+  const lineReplacements = new Map<number, string>();
+  const keyRewrites: ManagedCodexHookTrustStateKeyRewrite[] = [];
+  for (const move of moves) {
+    if (Object.hasOwn(entries, move.newKey) && !movesByOldKey.has(move.newKey)) {
+      // Do not remove or overwrite an occupied destination automatically: its
+      // ownership is unknown, and leaving stale trust there could activate it
+      // for the moved hook. Fail closed and require explicit reconciliation,
+      // even when the old coordinate has no trust entry.
+      throw unsafeHookTrustCoordinateMigration(
+        moves,
+        `destination trust key ${JSON.stringify(move.newKey)} is already occupied`,
+      );
+    }
+    if (!Object.hasOwn(entries, move.oldKey)) continue;
+    if (!move.expectedTrustedHash) {
+      throw unsafeHookTrustCoordinateMigration(
+        moves,
+        `the moved ${move.eventName} hook has opaque or unsupported definition metadata`,
+      );
+    }
+
+    const representations = inventory.representations.get(move.oldKey) ?? [];
+    if (representations.length !== 1) {
+      throw unsafeHookTrustCoordinateMigration(
+        moves,
+        `existing trust key ${JSON.stringify(move.oldKey)} has duplicate or unlocated source metadata`,
+      );
+    }
+    const representation = representations[0]!;
+    const value = entries[move.oldKey];
+    if (
+      !representation.hasExactSemanticScope ||
+      representation.hasComment ||
+      representation.stateEntryCount !== 1 ||
+      !isPlainTomlRecord(value) ||
+      Object.keys(value).some((key) => key !== "trusted_hash" && key !== "enabled") ||
+      typeof value.trusted_hash !== "string" ||
+      value.trusted_hash !== move.expectedTrustedHash ||
+      (Object.hasOwn(value, "enabled") && typeof value.enabled !== "boolean")
+    ) {
+      throw unsafeHookTrustCoordinateMigration(
+        moves,
+        `trusted_hash or metadata for ${JSON.stringify(move.oldKey)} does not exactly match the current hook definition`,
+      );
+    }
+
+    const line = inventory.source.lines[representation.start];
+    const header = line === undefined ? undefined : parseTomlSourceTableHeader(line);
+    if (!header || !hasOnlyManagedHookTrustStateField(header.parsed, move.oldKey)) {
+      throw unsafeHookTrustCoordinateMigration(
+        moves,
+        `trust key ${JSON.stringify(move.oldKey)} is not represented by a standalone [hooks.state] table`,
+      );
+    }
+    lineReplacements.set(
+      representation.start,
+      `[hooks.state."${escapeTomlBasicString(move.newKey)}"]`,
+    );
+    keyRewrites.push({
+      oldKey: move.oldKey,
+      newKey: move.newKey,
+      trustedHash: value.trusted_hash,
+    });
+  }
+
+  if (lineReplacements.size === 0) return { config, keyRewrites };
+  const eol = config.includes("\r\n") ? "\r\n" : "\n";
+  const lines = [...inventory.source.lines];
+  for (const [lineIndex, replacement] of lineReplacements) {
+    lines[lineIndex] = replacement;
+  }
+  return { config: lines.join(eol), keyRewrites };
+}
+
+/**
+ * Removes only proof-owned managed trust entries before validating and applying
+ * foreign hook coordinate moves. This keeps setup, uninstall, and doctor on the
+ * same collision-checking path while preserving unknown destination trust.
+ */
+export function migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+  config: string,
+  moves: readonly ManagedCodexHookCoordinateMove[],
+  options: {
+    managedTrustState?: Record<string, ManagedCodexHookTrustState>;
+    priorManagedHookTrustState?: Record<string, ManagedCodexHookTrustState>;
+  } = {},
+): ManagedCodexHookTrustStateCoordinateMigration {
+  const configWithoutManagedTrust = stripManagedCodexHookTrustState(config, options);
+  return migrateManagedCodexHookTrustStateCoordinates(
+    configWithoutManagedTrust,
+    moves,
+  );
 }
 
 function isExactlyManagedHookTrustStateValue(
@@ -2436,6 +2754,7 @@ function managedMarkerTrustStateConflicts(
   for (const [key, sourceRepresentations] of representations) {
     for (const representation of sourceRepresentations) {
       if (!isInsideManagedMarkerRange(representation)) continue;
+      if (isForeignHookTrustCoordinateBeyondManagedFamily(expectations, key)) continue;
       const expectedHashes = expectedManagedHookTrustHashes(
         expectations,
         key,
@@ -2446,15 +2765,21 @@ function managedMarkerTrustStateConflicts(
         !representation.hasComment &&
         representation.hasExactSemanticScope &&
         isExactlyManagedHookTrustStateValue(representation.value, expectedHashes);
-      if (!source.isUnambiguous || !isExactOwnedRepresentation) conflicts.add(key);
+      if (
+        !source.isUnambiguous ||
+        (!isExactOwnedRepresentation && !isExactOmxPluginHookTrustRepresentation(key, representation))
+      ) {
+        conflicts.add(key);
+      }
     }
   }
   return conflicts;
 }
 
-function removeEmptyManagedHookTrustStateMarkerBlocks(
+function removeManagedHookTrustStateFences(
   source: TomlSourceLexicalAnalysis,
   removed: Set<number>,
+  preservedForeignTrustSpans: readonly SourceSpan[],
 ): void {
   const { lines } = source;
   for (let start = 0; start < lines.length; start += 1) {
@@ -2468,13 +2793,7 @@ function removeEmptyManagedHookTrustStateMarkerBlocks(
         source.lineStartsOutsideMultiline[index] &&
         line.trim() === OMX_HOOK_TRUST_END_MARKER,
     );
-    const nestedStart = lines.findIndex(
-      (line, index) =>
-        index > start &&
-        source.lineStartsOutsideMultiline[index] &&
-        line.trim() === OMX_HOOK_TRUST_START_MARKER,
-    );
-    if (end === -1 || (nestedStart !== -1 && nestedStart < end)) continue;
+    if (end === -1) continue;
 
     let onlyOwnedMarkerContent = true;
     for (let index = start + 1; index < end; index += 1) {
@@ -2482,15 +2801,19 @@ function removeEmptyManagedHookTrustStateMarkerBlocks(
       if (
         removed.has(index) ||
         trimmed.length === 0 ||
-        trimmed === "# Trusts only setup-managed native hook wrappers."
+        trimmed === OMX_HOOK_TRUST_START_MARKER ||
+        trimmed === "# Trusts only setup-managed native hook wrappers." ||
+        preservedForeignTrustSpans.some((span) => span.start <= index && index < span.end)
       ) continue;
       onlyOwnedMarkerContent = false;
       break;
     }
     if (!onlyOwnedMarkerContent) continue;
 
-    removed.add(start);
     removed.add(end);
+    for (let index = start; index < end; index += 1) {
+      if (lines[index]?.trim() === OMX_HOOK_TRUST_START_MARKER) removed.add(index);
+    }
     for (let index = start + 1; index < end; index += 1) {
       if (lines[index]?.trim() === "# Trusts only setup-managed native hook wrappers.") {
         removed.add(index);
@@ -2545,18 +2868,20 @@ function stripProofManagedCodexHookTrustStateTables(
         key,
         representation.insideManagedMarkerBlock,
       );
-      return expectedHashes !== undefined &&
+      return (
+        expectedHashes !== undefined &&
         representation.stateEntryCount === 1 &&
         !representation.hasComment &&
         representation.hasExactSemanticScope &&
-        isExactlyManagedHookTrustStateValue(representation.value, expectedHashes);
+        isExactlyManagedHookTrustStateValue(representation.value, expectedHashes)
+      ) || isExactOmxPluginHookTrustRepresentation(key, representation);
     };
     if (!sourceRepresentations.some((representation) =>
       expectedManagedHookTrustHashes(
         expectations,
         key,
         representation.insideManagedMarkerBlock,
-      ) !== undefined
+      ) !== undefined || isExactOmxPluginHookTrustRepresentation(key, representation)
     )) continue;
     const mayRemoveAll = sourceRepresentations.length === 1
       ? isExactOwnedRepresentation(sourceRepresentations[0]!)
@@ -2587,7 +2912,18 @@ function stripProofManagedCodexHookTrustStateTables(
       removed.add(index);
     }
   }
-  removeEmptyManagedHookTrustStateMarkerBlocks(source, removed);
+  const preservedForeignTrustSpans = [...representations].flatMap(([key, entries]) =>
+    isForeignHookTrustCoordinateBeyondManagedFamily(expectations, key)
+      ? entries
+        .filter((entry) => entry.insideManagedMarkerBlock)
+        .map(({ start, end }) => ({ start, end }))
+      : []
+  );
+  removeManagedHookTrustStateFences(
+    source,
+    removed,
+    preservedForeignTrustSpans,
+  );
   return {
     config: lines.filter((_, index) => !removed.has(index)).join("\n").trimEnd(),
     preservedConflictKeys,
@@ -2795,14 +3131,20 @@ export function upsertManagedCodexHookTrustState(
 export function upsertPluginModeRuntimeFeatureFlags(
   config: string,
   codexHookFeatureFlag: CodexHookFeatureFlag = DEFAULT_CODEX_HOOK_FEATURE_FLAG,
-  options: { pluginScopedHooks?: boolean; preserveNativeHooks?: boolean } = {},
+  options: {
+    pluginScopedHooks?: boolean;
+    pluginHookFeatureFlag?: CodexPluginHookFeatureFlag;
+    preserveNativeHooks?: boolean;
+  } = {},
 ): string {
   const lines = config.split(/\r?\n/);
   const featuresStart = lines.findIndex((line) =>
     /^\s*\[features\]\s*$/.test(line),
   );
+  const pluginHookFeatureFlag = options.pluginHookFeatureFlag ?? CODEX_PLUGIN_SCOPED_HOOKS_FEATURE_FLAG;
+  const preserveNativeHooks = options.preserveNativeHooks && pluginHookFeatureFlag !== codexHookFeatureFlag;
   const hookFeatureFlagLine = options.pluginScopedHooks
-    ? `${CODEX_PLUGIN_SCOPED_HOOKS_FEATURE_FLAG} = true`
+    ? `${pluginHookFeatureFlag} = true`
     : formatCodexHookFeatureFlagLine(codexHookFeatureFlag);
 
   if (featuresStart < 0) {
@@ -2810,7 +3152,7 @@ export function upsertPluginModeRuntimeFeatureFlags(
     const featureBlock = [
       "[features]",
       hookFeatureFlagLine,
-      ...(options.pluginScopedHooks && options.preserveNativeHooks
+      ...(options.pluginScopedHooks && preserveNativeHooks
         ? [formatCodexHookFeatureFlagLine(codexHookFeatureFlag)]
         : []),
       "goals = true",
@@ -2844,8 +3186,9 @@ export function upsertPluginModeRuntimeFeatureFlags(
       lines,
       featuresStart,
       sectionEnd,
+      pluginHookFeatureFlag,
     ));
-    if (options.preserveNativeHooks) {
+    if (preserveNativeHooks) {
       ({ sectionEnd } = upsertCodexHookFeatureFlagInSection(
         lines,
         featuresStart,
@@ -3085,6 +3428,7 @@ export function stripOmxFeatureFlags(
     "child_agents_md",
     "hooks",
     "codex_hooks",
+    "plugin_hooks",
     "goals",
     "goal",
     "collab",
@@ -3407,38 +3751,41 @@ function upsertTuiStatusLine(
       }
 
       const key = keyMatch[1];
+      
+      // Accumulate all lines of the entry (handles multi-line arrays and values)
+      const entryLines = [trimmed];
+      while (
+        !parseStandaloneToml(entryLines.join("\n")) &&
+        i + 1 < section.end
+      ) {
+        i += 1;
+        entryLines.push(lines[i].trim());
+      }
+      const entryContent = entryLines.join("\n");
+      
       if (key === "status_line") {
-        const entryLines = [trimmed];
-        while (
-          !parseStandaloneToml(entryLines.join("\n")) &&
-          i + 1 < section.end
-        ) {
-          i += 1;
-          entryLines.push(lines[i].trim());
-        }
-        const statusLineEntry = entryLines.join("\n");
         const hasMarker =
           lastNonBlankBeforeStatusLine === OMX_MANAGED_STATUS_LINE_MARKER;
         const isManagedByMarker =
-          hasMarker && OMX_PRESET_STATUS_LINE_VALUES.has(statusLineEntry);
+          hasMarker && OMX_PRESET_STATUS_LINE_VALUES.has(entryContent);
         const isManagedByLegacyValue =
-          !hasMarker && statusLineEntry === LEGACY_OMX_STATUS_LINE;
+          !hasMarker && entryContent === LEGACY_OMX_STATUS_LINE;
         const isOmxManagedStatusLine =
           isManagedByMarker || isManagedByLegacyValue;
 
         if (!options.forceStatusLinePreset || !isOmxManagedStatusLine) {
-          preservedStatusLine ??= statusLineEntry;
+          preservedStatusLine ??= entryContent;
         }
-        lastNonBlankBeforeStatusLine = statusLineEntry;
+        lastNonBlankBeforeStatusLine = entryContent;
         continue;
       }
       if (seenKeys.has(key)) {
-        lastNonBlankBeforeStatusLine = trimmed;
+        lastNonBlankBeforeStatusLine = entryContent;
         continue;
       }
       seenKeys.add(key);
-      preservedKeyLines.push(trimmed);
-      lastNonBlankBeforeStatusLine = trimmed;
+      preservedKeyLines.push(entryContent);
+      lastNonBlankBeforeStatusLine = entryContent;
     }
   }
 
@@ -4000,7 +4347,7 @@ function getOmxTablesBlock(
  *
  * Layout:
  *   1. OMX top-level keys (notify, model_reasoning_effort, developer_instructions)
- *   2. [features] with child_agents_md + hooks + goals
+ *   2. [features] with hooks + goals
  *   3. [shell_environment_policy.set] with defaulted deprecated explore-routing opt-out
  *   4. … user sections …
  *   5. OMX [table] sections (mcp_servers, tui)
@@ -4057,9 +4404,33 @@ export function buildMergedConfig(
     !isOmxManagedNotifyCommand(getRootTomlArray(existing, "notify"), pkgRoot)
       ? getRootTomlArray(existing, "notify")
       : null;
+  const userReasoningEffortToPreserve =
+    options.preserveReasoningEffort === true
+      ? parseRootKeyValues(existing).get("model_reasoning_effort")
+      : undefined;
+  // Preserve custom developer_instructions only if it differs from ALL known OMX defaults.
+  // This allows users to get updates to the default guidance across OMX releases while
+  // preserving genuinely custom values.
+  const existingDeveloperInstructions = parseRootKeyValues(existing).get(
+    "developer_instructions",
+  );
+  let userDeveloperInstructionsToPreserve: string | undefined = undefined;
+  if (existingDeveloperInstructions) {
+    const parsedValue = parseTomlStringValue(existingDeveloperInstructions);
+    // Only preserve if the parsed value doesn't match any known OMX default
+    if (parsedValue && !KNOWN_OMX_DEVELOPER_INSTRUCTIONS_VALUES.has(parsedValue)) {
+      userDeveloperInstructionsToPreserve = existingDeveloperInstructions;
+    }
+  }
   existing = stripOmxTopLevelKeys(existing).trimStart();
   if (userNotifyToPreserve) {
     existing = `${`notify = ${formatTomlStringArray(userNotifyToPreserve)}`}\n${existing.trimStart()}`;
+  }
+  if (userReasoningEffortToPreserve !== undefined) {
+    existing = stripRootLevelKeys(existing, ["model_reasoning_effort"]);
+  }
+  if (userDeveloperInstructionsToPreserve !== undefined) {
+    existing = stripRootLevelKeys(existing, ["developer_instructions"]);
   }
   existing = stripOrphanedManagedNotify(existing, pkgRoot).trimStart();
   const hookTrustStrip = stripManagedCodexHookTrustStateForRefresh(
@@ -4094,6 +4465,10 @@ export function buildMergedConfig(
     options.notifyCommand === undefined
       ? getDefaultNotifyCommand(pkgRoot)
       : options.notifyCommand,
+    options.preserveReasoningEffort === true
+      ? userReasoningEffortToPreserve
+      : undefined,
+    userDeveloperInstructionsToPreserve,
   );
   const tablesBlock = getOmxTablesBlock(
     pkgRoot,

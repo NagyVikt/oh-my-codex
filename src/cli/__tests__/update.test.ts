@@ -24,6 +24,7 @@ import {
   writeUserInstallStamp,
 } from '../update.js';
 import {
+  isWorkingTreeInstall,
   resolveBunGlobalBin,
   resolvePackageManagerOwnership,
   type PackageManagerOwnership,
@@ -216,6 +217,47 @@ describe('maybeCheckAndPromptUpdate', () => {
       });
     }
   }
+
+  it('stays silent and stamps the cadence for an unowned working-tree build', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-worktree-check-'));
+    const statePath = join(cwd, '.omx', 'state', 'update-check.json');
+    const originalMode = process.env.OMX_AUTO_UPDATE;
+    const originalLog = console.log;
+    const logs: string[] = [];
+    let latestCalls = 0;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+    delete process.env.OMX_AUTO_UPDATE;
+
+    try {
+      await withInteractiveTty(async () => {
+        await maybeCheckAndPromptUpdate(cwd, {
+          getCurrentVersion: async () => '0.14.0',
+          fetchLatestVersion: async () => {
+            latestCalls += 1;
+            return '0.14.1';
+          },
+          isWorkingTreeInstall: () => true,
+          resolvePackageManagerOwnership: async () => null,
+          askYesNo: async () => {
+            throw new Error('an unowned build must never prompt for an update');
+          },
+        });
+      });
+
+      assert.deepEqual(logs, []);
+      assert.equal(latestCalls, 0);
+      const state = JSON.parse(await readFile(statePath, 'utf-8')) as { last_checked_at?: string };
+      assert.ok(state.last_checked_at, 'the cadence must be stamped so the skip is not re-probed each launch');
+    } finally {
+      if (typeof originalMode === 'string') {
+        process.env.OMX_AUTO_UPDATE = originalMode;
+      }
+      console.log = originalLog;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
   it('schedules a deferred update after a successful startup prompt', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-update-'));
@@ -456,6 +498,54 @@ describe('maybeCheckAndPromptUpdate', () => {
     }
   });
 
+  it('repairs the native runtime cache on the passive up-to-date path (issue #3636)', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-hydrate-'));
+    const originalLog = console.log;
+    const originalMode = process.env.OMX_AUTO_UPDATE;
+    const logs: string[] = [];
+    let hydrateCalls = 0;
+    let deferredCalls = 0;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+    process.env.OMX_AUTO_UPDATE = 'defer';
+
+    try {
+      await withInteractiveTty(async () => {
+        await maybeCheckAndPromptUpdate(cwd, {
+          getCurrentVersion: async () => '0.21.3',
+          fetchLatestVersion: async () => '0.21.3',
+          runGlobalUpdate: () => {
+            throw new Error('no install should run when already up to date');
+          },
+          runDeferredGlobalUpdate: () => {
+            deferredCalls += 1;
+            return { ok: true, stderr: '', logPath: join(cwd, 'update.log') };
+          },
+          runSetupRefresh: async () => {
+            throw new Error('no setup refresh should run when already up to date');
+          },
+          hydrateRuntime: async () => {
+            hydrateCalls += 1;
+            return undefined;
+          },
+        });
+      });
+
+      assert.equal(hydrateCalls, 1);
+      assert.equal(deferredCalls, 0);
+    } finally {
+      if (typeof originalMode === 'string') {
+        process.env.OMX_AUTO_UPDATE = originalMode;
+      } else {
+        delete process.env.OMX_AUTO_UPDATE;
+      }
+      console.log = originalLog;
+      await rm(cwd, { recursive: true, force: true });
+    }
+    void logs;
+  });
+
   it('treats a current dev install dev_base_version as the launch update baseline', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-update-dev-baseline-'));
     let promptCalls = 0;
@@ -630,6 +720,7 @@ describe('frozen package-manager update ownership', () => {
     const result = await runImmediateUpdate('/tmp/omx-unowned-update', {
       getCurrentVersion: async () => '0.14.0',
       fetchLatestVersion: async () => '0.14.1',
+      isWorkingTreeInstall: () => false,
       resolvePackageManagerOwnership: async () => null,
       runSetupRefresh: async () => ({ ok: true, stderr: '' }),
     });
@@ -1097,6 +1188,37 @@ describe('runImmediateUpdate failure diagnostics', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('refuses an explicit update on an unowned working-tree build instead of demanding a reinstall', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-worktree-update-'));
+    const originalLog = console.log;
+    const logs: string[] = [];
+    let latestCalls = 0;
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+
+    try {
+      const result = await runImmediateUpdate(cwd, {
+        getCurrentVersion: async () => '0.14.0',
+        fetchLatestVersion: async () => {
+          latestCalls += 1;
+          return '0.14.1';
+        },
+        isWorkingTreeInstall: () => true,
+        resolvePackageManagerOwnership: async () => null,
+      });
+
+      assert.equal(result.status, 'skipped');
+      assert.equal(latestCalls, 0);
+      assert.match(logs.join('\n'), /runs from a working tree/);
+      assert.doesNotMatch(logs.join('\n'), /Reinstall OMX globally/);
+    } finally {
+      console.log = originalLog;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 
@@ -1121,7 +1243,10 @@ describe('runDeferredGlobalUpdate', () => {
         }) as typeof import('node:child_process').spawn,
         'win32',
         12345,
-        frozenNpmOwnership,
+        {
+          ...frozenNpmOwnership,
+          environment: { ...frozenNpmOwnership.environment },
+        },
       );
 
       assert.equal(result.ok, true);
@@ -1141,7 +1266,10 @@ describe('runDeferredGlobalUpdate', () => {
         cwd,
         logPath: result.logPath,
         parentPid: 12345,
-        ownership: frozenNpmOwnership,
+        ownership: {
+          ...frozenNpmOwnership,
+          environment: { ...frozenNpmOwnership.environment },
+        },
         setupArgs: ['setup'],
       });
       assert.deepEqual(listeners, ['error']);
@@ -1149,7 +1277,7 @@ describe('runDeferredGlobalUpdate', () => {
       assert.equal(calls[0]?.options.stdio, 'ignore');
       assert.equal(calls[0]?.options.windowsHide, true);
       assert.equal(calls[0]?.options.cwd, cwd);
-      assert.deepEqual(calls[0]?.options.env, { OMX_UPDATE_TEST: '1', OMX_SKIP_NATIVE_AGENT_REFRESH: '1' });
+      assert.deepEqual(calls[0]?.options.env, { OMX_UPDATE_TEST: '1' });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1215,7 +1343,7 @@ describe('runDeferredGlobalUpdate', () => {
       assert.equal(calls.length, 1);
       const payload = JSON.parse(await readFile(calls[0]?.args[1] ?? '', 'utf-8')) as { setupArgs: string[] };
       assert.deepEqual(payload.setupArgs, ['setup', '--scope', 'user', '--plugin', '--mcp', 'none', '--disable-team']);
-      assert.equal((calls[0].options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.OMX_SKIP_NATIVE_AGENT_REFRESH, '1');
+      assert.deepEqual((calls[0].options as { env?: NodeJS.ProcessEnv } | undefined)?.env, frozenNpmOwnership.environment);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1278,7 +1406,7 @@ describe('runDeferredGlobalUpdate', () => {
 
 
 describe('deferred update worker', () => {
-  it('retains refresh suppression and removes the verified staging directory after execution', async () => {
+  it('allows native agent refresh and removes the verified staging directory after execution', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-update-worker-'));
     const globalRoot = join(root, 'global');
     const packageRoot = join(globalRoot, PACKAGE_NAME);
@@ -1297,7 +1425,7 @@ describe('deferred update worker', () => {
       await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: PACKAGE_NAME, version: '0.14.1', bin: { omx: 'dist/cli.js' } }));
       await writeFile(cliPath, [
         "import { existsSync, writeFileSync } from 'node:fs';",
-        "writeFileSync(process.env.OMX_UPDATE_CAPTURE_PATH, JSON.stringify({ args: process.argv.slice(2), skip: process.env.OMX_SKIP_NATIVE_AGENT_REFRESH, stampPresent: existsSync(process.env.OMX_UPDATE_STAMP_PATH) }));",
+        "writeFileSync(process.env.OMX_UPDATE_CAPTURE_PATH, JSON.stringify({ args: process.argv.slice(2), codexHome: process.env.CODEX_HOME, stampPresent: existsSync(process.env.OMX_UPDATE_STAMP_PATH) }));",
       ].join('\n'));
       await writeFile(npmCliPath, [
         "const args = process.argv.slice(2);",
@@ -1331,7 +1459,7 @@ describe('deferred update worker', () => {
       assert.equal(result.status, 0, result.stderr);
       assert.deepEqual(JSON.parse(await readFile(capturePath, 'utf-8')), {
         args: ['setup', '--scope', 'project'],
-        skip: '1',
+        codexHome,
         stampPresent: false,
       });
       const stamp = JSON.parse(await readFile(stampPath, 'utf-8')) as {
@@ -1353,6 +1481,28 @@ describe('deferred update worker', () => {
       assert.match(stamp.updated_at, /^\d{4}-\d{2}-\d{2}T/);
       await assert.rejects(readFile(payloadPath), { code: 'ENOENT' });
       await assert.rejects(readFile(stage), { code: 'ENOENT' });
+
+      // An external launcher owns this Codex home. Updating must not replay the
+      // persisted OMX setup, even if the preceding install used that setup.
+      await rm(capturePath);
+      await mkdir(stage, { mode: 0o700 });
+      const externallyManaged = JSON.stringify({
+        ...JSON.parse(serialized),
+        setupArgs: null,
+      });
+      await writeFile(payloadPath, externallyManaged, { mode: 0o600 });
+      const external = spawnSync(process.execPath, [workerPath, payloadPath, digest(externallyManaged), digest(await readFile(workerPath))], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+      assert.equal(external.status, 0, external.stderr);
+      assert.equal(existsSync(capturePath), false);
+      const externalStamp = JSON.parse(await readFile(stampPath, 'utf-8'));
+      assert.equal(externalStamp.installed_version, '0.14.1');
+      assert.equal(externalStamp.setup_completed_version, undefined);
+      assert.match(await readFile(join(root, 'update.log'), 'utf-8'), /setup is managed by the launcher/);
+      await assert.rejects(readFile(stage), { code: 'ENOENT' });
+
       await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: 'unexpected-package', version: '0.14.1', bin: { omx: 'dist/cli.js' } }));
       await mkdir(stage, { recursive: true });
       await chmod(stage, 0o700);
@@ -1530,10 +1680,9 @@ describe('post-update setup refresh handoff', () => {
     assert.equal(receivedTimeout, undefined);
   });
 
-  it('passes only the frozen ownership environment to the immediate setup child', () => {
+  it('passes the frozen environment unchanged to the immediate update setup child', () => {
     const frozenEnvironment: NodeJS.ProcessEnv = {
       CODEX_HOME: '/frozen/codex-home',
-      OMX_SKIP_NATIVE_AGENT_REFRESH: '1',
     };
     let receivedEnvironment: NodeJS.ProcessEnv | undefined;
 
@@ -1549,8 +1698,7 @@ describe('post-update setup refresh handoff', () => {
     );
 
     assert.equal(result.ok, true);
-    assert.deepEqual(receivedEnvironment, frozenEnvironment);
-    assert.equal(receivedEnvironment?.OMX_SKIP_NATIVE_AGENT_REFRESH, '1');
+    assert.deepEqual(receivedEnvironment, { CODEX_HOME: '/frozen/codex-home' });
   });
 
   it('passes persisted plugin setup choices to the updated CLI refresh', async () => {
@@ -1687,6 +1835,29 @@ describe('package-manager ownership', () => {
   const executable = '/configured/node_modules/oh-my-codex/dist/cli/omx.js';
   const packageRoot = '/configured/node_modules/oh-my-codex';
 
+  async function createNpmRuntimePrefixFixture(includeRuntimeNpm = true) {
+    const root = await mkdtemp(join(tmpdir(), 'omx-npm-runtime-prefix-'));
+    const nodeRuntime = join(root, 'node-runtime');
+    const currentNodeExecutable = join(nodeRuntime, 'bin', 'node');
+    const npmCli = join(nodeRuntime, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    const npmPrefix = join(root, 'global-prefix');
+    const globalInstallRoot = join(npmPrefix, 'lib', 'node_modules');
+    const currentPackageRoot = join(globalInstallRoot, 'oh-my-codex');
+    const currentExecutable = join(currentPackageRoot, 'dist', 'cli', 'omx.js');
+    const pathBin = join(root, 'path-bin');
+    await mkdir(dirname(currentNodeExecutable), { recursive: true });
+    await writeFile(currentNodeExecutable, '');
+    if (includeRuntimeNpm) {
+      await mkdir(dirname(npmCli), { recursive: true });
+      await writeFile(npmCli, '');
+    }
+    await mkdir(dirname(currentExecutable), { recursive: true });
+    await writeFile(currentExecutable, '');
+    await mkdir(pathBin, { recursive: true });
+    await writeFile(join(pathBin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    return { root, currentNodeExecutable, npmCli, npmPrefix, globalInstallRoot, currentPackageRoot, currentExecutable, pathBin };
+  }
+
   function ownershipDependencies(stamp: 'npm' | 'bun' | undefined, roots: { npm?: string; bunBin?: string }) {
     return {
       currentExecutable: executable,
@@ -1703,6 +1874,19 @@ describe('package-manager ownership', () => {
       environment: { OMX_UPDATE_TEST: '1' },
     };
   }
+
+  it('classifies only package roots outside node_modules as working-tree builds', () => {
+    const realpath = (path: string): string => (path === '/opt/homebrew/lib/node_modules/oh-my-codex'
+      ? '/Users/dev/Workspace/oh-my-codex'
+      : path);
+    assert.equal(isWorkingTreeInstall('/opt/homebrew/lib/node_modules/oh-my-codex', 'darwin', realpath), true);
+    assert.equal(isWorkingTreeInstall('/opt/homebrew/lib/node_modules/oh-my-codex', 'darwin', (path) => path), false);
+    assert.equal(isWorkingTreeInstall('/root/.bun/install/global/node_modules/oh-my-codex', 'darwin', (path) => path), false);
+    assert.equal(isWorkingTreeInstall('C:\\Users\\dev\\AppData\\Roaming\\npm\\node_modules\\oh-my-codex', 'win32', (path) => path), false);
+    assert.equal(isWorkingTreeInstall('/Users/dev/Workspace/oh-my-codex', 'darwin', () => {
+      throw new Error('unresolvable');
+    }), false);
+  });
 
   it('selects a validated npm owner from isolated roots', async () => {
     assert.deepEqual(await resolvePackageManagerOwnership(ownershipDependencies('npm', {
@@ -1771,6 +1955,110 @@ describe('package-manager ownership', () => {
       },
       environment: {},
     }), null, 'missing installed npm CLI must fail closed');
+  });
+
+  it('resolves npm from the Node runtime with a separate global prefix', async () => {
+    const fixture = await createNpmRuntimePrefixFixture();
+    let npmCommand: Extract<PackageManagerOwnership, { manager: 'npm' }>['npmCommand'] | undefined;
+    try {
+      assert.equal(existsSync(join(fixture.globalInstallRoot, 'npm', 'bin', 'npm-cli.js')), false);
+      const ownership = await resolvePackageManagerOwnership({
+        currentExecutable: fixture.currentExecutable,
+        currentPackageRoot: fixture.currentPackageRoot,
+        currentNodeExecutable: fixture.currentNodeExecutable,
+        platform: 'darwin',
+        readInstallStamp: async () => null,
+        realpath: realpathSync,
+        resolveNpmCommand: () => null,
+        resolveNpmGlobalInstallRoot: (command) => {
+          npmCommand = command;
+          return fixture.globalInstallRoot;
+        },
+        resolveNpmPrefix: () => fixture.npmPrefix,
+        resolveBunGlobalBin: () => null,
+        resolveBunCommand: () => null,
+        environment: { PATH: fixture.pathBin },
+      });
+
+      assert.deepEqual(npmCommand, {
+        kind: 'node-script',
+        command: fixture.currentNodeExecutable,
+        commandArgs: [fixture.npmCli],
+      });
+      assert.equal(ownership?.manager, 'npm');
+      assert.equal(ownership?.globalInstallRoot, fixture.globalInstallRoot);
+      assert.equal(ownership?.npmPrefix, fixture.npmPrefix);
+      assert.equal(ownership?.packageRoot, fixture.currentPackageRoot);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a Node runtime npm whose reported global prefix does not contain the install root', async () => {
+    const fixture = await createNpmRuntimePrefixFixture();
+    const mismatchedPrefix = join(fixture.root, 'unrelated-prefix');
+    await mkdir(mismatchedPrefix);
+    let npmCommand: Extract<PackageManagerOwnership, { manager: 'npm' }>['npmCommand'] | undefined;
+    try {
+      const ownership = await resolvePackageManagerOwnership({
+        currentExecutable: fixture.currentExecutable,
+        currentPackageRoot: fixture.currentPackageRoot,
+        currentNodeExecutable: fixture.currentNodeExecutable,
+        platform: 'darwin',
+        readInstallStamp: async () => null,
+        realpath: realpathSync,
+        resolveNpmCommand: () => null,
+        resolveNpmGlobalInstallRoot: (command) => {
+          npmCommand = command;
+          return fixture.globalInstallRoot;
+        },
+        resolveNpmPrefix: () => mismatchedPrefix,
+        resolveBunGlobalBin: () => null,
+        resolveBunCommand: () => null,
+        environment: { PATH: fixture.pathBin },
+      });
+
+      assert.deepEqual(npmCommand, {
+        kind: 'node-script',
+        command: fixture.currentNodeExecutable,
+        commandArgs: [fixture.npmCli],
+      });
+      assert.equal(ownership, null);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not trust an npm found only on PATH', async () => {
+    const fixture = await createNpmRuntimePrefixFixture(false);
+    let npmRootQueries = 0;
+    try {
+      assert.equal(existsSync(fixture.npmCli), false);
+      assert.equal(existsSync(join(fixture.globalInstallRoot, 'npm', 'bin', 'npm-cli.js')), false);
+      assert.equal(existsSync(join(fixture.pathBin, 'npm')), true);
+      const ownership = await resolvePackageManagerOwnership({
+        currentExecutable: fixture.currentExecutable,
+        currentPackageRoot: fixture.currentPackageRoot,
+        currentNodeExecutable: fixture.currentNodeExecutable,
+        platform: 'darwin',
+        readInstallStamp: async () => null,
+        realpath: realpathSync,
+        resolveNpmCommand: () => null,
+        resolveNpmGlobalInstallRoot: () => {
+          npmRootQueries += 1;
+          return fixture.globalInstallRoot;
+        },
+        resolveNpmPrefix: () => fixture.npmPrefix,
+        resolveBunGlobalBin: () => null,
+        resolveBunCommand: () => null,
+        environment: { PATH: fixture.pathBin },
+      });
+
+      assert.equal(ownership, null);
+      assert.equal(npmRootQueries, 0);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   });
 
   it('resolves npm from the selected global OMX root before a Node runtime sibling on Windows', async () => {

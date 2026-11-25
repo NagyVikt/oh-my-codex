@@ -5,12 +5,12 @@ import { basename, isAbsolute, join, relative } from 'node:path';
 
 import { isCompletePackageManagerOwnership, runNpmCommand, validatePackageManagerOwnership, type PackageManagerOwnership } from './package-manager-ownership.js';
 import { writeUserInstallStamp } from '../scripts/postinstall-advisory.js';
+import { hydrateOmxRuntimeNonFatal } from '../scripts/postinstall.js';
 import { omxUserInstallStampPath } from '../utils/paths.js';
 
-type DeferredUpdatePayload = { cwd: string; logPath: string; parentPid: number; ownership: PackageManagerOwnership; setupArgs: string[] };
+type DeferredUpdatePayload = { cwd: string; logPath: string; parentPid: number; ownership: PackageManagerOwnership; setupArgs: string[] | null };
 const PACKAGE_NAME = 'oh-my-codex';
 const installSource = `${PACKAGE_NAME}@latest`;
-const SKIP_NATIVE_AGENT_REFRESH_ENV = 'OMX_SKIP_NATIVE_AGENT_REFRESH';
 const installOptions: SpawnSyncOptions = { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, windowsHide: true };
 
 
@@ -34,8 +34,8 @@ function isDeferredUpdatePayload(value: unknown): value is DeferredUpdatePayload
     && Boolean(payload.logPath)
     && Number.isSafeInteger(payload.parentPid)
     && (payload.parentPid as number) > 0
-    && Array.isArray(payload.setupArgs)
-    && payload.setupArgs.every((arg) => typeof arg === 'string')
+    && (payload.setupArgs === null
+      || (Array.isArray(payload.setupArgs) && payload.setupArgs.every((arg) => typeof arg === 'string')))
     && isCompletePackageManagerOwnership(payload.ownership);
 }
 async function waitForParent(parentPid: number): Promise<void> {
@@ -62,19 +62,21 @@ async function ownerOnlyStage(stage: string): Promise<boolean> {
   } catch { return false; }
 }
 
-async function finalizeSuccessfulUpdate(ownership: PackageManagerOwnership): Promise<void> {
+async function finalizeSuccessfulUpdate(ownership: PackageManagerOwnership, setupCompleted: boolean): Promise<string> {
   const manifest = JSON.parse(await readFile(join(ownership.packageRoot, 'package.json'), 'utf-8')) as { version?: string };
   if (typeof manifest.version !== 'string' || manifest.version.trim() === '') {
     throw new Error('Updated package version is unavailable for deferred update finalization.');
   }
+  const version = manifest.version.trim().replace(/^v/i, '');
   await writeUserInstallStamp({
-    installed_version: manifest.version.trim().replace(/^v/i, ''),
-    setup_completed_version: manifest.version.trim().replace(/^v/i, ''),
+    installed_version: version,
+    ...(setupCompleted ? { setup_completed_version: version } : {}),
     install_channel: 'stable',
     install_source: installSource,
     package_manager: ownership.manager,
     updated_at: new Date().toISOString(),
   }, omxUserInstallStampPath(ownership.environment.CODEX_HOME));
+  return version;
 }
 
 async function main(): Promise<void> {
@@ -111,9 +113,21 @@ async function main(): Promise<void> {
     if (result.error || result.status !== 0) throw new Error(String(result.stderr || result.error?.message || 'controller install failed'));
     const cliEntry = await validatePackageManagerOwnership(payload.ownership);
     if (!cliEntry) throw new Error('Frozen manager, package root, or bin ownership validation failed after update.');
-    const setup = spawnSync(process.execPath, [cliEntry, ...payload.setupArgs], { cwd: payload.cwd, env: { ...payload.ownership.environment, [SKIP_NATIVE_AGENT_REFRESH_ENV]: '1' }, stdio: 'inherit', windowsHide: true });
-    if (setup.error || setup.status !== 0) throw new Error(setup.error?.message || `setup exited ${setup.status}`);
-    await finalizeSuccessfulUpdate(payload.ownership);
+    // The package was installed with --ignore-scripts. Hydrate before setup so
+    // setup failure still leaves the installed version with a repaired runtime
+    // cache and the recovery command does not repeat the omission.
+    await hydrateOmxRuntimeNonFatal({
+      packageRoot: payload.ownership.packageRoot,
+      env: payload.ownership.environment,
+      log: (message) => appendFile(payload!.logPath, `${message}\n`).then(() => undefined),
+    });
+    if (payload.setupArgs !== null) {
+      const setup = spawnSync(process.execPath, [cliEntry, ...payload.setupArgs], { cwd: payload.cwd, env: payload.ownership.environment, stdio: 'inherit', windowsHide: true });
+      if (setup.error || setup.status !== 0) throw new Error(setup.error?.message || `setup exited ${setup.status}`);
+    }
+    const version = await finalizeSuccessfulUpdate(payload.ownership, payload.setupArgs !== null);
+    const setupNote = payload.setupArgs === null ? '; setup is managed by the launcher' : '';
+    await appendFile(payload.logPath, `[omx] Deferred update completed to v${version}${setupNote}.\n`);
   } catch (error) {
     if (payload) await appendFile(payload.logPath, `[omx] Deferred update failed: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;

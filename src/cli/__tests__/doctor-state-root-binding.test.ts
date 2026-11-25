@@ -1,8 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   checkStateRootSessionBinding,
   formatStateRootSessionBindingDiagnostic,
+  repairStateProjections,
 } from '../doctor.js';
 import {
   readCanonicalSessionBindingSnapshot,
@@ -25,6 +29,95 @@ function syntheticSnapshot(
 }
 
 describe('doctor state-root/session binding diagnostics', () => {
+  it('reports unavailable runtime binding for only an ambient Codex session in an uninitialized workspace', () => {
+    const check = checkStateRootSessionBinding(
+      syntheticSnapshot('absent', { rootSource: 'cwd-default' }),
+      { CODEX_SESSION_ID: 'codex-session' },
+    );
+    assert.equal(check.status, 'warn');
+    assert.match(check.message, /may not be OMX-managed/);
+    assert.match(check.message, /non-OMX workflows do not require OMX binding/);
+    assert.match(check.message, /no OMX runtime authority verified/i);
+    assert.match(check.message, /this condition alone does not indicate installation damage/);
+    assert.match(check.message, /omx.*start an OMX-managed session/);
+    assert.doesNotMatch(check.message, /bad_selectors|clear|relaunch|unset|CODEX_SESSION_ID/);
+  });
+
+  it('distinguishes ordinary Codex sessions from broken OMX bindings', () => {
+    const check = checkStateRootSessionBinding(
+      syntheticSnapshot('absent', { rootSource: 'cwd-default' }),
+      { CODEX_SESSION_ID: 'codex-session' },
+    );
+    assert.equal(check.status, 'warn');
+    assert.match(check.message, /may not be OMX-managed/);
+    assert.doesNotMatch(check.message, /is not OMX-managed/);
+    assert.match(check.message, /non-OMX workflows do not require OMX binding/);
+    assert.match(check.message, /no OMX runtime authority verified/i);
+    assert.match(check.message, /this condition alone does not indicate installation damage/);
+    assert.match(check.message, /omx.*start an OMX-managed session/);
+    assert.doesNotMatch(check.message, /unset|CODEX_SESSION_ID/);
+  });
+
+  it('leaves a fresh workspace untouched when inspecting an ambient Codex session', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-doctor-ambient-session-'));
+    try {
+      const env = { CODEX_SESSION_ID: 'codex-session' };
+      const snapshot = await readCanonicalSessionBindingSnapshot(cwd, env);
+      assert.equal(snapshot.status, 'absent');
+      assert.equal(snapshot.rootSource, 'cwd-default');
+      assert.equal(checkStateRootSessionBinding(snapshot, env).status, 'warn');
+      assert.deepEqual(await readdir(cwd), []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps explicit runtime selectors and unsafe pointers fail-closed', () => {
+    for (const env of [
+      { CODEX_SESSION_ID: 'codex-session', OMX_SESSION_ID: 'omx-session' },
+      { CODEX_SESSION_ID: 'codex-session', SESSION_ID: 'session' },
+      { CODEX_SESSION_ID: 'codex-session', OMX_ROOT: '/explicit' },
+      { CODEX_SESSION_ID: 'codex-session', OMX_STATE_ROOT: '/explicit' },
+      { CODEX_SESSION_ID: 'codex-session', OMX_TEAM_STATE_ROOT: '/explicit' },
+      { CODEX_SESSION_ID: 'invalid/session' },
+    ]) {
+      assert.equal(checkStateRootSessionBinding(
+        syntheticSnapshot('absent', { rootSource: 'cwd-default' }), env,
+      ).status, 'fail');
+    }
+    for (const status of ['foreign-cwd', 'malformed', 'identity-indeterminate', 'non-runtime-owner', 'usable'] as const) {
+      assert.equal(checkStateRootSessionBinding(
+        syntheticSnapshot(status, { rootSource: 'cwd-default' }),
+        { CODEX_SESSION_ID: 'unverified-codex' },
+      ).status, 'fail');
+    }
+    assert.equal(checkStateRootSessionBinding(
+      syntheticSnapshot('absent'), { CODEX_SESSION_ID: 'codex-session' },
+    ).status, 'fail');
+  });
+
+  it('recommends the working pointer recovery action for a live managed Codex daemon', () => {
+    const check = checkStateRootSessionBinding(
+      syntheticSnapshot('non-runtime-owner', {
+        liveness: 'non-runtime-owner',
+        state: {
+          session_id: 'native-daemon-session',
+          started_at: '2026-10-28T23:03:37.205Z',
+          cwd: '/tmp/workspace',
+          pid: 57617,
+        },
+      }),
+      { OMX_SESSION_ID: 'omx-inherited-stale' },
+    );
+
+    assert.equal(check.status, 'fail');
+    assert.match(check.message, /ptr=non-runtime-owner/);
+    assert.match(check.message, /fix=clear\/correct/);
+    assert.match(check.message, /omx session pointer recover/);
+    assert.match(check.message, /managed Codex daemon/);
+    assert.doesNotMatch(check.message, /terminate only verified owner/);
+  });
+
   it('prefers the winning env root over OMX_SESSION_ID during resolution failure', async () => {
     const env = {
       OMX_ROOT: '/winning-root',
@@ -139,9 +232,22 @@ describe('doctor state-root/session binding diagnostics', () => {
       assert.ok(message.length <= 240, status);
       assert.match(message, /session\.json/, status);
       assert.match(message, /bad_selectors=OMX_SESSION_ID,CODEX_SESSION_ID,SESSION_ID/, status);
-      assert.match(message, /(?:terminate only verified owner if necessary|owner=terminate-verified-only-if-needed)/, status);
+      if (status === 'stale-dead') {
+        assert.match(message, /(?:positively dead, non-reused owner|recover=dead-nonreused-only)/, status);
+        assert.doesNotMatch(message, /recover=omx-session-pointer-recover/, status);
+      } else {
+        assert.match(message, /(?:terminate only verified owner if necessary|owner=terminate-verified-only-if-needed)/, status);
+      }
       assert.doesNotMatch(message, /…$/, status);
     }
+  });
+  it('does not prescribe verified-dead recovery for reused or uncertain owner identity', () => {
+    const message = formatStateRootSessionBindingDiagnostic(
+      syntheticSnapshot('stale-dead', { selectedSessionJson: '/tmp/project/.omx/state/session.json' }),
+      {},
+    );
+    assert.match(message, /(?:only for a positively dead, non-reused owner|recover=dead-nonreused-only)/);
+    assert.match(message, /(?:reused or uncertain identity requires investigation|reused=investigate)/);
   });
   it('keeps all selector recovery fields atomic for owner diagnostics at the final cap fallback', () => {
     const cases = [
@@ -176,6 +282,135 @@ describe('doctor state-root/session binding diagnostics', () => {
       ].join(';');
       assert.equal(message, expected, testCase.source);
       assert.ok(message.length <= 240, testCase.source);
+    }
+  });
+
+  describe('identity-indeterminate selectors (#3725)', () => {
+    const snapshot = {
+      cwd: '/repo',
+      baseStateDir: '/repo/.omx/state',
+      rootSource: 'cwd-default',
+      selectedSessionJson: '/repo/.omx/state/session.json',
+      status: 'identity-indeterminate',
+      liveness: 'identity-indeterminate',
+      state: { session_id: 'omx-example', native_session_id: 'native-example', cwd: '/repo' },
+      verifiedAliases: {},
+    } as unknown as Parameters<typeof checkStateRootSessionBinding>[0];
+
+    it('reports matching selectors as unverified, not bad, and stays fail-closed', () => {
+      const check = checkStateRootSessionBinding(snapshot, {
+        OMX_SESSION_ID: 'omx-example',
+        CODEX_SESSION_ID: 'native-example',
+      });
+      assert.equal(check.status, 'fail');
+      assert.doesNotMatch(check.message, /bad_selectors/);
+      assert.doesNotMatch(check.message, /clear or correct listed selectors/);
+      assert.match(check.message, /unverified=process-identity-indeterminate/);
+    });
+
+    it('still reports a true mismatch as a bad selector', () => {
+      const check = checkStateRootSessionBinding(snapshot, {
+        OMX_SESSION_ID: 'omx-example',
+        CODEX_SESSION_ID: 'native-other',
+      });
+      assert.equal(check.status, 'fail');
+      assert.match(check.message, /bad_selectors=CODEX_SESSION_ID(?![,A-Z_])/);
+      assert.match(check.message, /unverified=process-identity-indeterminate/);
+    });
+
+    it('treats a selector with no recorded session state as bad', () => {
+      const check = checkStateRootSessionBinding(
+        { ...snapshot, state: undefined } as typeof snapshot,
+        { OMX_SESSION_ID: 'omx-example' },
+      );
+      assert.equal(check.status, 'fail');
+      assert.match(check.message, /bad_selectors=OMX_SESSION_ID/);
+      assert.doesNotMatch(check.message, /unverified=/);
+    });
+
+    it('keeps mixed unverified and bad selector evidence within the cap for an explicit root', () => {
+      const message = formatStateRootSessionBindingDiagnostic(
+        { ...snapshot, rootSource: 'team-env' } as typeof snapshot,
+        {
+          OMX_TEAM_STATE_ROOT: '/winning-team-root',
+          OMX_SESSION_ID: 'omx-example',
+          CODEX_SESSION_ID: 'native-other',
+          SESSION_ID: 'other-session',
+        },
+      );
+      assert.equal(message, [
+        'src=team-env',
+        'root=OMX_TEAM_STATE_ROOT',
+        'clear=OMX_TEAM_STATE_ROOT-if-unintended',
+        'ptr=indet',
+        'fix=clear/correct',
+        'no-mutation',
+        'selected=session.json',
+        'bad_selectors=CODEX_SESSION_ID,SESSION_ID',
+        'unverified=process-identity-indeterminate',
+      ].join(';'));
+      assert.ok(message.length <= 240, `${message.length}`);
+    });
+
+    it('does not echo hostile selector values', () => {
+      const check = checkStateRootSessionBinding(snapshot, { OMX_SESSION_ID: '../../../etc/passwd' });
+      assert.match(check.message, /bad_selectors=OMX_SESSION_ID/);
+      assert.doesNotMatch(check.message, /passwd|\.\.\//);
+    });
+  });
+
+  it('archives stale projections while preserving the current scope and unrelated artifacts', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-doctor-repair-state-'));
+    try {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const currentSession = join(stateRoot, 'sessions', 'current-session');
+      const staleSession = join(stateRoot, 'sessions', 'stale-session');
+      await mkdir(currentSession, { recursive: true });
+      await mkdir(staleSession, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
+        session_id: 'current-session',
+        cwd,
+        state_root: stateRoot,
+      }));
+      await writeFile(join(stateRoot, 'root-state.json'), 'root projection');
+      await writeFile(join(currentSession, 'current-state.json'), 'current projection');
+      await writeFile(join(staleSession, 'stale-state.json'), 'stale projection');
+      await writeFile(join(cwd, '.omx', 'plans.md'), 'keep plans');
+      await writeFile(join(cwd, '.omx', 'specs.md'), 'keep specs');
+      await writeFile(join(cwd, '.omx', 'context.md'), 'keep context');
+
+      const first = await repairStateProjections(cwd, {});
+      assert.equal(first.archived.length, 2);
+      assert.equal(await readFile(join(currentSession, 'current-state.json'), 'utf8'), 'current projection');
+      assert.equal(await readFile(join(stateRoot, 'session.json'), 'utf8') !== '', true);
+      assert.equal(await readFile(join(cwd, '.omx', 'plans.md'), 'utf8'), 'keep plans');
+      assert.equal(await readFile(join(cwd, '.omx', 'specs.md'), 'utf8'), 'keep specs');
+      assert.equal(await readFile(join(cwd, '.omx', 'context.md'), 'utf8'), 'keep context');
+      assert.equal(await readFile(join(cwd, '.omx', 'archive', 'state', 'root-state.json'), 'utf8'), 'root projection');
+      assert.equal(await readFile(join(cwd, '.omx', 'archive', 'state', 'sessions', 'stale-session', 'stale-state.json'), 'utf8'), 'stale projection');
+
+      const second = await repairStateProjections(cwd, {});
+      assert.deepEqual(second.archived, []);
+      assert.equal((await readdir(join(cwd, '.omx', 'archive', 'state'))).includes('root-state.json'), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not archive symlink projections without file ownership proof', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-doctor-repair-state-link-'));
+    try {
+      const stateRoot = join(cwd, '.omx', 'state');
+      await mkdir(stateRoot, { recursive: true });
+      const target = join(cwd, 'foreign-state.json');
+      const projection = join(stateRoot, 'foreign-state.json');
+      await writeFile(target, 'foreign');
+      await symlink(target, projection);
+      const result = await repairStateProjections(cwd, {});
+      assert.deepEqual(result.archived, []);
+      assert.equal(await readFile(projection, 'utf8'), 'foreign');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 });

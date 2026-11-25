@@ -2,6 +2,10 @@
 
 Use this page when OMX appears installed but real Codex execution still fails.
 
+## Question submit lock requires recovery
+
+`question_submit_lock_recovery_required:<path>` means an abandoned question submit lock was preserved to avoid overwriting an in-flight answer. A live owner's lock is retained even when it is old. Confirm that no question command or renderer is using the reported lock, then remove that specific lock directory and retry. Do not remove a lock while its owner is still running.
+
 ## Install success vs real execution success
 
 `omx setup` and `omx doctor` validate OMX's local install surface: prompts, skills, AGENTS scaffolding, config files, hooks, and runtime prerequisites. They do not guarantee that the active Codex profile can authenticate and complete a model request.
@@ -86,12 +90,26 @@ omx doctor --team
 Do not force-shutdown a team that may still have useful live panes or worker state. Prefer `omx team status <team-name>` and `tmux ls` first when unsure.
 
 
+## Team operation reports `team_lock_recovery_required`
+
+Team membership, scaling, task-claim, mailbox, and shared dispatch locks are no longer deleted automatically based on age. Concurrent recovery could otherwise delete a replacement lock and silently overwrite task data. A live owner is preserved even when its lease timestamp is old.
+
+If an operation reports `team_lock_recovery_required:<path>`, stop retries and inspect the exact lock directory and its `owner` file. Confirm the recorded process and all operations using that team/state root have stopped before manually removing only that lock directory, then retry the operation. Unknown, malformed, or partially initialized owners require the same confirmation; an old timestamp alone is not proof that an operation has stopped. Process crashes can leave locks requiring this manual recovery.
+
 ## Stale session pointer blocks state writes (`session.json is present but unusable`)
 
-State writes fail closed with `Cannot resolve writable state scope: session.json is present but unusable.` when a stale-dead selected pointer lacks a valid `OMX_SESSION_ID` binding, or when the pointer is malformed, belongs to a different working directory, or has indeterminate identity without the bounded exact-session reconciliation described below. Malformed and foreign-working-directory pointers always fail closed; identity-indeterminate pointers have only the narrow exact-session recovery path described below. Durable Ultragoal mutations (`goals.json` story/goal transitions) perform point-in-time writable-authority checks at mutation entry and after lock acquisition; a later SessionStart publication can still interleave before filesystem writes.
+State writes fail closed with `Cannot resolve writable state scope: session.json is present but unusable.` when a stale-dead selected pointer lacks a valid `OMX_SESSION_ID` binding, when a live managed Codex daemon owns the pointer but is not an OMX runtime, or when the pointer is malformed, belongs to a different working directory, or has indeterminate identity without the bounded exact-session reconciliation described below. Malformed and foreign-working-directory pointers always fail closed; identity-indeterminate pointers have only the narrow exact-session recovery path described below. Durable Ultragoal mutations (`goals.json` story/goal transitions) perform point-in-time writable-authority checks at mutation entry and after lock acquisition; a later SessionStart publication can still interleave before filesystem writes.
 
 
-### Exact-session reconciliation (stale-dead pointer)
+### Session pointer recovery (stale-dead or managed-daemon owner)
+
+To remove a verified-dead selected pointer or a pointer owned by a verified live managed Codex app-server daemon, preserving its exact forensic bytes, use the official recovery command:
+
+```bash
+omx session pointer recover --cwd /path/to/project
+```
+
+The command serializes with the canonical pointer lock and moves only an authoritative `session.json` whose owner is positively dead or whose matching Linux process identity proves it is a managed Codex `app-server --managed-daemon`, not an OMX runtime. It refuses ordinary live or usable owners, uncertain or reused identities, malformed or foreign pointers, root/lineage mismatches, concurrent changes, I/O failures, and existing quarantine destinations. A successful recovery leaves the canonical pointer absent so an ordinary relaunch can publish a fresh pointer. No native runtime is required: when the atomic no-replace rename provider is unavailable (for example an unhydrated `omx-runtime` on macOS arm64), recovery falls back to a portable `link()` + `unlink()` quarantine with the same no-clobber guarantee.
 
 When the pointer's recorded PID is definitively dead, bind the exact current session explicitly and retry the same command — no manual file surgery:
 
@@ -100,7 +118,7 @@ export OMX_SESSION_ID=<current-session-id>
 omx state write --input '{"mode":"ultragoal","active":true,"current_phase":"reviewing"}' --json
 ```
 
-A stale-dead pointer holds no owner authority, so the validated `OMX_SESSION_ID` binding becomes the writable session scope (state lands under `.omx/state/sessions/<current-session-id>/`). The binding is operator-asserted: the code proves the pointer is definitively dead and authoritative, not that the env value names your live session — set it to the exact current session id. Recovery additionally requires the dead pointer itself to be authoritative for this project: its recorded `cwd` must contain the working directory, and its recorded `state_root` — when present — must canonical-match the selected state root (legacy pointers without `state_root` are accepted only when the cwd-derived `.omx/state` root matches exactly). A pointer with missing or foreign authority metadata stays fail-closed even with an env binding. Scope resolution never rewrites `session.json` itself; only a SessionStart hook reconciles the pointer through the normal pointer-lock protocol. Note that a plain OMX relaunch with a stale-dead pointer aborts with `session_pointer_unusable`/`stale-dead` and preserves the pointer, so setting `OMX_SESSION_ID` explicitly is the reliable recovery path.
+Note that a plain OMX relaunch with a stale-dead pointer aborts with `session_pointer_unusable`/`stale-dead` and preserves the pointer, so setting `OMX_SESSION_ID` explicitly is the reliable recovery path for that case. A verified managed-daemon pointer is not considered an OMX owner; OMX launch can replace it, or the recovery command above can quarantine it without stopping the daemon.
 
 ### Exact-session reconciliation (identity-indeterminate pointer)
 
@@ -114,7 +132,7 @@ Pre-commit scope revalidation is a point-in-time check: it reduces but does not 
 
 - Malformed and foreign-working-directory pointers always fail closed. An identity-indeterminate pointer also fails closed unless `OMX_SESSION_ID` exactly matches the pointer's own `session_id` and cwd/state_root authority already holds; see **Exact-session reconciliation (identity-indeterminate pointer)**.
 - Without an env binding, a stale-dead pointer still blocks writes — set `OMX_SESSION_ID` (a plain relaunch aborts instead of reconciling; only a SessionStart hook reconciles the pointer).
-- A live pointer with an unmatched `OMX_SESSION_ID` fails closed as `OMX_SESSION_ID does not match the live session recorded in session.json`.
+- A live interactive OMX pointer with an unmatched `OMX_SESSION_ID` fails closed as `OMX_SESSION_ID does not match the live session recorded in session.json`; a positively identified managed Codex daemon is not treated as an OMX owner and can be quarantined with the command above.
 - Durable Ultragoal mutations (including the legacy aggregate-objective migration that used to run on plain reads) require successful writable-scope resolution: with no selected pointer they keep prior root/unbound behavior, but allowlist violations, conflicting roots, and live-owner mismatches now propagate instead of being ignored.
 
 ## Shift+Enter submits instead of inserting a newline in tmux-backed OMX sessions
@@ -178,3 +196,85 @@ Adjust the terminal pattern if your client advertises a different terminfo name.
 - For explicit shell-native read-only evidence or `--tmux-pane` summaries, use `omx sparkshell -- <command>`.
 
 The earlier explore harness fallback boundaries (sparkshell-backend fallback and in-harness model fallback) no longer apply to a user-facing command, because the command no longer runs a harness. Internal harness-resolution helpers remain only to support `omx doctor`/native-asset diagnostics.
+
+## `omx update` refuses to run on a working-tree build
+
+A checkout that you run directly, or link into a global root with `npm link`, is not owned by any package manager. `omx update` refuses it explicitly:
+
+```
+[omx] This build runs from a working tree (/path/to/oh-my-codex), which no package manager owns.
+      Self-update is refused; pull and rebuild the checkout instead.
+```
+
+Update such a build with `git pull && npm run build`. The launch-time check makes the same determination silently and records the cadence, so a linked dev build never nags on startup and never overwrites your tree.
+
+This is distinct from `[omx] Unable to determine whether this global install is owned by npm or Bun`, which means the package root *is* inside a global `node_modules` but neither manager could be validated as its owner — reinstall globally with npm or Bun.
+
+## The prompt input line drifts into the middle of the pane
+
+Symptom: after a multi-agent/review workflow finishes, the Codex composer (`Ask Codex to do anything`) no longer sits directly above the bottom bars — it renders partway up the pane, with unused rows below it.
+
+The composer is drawn by the Codex CLI itself, not by OMX. OMX only mutates the *pane* around it (HUD split, pane teardown, geometry changes, `send-keys` nudges, and the detached-client `clear-history` prune hook). Every one of those mutations was exercised against a live Codex TUI on `codex-cli 0.152.1` / `tmux 3.2a`, both idle and mid-stream, and none of them desynced the composer anchor:
+
+| mutation | idle | mid-stream |
+|---|---|---|
+| HUD-style `split-window -v -f -l <n>` below the pane | anchored | anchored |
+| `kill-pane` on the HUD pane (pane grows back) | anchored | anchored |
+| window shrink 30 → 12 rows, then grow to 40 rows | re-anchors | re-anchors |
+| `clear-history` on the leader pane (detach prune hook) | anchored | anchored |
+| `detach-client` → `clear-history` → reattach | anchored | anchored |
+| nudge transport `C-u` → trigger text → `Tab` → `Enter` | anchored | anchored |
+| `alternate-screen off` + `aggressive-resize on` during the above | anchored | anchored |
+
+So a drift is environment-specific rather than an unconditional OMX layout bug.
+
+### Recovery
+
+Force the TUI to recompute its layout by changing the pane geometry once:
+
+```bash
+tmux resize-pane -D 1 && tmux resize-pane -U 1
+```
+
+If that restores the composer to the bottom, the pane content was fine and only the app's cached bottom anchor was stale (an anchor desync). If the drift survives a resize, it is a genuine layout bug and worth an issue.
+
+### What to attach when reporting it
+
+1. `codex --version` from the affected session (the inline-viewport anchor logic is Codex-side and version-sensitive).
+2. `tmux -V` and `tmux show -g | grep -iE 'aggressive-resize|alternate-screen|default-terminal|terminal-overrides'`.
+3. Whether the resize nudge above heals it.
+4. Whether the drift appeared while output was still streaming or only once everything was idle.
+5. Terminal emulator, `TERM`, and any wrapper in the pane (`ssh`, `script`, `asciinema`, nested multiplexer).
+
+## A multi-line assistant response is rendered as one line, or the rest of it is unreachable
+
+Symptom: a long response shows only its first line (or only its tail), scrolling back does not reveal the rest, and `/copy` still reports that it copied the *whole* response.
+
+`/copy` succeeding is the tell: the response is intact in session state, so nothing was truncated at generation time — the missing rows fell out of the terminal's **scrollback**, which is a pane property, not an OMX buffer.
+
+Measured on `tmux 3.2a` with 1500 emitted lines in an 80x24 pane:
+
+| effective `history-limit` at pane creation | lines recoverable with `capture-pane -S -` |
+|---|---|
+| 200 | 220 (visible screen + a small tail) |
+| 5000 | 1500 (all of them) |
+
+Two things follow, and both matter:
+
+1. **`history-limit` is captured when the pane is created.** Setting it afterwards — session-scoped or pane-scoped — does not grow the existing pane's scrollback. It only affects panes created later.
+2. OMX clamps `history-limit` for its own detached leader sessions to bound memory. That clamp is `5000` lines and is overridable with `OMX_TMUX_HISTORY_LIMIT` (accepted range 500–200000; anything unparseable falls back to the default rather than shrinking your transcript).
+
+### Recovery and prevention
+
+```bash
+# recover the text you cannot see right now
+/copy                       # in the Codex TUI: the full response goes to the clipboard
+
+# prevent it for future panes/sessions
+tmux set -g history-limit 20000          # or put it in ~/.tmux.conf
+OMX_TMUX_HISTORY_LIMIT=20000 omx         # raise the OMX-owned leader clamp too
+```
+
+Then start a fresh pane — the current pane keeps the scrollback size it was born with.
+
+If the response is unreachable even in a pane created with a large `history-limit`, that is a rendering defect rather than scrollback loss; attach `codex --version`, `tmux -V`, `tmux show -gv history-limit`, the pane size, and whether `/copy` returns the full text.

@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
-import { getDefaultBridge, isBridgeEnabled, resolveBridgeStateDir, type DispatchRecord, type RuntimeCommand } from '../../runtime/bridge.js';
+import { getDefaultBridge, isBridgeEnabled, isRuntimeTransportError, isStrictDispatchRecord, resolveBridgeStateDir, RuntimeBridgeError, type DispatchRecord, type RuntimeCommand } from '../../runtime/bridge.js';
+import { hasRuntimeAuthority, hasRuntimeDispatchIdentity, recordRuntimeFinalization } from './dispatch-recovery.js';
 import { appendTeamDeliveryLogForCwd } from '../delivery-log.js';
 import { isTeamReminderIntent, type TeamReminderIntent } from '../reminder-intents.js';
 import {
@@ -25,6 +26,7 @@ export interface TeamDispatchRequest {
   inbox_correlation_key?: string;
   transport_preference: TeamDispatchTransportPreference;
   fallback_allowed: boolean;
+  creation_transport?: 'legacy-json';
   status: TeamDispatchRequestStatus;
   attempt_count: number;
   created_at: string;
@@ -54,7 +56,7 @@ interface DispatchDeps {
   cwd: string;
   validateWorkerName: (name: string) => void;
   withDispatchLock: <T>(teamName: string, cwd: string, fn: () => Promise<T>) => Promise<T>;
-  readDispatchRequests: (teamName: string, cwd: string) => Promise<TeamDispatchRequest[]>;
+  readDispatchRequests: (teamName: string, cwd: string, authoritativeRecords?: readonly DispatchRecord[]) => Promise<TeamDispatchRequest[]>;
   writeDispatchRequests: (teamName: string, requests: TeamDispatchRequest[], cwd: string) => Promise<void>;
 }
 
@@ -118,6 +120,7 @@ export function normalizeDispatchRequest(
         ? raw.transport_preference
         : 'hook_preferred_with_fallback',
     fallback_allowed: raw.fallback_allowed !== false,
+    creation_transport: raw.creation_transport === 'legacy-json' ? 'legacy-json' : undefined,
     status,
     attempt_count: Number.isFinite(raw.attempt_count) ? Math.max(0, Math.floor(raw.attempt_count as number)) : 0,
     created_at: typeof raw.created_at === 'string' && raw.created_at !== '' ? raw.created_at : nowIso,
@@ -173,21 +176,27 @@ function buildDispatchMetadata(teamName: string, requestInput: TeamDispatchReque
   };
 }
 
-function executeBridgeCommand(cwd: string, command: RuntimeCommand): boolean {
+function executeBridgeCommand(deps: DispatchDeps, command: RuntimeCommand): boolean {
   if (!isBridgeEnabled()) return false;
+  if ((command.command === 'MarkNotified' || command.command === 'MarkDelivered' || command.command === 'MarkFailed')
+    && !hasRuntimeDispatchIdentity(resolveBridgeStateDir(deps.cwd), command.request_id)) return false;
   try {
-    getDefaultBridge(resolveBridgeStateDir(cwd)).execCommand(command);
+    getDefaultBridge(resolveBridgeStateDir(deps.cwd)).execCommand(command);
     return true;
-  } catch {
-    return false;
-  }
-}
-
-function hasBridgeDispatchCompat(cwd: string): boolean {
-  if (!isBridgeEnabled()) return false;
-  try {
-    return getDefaultBridge(resolveBridgeStateDir(cwd)).readCompatFile('dispatch.json') !== null;
-  } catch {
+  } catch (error) {
+    const isSchemaFailure = error instanceof RuntimeBridgeError && error.context.command === 'schema';
+    const isTransportFailure = isRuntimeTransportError(error);
+    if (command.command === 'MarkNotified' || command.command === 'MarkDelivered' || command.command === 'MarkFailed') {
+      const stateDir = resolveBridgeStateDir(deps.cwd);
+      if (!isSchemaFailure && !isTransportFailure) {
+        if (hasRuntimeDispatchIdentity(stateDir, command.request_id)) throw error;
+        return false;
+      }
+      recordRuntimeFinalization(stateDir, deps.teamName, command);
+      return false;
+    }
+    if (!isTransportFailure || (command.command === 'QueueDispatch'
+      && hasRuntimeAuthority(resolveBridgeStateDir(deps.cwd)))) throw error;
     return false;
   }
 }
@@ -210,7 +219,7 @@ export function normalizeBridgeDispatchRecord(
   const metadataTeamName = typeof metadata.team_name === 'string' && metadata.team_name.trim() !== ''
     ? metadata.team_name.trim()
     : null;
-  if (metadataTeamName !== null && metadataTeamName !== teamName) return null;
+  if (metadataTeamName !== teamName) return null;
 
   return normalizeDispatchRequest(
     teamName,
@@ -263,9 +272,21 @@ export async function enqueueDispatchRequest(
   deps.validateWorkerName(requestInput.to_worker);
 
   const queued = await deps.withDispatchLock(deps.teamName, deps.cwd, async () => {
-    const requests = await deps.readDispatchRequests(deps.teamName, deps.cwd);
+    let records: DispatchRecord[] | undefined;
+    const stateDir = resolveBridgeStateDir(deps.cwd);
+    if (isBridgeEnabled() && hasRuntimeAuthority(stateDir)) {
+      // A failed persist can commit the queue event before publishing its projection.
+      const bridge = getDefaultBridge(stateDir);
+      const snapshot = bridge.execCommand({ command: 'CaptureSnapshot' });
+      if (snapshot?.event !== 'SnapshotCaptured') throw new RuntimeBridgeError('invalid dispatch recovery acknowledgement');
+      records = snapshot.dispatch_records === undefined ? bridge.readDispatchRecordsStrict() : snapshot.dispatch_records;
+      if (!Array.isArray(records) || !records.every(isStrictDispatchRecord)) {
+        throw new RuntimeBridgeError('invalid recovered dispatch records');
+      }
+    }
+    const requests = await deps.readDispatchRequests(deps.teamName, deps.cwd, records);
     const existing = requests.find((req) => equivalentPendingDispatch(req, requestInput));
-    if (existing && (!isBridgeEnabled() || hasBridgeDispatchCompat(deps.cwd))) {
+    if (existing) {
       return { request: existing, deduped: true };
     }
 
@@ -284,7 +305,7 @@ export async function enqueueDispatchRequest(
     );
     if (!request) throw new Error('failed_to_normalize_dispatch_request');
 
-    if (executeBridgeCommand(deps.cwd, {
+    if (executeBridgeCommand(deps, {
       command: 'QueueDispatch',
       request_id: request.request_id,
       target: requestInput.to_worker,
@@ -296,6 +317,7 @@ export async function enqueueDispatchRequest(
       }
     }
 
+    request.creation_transport = 'legacy-json';
     requests.push(request);
     await deps.writeDispatchRequests(deps.teamName, requests, deps.cwd);
     return { request, deduped: false, queuedTransport: 'legacy-json' as const };
@@ -344,40 +366,65 @@ export async function transitionDispatchRequest(
   deps: DispatchDeps,
 ): Promise<TeamDispatchRequest | null> {
   return await deps.withDispatchLock(deps.teamName, deps.cwd, async () => {
-    const requests = await deps.readDispatchRequests(deps.teamName, deps.cwd);
-    const index = requests.findIndex((req) => req.request_id === requestId);
-    if (index < 0) return null;
-
-    const existing = requests[index]!;
-    if (existing.status !== from && existing.status !== to) return null;
-    if (!canTransitionDispatchStatus(existing.status, to)) return null;
-
-    const nowIso = new Date().toISOString();
-    const nextAttemptCount = Math.max(
-      existing.attempt_count,
-      Number.isFinite(patch.attempt_count)
-        ? Math.floor(patch.attempt_count as number)
-        : (existing.status === to ? existing.attempt_count : existing.attempt_count + 1),
-    );
-
-    const next = sanitizeDispatchRequestForStatus({
-      ...existing,
-      ...patch,
-      status: to,
-      attempt_count: Math.max(0, nextAttemptCount),
-      updated_at: nowIso,
-    });
-    if (to === 'notified') {
-      next.notified_at = patch.notified_at ?? nowIso;
-      next.failed_at = patch.failed_at;
+    const current = await readDispatchRequest(requestId, deps);
+    if (!current || (current.status !== from && current.status !== to)
+      || !canTransitionDispatchStatus(current.status, to)) return null;
+    if (current.status !== to) {
+      const command: RuntimeCommand | null = to === 'notified'
+        ? { command: 'MarkNotified', request_id: requestId, channel: patch.last_reason ?? 'tmux' }
+        : to === 'delivered' ? { command: 'MarkDelivered', request_id: requestId }
+          : to === 'failed' ? { command: 'MarkFailed', request_id: requestId, reason: patch.last_reason ?? 'failed' } : null;
+      if (command && executeBridgeCommand(deps, command)) {
+        return await transitionDispatchRequestLocked(requestId, to, to, {
+          ...patch,
+          attempt_count: Number.isFinite(patch.attempt_count) ? patch.attempt_count : current.attempt_count + 1,
+        }, deps);
+      }
     }
-    if (to === 'delivered') next.delivered_at = patch.delivered_at ?? nowIso;
-    if (to === 'failed') next.failed_at = patch.failed_at ?? nowIso;
-
-    requests[index] = next;
-    await deps.writeDispatchRequests(deps.teamName, requests, deps.cwd);
-    return next;
+    return await transitionDispatchRequestLocked(requestId, from, to, patch, deps);
   });
+}
+
+async function transitionDispatchRequestLocked(
+  requestId: string,
+  from: TeamDispatchRequestStatus,
+  to: TeamDispatchRequestStatus,
+  patch: Partial<TeamDispatchRequest> = {},
+  deps: DispatchDeps,
+): Promise<TeamDispatchRequest | null> {
+  const requests = await deps.readDispatchRequests(deps.teamName, deps.cwd);
+  const index = requests.findIndex((req) => req.request_id === requestId);
+  if (index < 0) return null;
+
+  const existing = requests[index]!;
+  if (existing.status !== from && existing.status !== to) return null;
+  if (!canTransitionDispatchStatus(existing.status, to)) return null;
+
+  const nowIso = new Date().toISOString();
+  const nextAttemptCount = Math.max(
+    existing.attempt_count,
+    Number.isFinite(patch.attempt_count)
+      ? Math.floor(patch.attempt_count as number)
+      : (existing.status === to ? existing.attempt_count : existing.attempt_count + 1),
+  );
+
+  const next = sanitizeDispatchRequestForStatus({
+    ...existing,
+    ...patch,
+    status: to,
+    attempt_count: Math.max(0, nextAttemptCount),
+    updated_at: nowIso,
+  });
+  if (to === 'notified') {
+    next.notified_at = patch.notified_at ?? nowIso;
+    next.failed_at = patch.failed_at;
+  }
+  if (to === 'delivered') next.delivered_at = patch.delivered_at ?? nowIso;
+  if (to === 'failed') next.failed_at = patch.failed_at ?? nowIso;
+
+  requests[index] = next;
+  await deps.writeDispatchRequests(deps.teamName, requests, deps.cwd);
+  return await readDispatchRequest(requestId, deps);
 }
 
 export async function markDispatchRequestNotified(
@@ -385,21 +432,23 @@ export async function markDispatchRequestNotified(
   patch: Partial<TeamDispatchRequest> = {},
   deps: DispatchDeps,
 ): Promise<TeamDispatchRequest | null> {
-  const current = await readDispatchRequest(requestId, deps);
-  if (!current) return null;
-  if (current.status === 'notified' || current.status === 'delivered') return current;
-  // `failed` is a terminal state per TEAM_DISPATCH_REQUEST_STATUS_TRANSITIONS —
-  // return null so callers can fall through to an explicit failed→failed
-  // reason patch instead of silently promoting via the bridge side-channel.
-  if (current.status === 'failed') return null;
-  if (executeBridgeCommand(deps.cwd, {
-    command: 'MarkNotified',
-    request_id: requestId,
-    channel: patch.last_reason ?? patch.message_id ?? 'tmux',
-  })) {
-    return await readDispatchRequest(requestId, deps) ?? current;
-  }
-  return await transitionDispatchRequest(requestId, current.status, 'notified', patch, deps);
+  return await deps.withDispatchLock(deps.teamName, deps.cwd, async () => {
+    const current = await readDispatchRequest(requestId, deps);
+    if (!current) return null;
+    if (current.status === 'notified' || current.status === 'delivered') return current;
+    // `failed` is a terminal state per TEAM_DISPATCH_REQUEST_STATUS_TRANSITIONS —
+    // return null so callers can fall through to an explicit failed→failed
+    // reason patch instead of silently promoting via the bridge side-channel.
+    if (current.status === 'failed') return null;
+    if (executeBridgeCommand(deps, {
+      command: 'MarkNotified',
+      request_id: requestId,
+      channel: patch.last_reason ?? patch.message_id ?? 'tmux',
+    })) {
+      return await readDispatchRequest(requestId, deps) ?? current;
+    }
+    return await transitionDispatchRequestLocked(requestId, current.status, 'notified', patch, deps);
+  });
 }
 
 export async function markDispatchRequestDelivered(
@@ -407,14 +456,16 @@ export async function markDispatchRequestDelivered(
   patch: Partial<TeamDispatchRequest> = {},
   deps: DispatchDeps,
 ): Promise<TeamDispatchRequest | null> {
-  const current = await readDispatchRequest(requestId, deps);
-  if (!current) return null;
-  if (current.status === 'delivered') return current;
-  if (current.status === 'failed') return null;
-  if (executeBridgeCommand(deps.cwd, { command: 'MarkDelivered', request_id: requestId })) {
-    return await readDispatchRequest(requestId, deps) ?? current;
-  }
-  return await transitionDispatchRequest(requestId, current.status, 'delivered', patch, deps);
+  return await deps.withDispatchLock(deps.teamName, deps.cwd, async () => {
+    const current = await readDispatchRequest(requestId, deps);
+    if (!current) return null;
+    if (current.status === 'delivered') return current;
+    if (!canTransitionDispatchStatus(current.status, 'delivered')) return null;
+    if (executeBridgeCommand(deps, { command: 'MarkDelivered', request_id: requestId })) {
+      return await readDispatchRequest(requestId, deps) ?? current;
+    }
+    return await transitionDispatchRequestLocked(requestId, current.status, 'delivered', patch, deps);
+  });
 }
 
 export async function markDispatchRequestFailed(
@@ -422,8 +473,11 @@ export async function markDispatchRequestFailed(
   reason: string,
   deps: DispatchDeps,
 ): Promise<void> {
-  if (executeBridgeCommand(deps.cwd, { command: 'MarkFailed', request_id: requestId, reason })) {
-    return;
-  }
-  await transitionDispatchRequest(requestId, 'pending', 'failed', { last_reason: reason }, deps);
+  return await deps.withDispatchLock(deps.teamName, deps.cwd, async () => {
+    if (!await readDispatchRequest(requestId, deps)) return;
+    if (executeBridgeCommand(deps, { command: 'MarkFailed', request_id: requestId, reason })) {
+      return;
+    }
+    await transitionDispatchRequestLocked(requestId, 'pending', 'failed', { last_reason: reason }, deps);
+  });
 }

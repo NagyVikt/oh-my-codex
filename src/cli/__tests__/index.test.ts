@@ -1,8 +1,8 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, statSync, utimesSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, readdir as fsReaddir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import {
   resolveCliInvocation,
   parseResumeCodexHomeSelection,
   isResumeCodexLaunch,
+  findResumeCodexSubcommandIndex,
   CODEX_GLOBAL_OPTIONS_WITH_SPLIT_VALUE,
   isCodexVersionRequest,
   resolveUpdateChannelArg,
@@ -38,8 +39,10 @@ import {
   collectInheritableTeamWorkerArgs,
   resolveTeamWorkerLaunchArgsEnv,
   injectModelInstructionsBypassArgs,
+  buildStartupModelInstructionsEnv,
   resolveWorkerSparkModel,
   resolveSetupInstallModeArg,
+  resolveSetupRepairPluginCacheArg,
   resolveSetupMcpModeArg,
   resolveSetupScopeArg,
   resolveSetupTeamModeArg,
@@ -55,10 +58,16 @@ import {
   buildMadmaxDetachedLaunchContextKey,
   withMadmaxDetachedContextLock,
   executeDetachedLaunchStateMachine,
+  isExactDetachedFinalization,
   type DetachedLaunchDependencies,
+  type DetachedReleaseFailureResolution,
   resolveOmxRootForLaunch,
   resolveDisposableWorktreeOmxRootForLaunch,
   prepareCodexHomeForLaunch,
+  prepareRuntimeCodexHomeForProjectLaunch,
+  historyDestinationMode,
+  acquireHistoryPersistenceLock,
+  releaseHistoryPersistenceLock,
   captureMadmaxWorktreeRuntimeContext,
   persistProjectLaunchRuntimeAuthState,
   persistProjectLaunchRuntimeProjectTrustState,
@@ -97,6 +106,9 @@ import {
   prependOmxRuntimeCommandShimToEnv,
   CODEX_SQLITE_HOME_ENV,
   DETACHED_TMUX_HISTORY_LIMIT,
+  DETACHED_TMUX_HISTORY_LIMIT_MAX,
+  DETACHED_TMUX_HISTORY_LIMIT_MIN,
+  resolveDetachedTmuxHistoryLimit,
   isExistingTmuxWindowTooCrampedForLaunchHud,
   guardDetachedHudDeferredMutation,
   DETACHED_LAUNCH_CONTROL_PLANE_KEYS,
@@ -140,6 +152,19 @@ function expectedLowComplexityModel(codexHomeOverride?: string): string {
 
 afterEach(() => {
   mock.restoreAll();
+});
+
+it('finds the actual resume command rather than a global option value', () => {
+  assert.equal(findResumeCodexSubcommandIndex(['--model', 'resume', 'resume', '01234567-89ab-cdef-0123-456789abcdef']), 2);
+  assert.equal(findResumeCodexSubcommandIndex(['--model', 'resume', 'exec', 'resume']), -1);
+  assert.equal(findResumeCodexSubcommandIndex(['resume', '--', 'literal']), 0);
+});
+
+it('does not classify `omx --add-dir resume` as a resume launch (top-level handler uses findResumeCodexSubcommandIndex)', () => {
+  assert.equal(findResumeCodexSubcommandIndex(['--add-dir', 'resume']), -1);
+  assert.equal(findResumeCodexSubcommandIndex(['--add-dir=resume']), -1);
+  assert.equal(findResumeCodexSubcommandIndex(['--add-dir', 'resume', 'resume']), 2);
+  assert.equal(isResumeCodexLaunch(['--add-dir', 'resume']), false);
 });
 
 describe("madmax state isolation", () => {
@@ -306,7 +331,7 @@ describe("madmax state isolation", () => {
     const runs = await mkdtemp(join(tmpdir(), "omx-madmax-runs-"));
     try {
       const runDir = createMadmaxIsolatedRoot(wd, ["--madmax"], { OMX_RUNS_DIR: runs });
-      assert.equal(runDir.startsWith(runs), true);
+      assert.equal(runDir.startsWith(await realpath(runs)), true);
       assert.equal(existsSync(join(wd, ".omx")), false);
       const metadata = JSON.parse(await readFile(join(runDir, ".omxbox-run.json"), "utf-8"));
       assert.equal(metadata.source_cwd, wd);
@@ -523,6 +548,102 @@ describe("detached launch state machine", () => {
       });
       assert.ok(events.includes("rollback"));
       assert.equal(events.includes("D10"), false);
+    });
+  }
+
+  for (const failure of ["D3", "D4", "D5", "D6", "D7", "D9"] as const) {
+    it(`passes authenticated finalized failure authority to rollback when ${failure} fails`, async () => {
+      const events: string[] = [];
+      const deps = createDependencies(events, failure);
+      let finalization: unknown;
+      deps.rollback = async (_ownedRecord, _report, observedFinalization) => {
+        events.push("rollback");
+        finalization = observedFinalization;
+      };
+      await assert.rejects(executeDetachedLaunchStateMachine(
+        { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
+        deps,
+      ));
+      assert.deepEqual(finalization, {
+        nonce: "nonce",
+        sessionId: "session",
+        sessionName: "session-name",
+        leaderPid: 123,
+        kind: "failed",
+      });
+      assert.equal(events.includes("rollback"), true);
+    });
+
+    it(`preserves the leader and does not roll back when ${failure} finalization is malformed`, async () => {
+      const events: string[] = [];
+      const deps = createDependencies(events, failure);
+      deps.abortAndAwaitFinalization = async () => ({
+        acknowledged: true,
+        nonce: "nonce",
+        sessionName: "session-name",
+        leaderPid: 123,
+        kind: "failed",
+      });
+      await assert.rejects(executeDetachedLaunchStateMachine(
+        { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
+        deps,
+      ));
+      assert.equal(events.includes("rollback"), false);
+    });
+  }
+
+  it("routes an exact D9 terminal finalization to HUD-only cleanup instead of session rollback", async () => {
+    const events: string[] = [];
+    const deps = createDependencies(events, "D9");
+    deps.abortAndAwaitFinalization = async () => ({
+      acknowledged: true,
+      nonce: "nonce",
+      sessionId: "session",
+      sessionName: "session-name",
+      leaderPid: 123,
+      kind: "terminal",
+    });
+    let finalization: Parameters<typeof deps.rollback>[2];
+    deps.rollback = async (_ownedRecord, _report, observedFinalization) => {
+      events.push("hud-only-cleanup");
+      finalization = observedFinalization;
+    };
+    await assert.rejects(executeDetachedLaunchStateMachine(
+      { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
+      deps,
+    ));
+    assert.equal(isExactDetachedFinalization(finalization, {
+      nonce: "nonce",
+      sessionId: "session",
+      sessionName: "session-name",
+      leaderPid: 123,
+    }), true);
+    assert.equal(finalization?.kind, "terminal");
+    assert.deepEqual(events.slice(-2), ["D9", "hud-only-cleanup"]);
+  });
+  for (const kind of ["malformed", "", "FAILED", "terminal ", "terminalized"] as const) {
+    it(`never grants HUD-only rollback authority when a matching report kind is "${kind}"`, async () => {
+      const events: string[] = [];
+      const deps = createDependencies(events, "D9");
+      deps.abortAndAwaitFinalization = async () => ({
+        acknowledged: true,
+        nonce: "nonce",
+        sessionId: "session",
+        sessionName: "session-name",
+        leaderPid: 123,
+        kind,
+      } as unknown as DetachedReleaseFailureResolution);
+      let observedFinalization: Parameters<typeof deps.rollback>[2];
+      deps.rollback = async (_ownedRecord, _report, finalization) => {
+        events.push("rollback");
+        observedFinalization = finalization;
+      };
+      await assert.rejects(() => executeDetachedLaunchStateMachine(
+        { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
+        deps,
+      ));
+      assert.equal(observedFinalization, undefined);
+      assert.equal(events.includes("rollback"), false, `kind ${JSON.stringify(kind)} must never reach rollback`);
     });
   }
 
@@ -2326,6 +2447,7 @@ describe("commandOwnsLocalHelp", () => {
       "code-intel",
       "team",
       "tmux-hook",
+      "native-runtime",
     ]) {
       assert.equal(
         commandOwnsLocalHelp(command),
@@ -2432,6 +2554,13 @@ describe("resolveCliInvocation", () => {
     });
   });
 
+  it("resolves native-runtime to its foreground command", () => {
+    assert.deepEqual(resolveCliInvocation(["native-runtime", "hydrate"]), {
+      command: "native-runtime",
+      launchArgs: [],
+    });
+  });
+
   it("resolves update channel flags and rejects invalid combinations", () => {
     assert.equal(resolveUpdateChannelArg([]), "stable");
     assert.equal(resolveUpdateChannelArg(["--stable"]), "stable");
@@ -2501,6 +2630,10 @@ describe("resolveCliInvocation", () => {
     assert.match(HELP, /omx update --dev\s+Install the upstream dev branch, then refresh setup/);
   });
 
+  it("advertises the foreground native runtime repair command", () => {
+    assert.match(HELP, /omx native-runtime hydrate\s+Retry native runtime cache hydration in the foreground and report errors/);
+  });
+
   it("scopes Ralplan authority preflight in top-level help", () => {
     assert.match(HELP, /omx ralplan\s+Adapted Ralplan authority support; preflight applies only when native role routing is unavailable\s+and adapted Ralplan authority is requested/);
     assert.doesNotMatch(HELP, /Record validated role intents/);
@@ -2567,6 +2700,20 @@ describe("resolveSetupInstallModeArg", () => {
     assert.throws(
       () => resolveSetupInstallModeArg(["--legacy", "--install-mode=plugin"]),
       /Conflicting setup install mode flags/,
+    );
+  });
+});
+
+describe("resolveSetupRepairPluginCacheArg", () => {
+  it("recognizes the scoped plugin-cache repair flag", () => {
+    assert.equal(resolveSetupRepairPluginCacheArg(["--plugin"]), false);
+    assert.equal(
+      resolveSetupRepairPluginCacheArg(["--plugin", "--repair-plugin-cache"]),
+      true,
+    );
+    assert.throws(
+      () => resolveSetupRepairPluginCacheArg(["--repair-plugin-cache=true"]),
+      /--repair-plugin-cache does not accept a value/,
     );
   });
 });
@@ -2986,6 +3133,436 @@ describe("project launch scope helpers", () => {
     }
   });
 
+  it("materializes resolved history links and skips broken links", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-symlinks-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const targetSessions = join(wd, "project-sessions");
+      const nestedSessions = join(targetSessions, "nested");
+      const targetHistory = join(wd, "project-history.jsonl");
+      const outsideHistory = join(wd, "outside-history.jsonl");
+      await mkdir(sourceCodexHome, { recursive: true });
+      await mkdir(nestedSessions, { recursive: true });
+      await writeFile(join(nestedSessions, "rollout-linked.jsonl"), "linked-session\n");
+      await writeFile(outsideHistory, "must-not-follow\n");
+      await symlink(outsideHistory, join(nestedSessions, "nested-escape.jsonl"));
+      await writeFile(targetHistory, '{"session_id":"linked-session"}\n');
+      const sessionsMtime = new Date("2024-06-07T08:09:10Z");
+      chmodSync(targetSessions, 0o700);
+      chmodSync(nestedSessions, 0o700);
+      utimesSync(targetSessions, sessionsMtime, sessionsMtime);
+      await symlink(targetSessions, join(sourceCodexHome, "sessions"), "dir");
+      await symlink(targetHistory, join(sourceCodexHome, "history.jsonl"));
+      await symlink(join(wd, "missing-session-index.jsonl"), join(sourceCodexHome, "session_index.jsonl"));
+      const createSymlink: typeof symlink = async () => {
+        throw new Error("history symlink creation must not be used");
+      };
+
+      const runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-symlinks",
+        sourceCodexHome,
+        { includeHistoryArtifacts: true, createSymlink },
+      );
+
+      assert.equal((await stat(join(runtimeCodexHome, "sessions"))).isDirectory(), true);
+      assert.equal((await lstat(join(runtimeCodexHome, "sessions"))).isSymbolicLink(), false);
+      assert.equal((await stat(join(runtimeCodexHome, "sessions"))).mtime.toISOString(), sessionsMtime.toISOString());
+      if (process.platform !== "win32") {
+        assert.equal((await stat(join(runtimeCodexHome, "sessions"))).mode & 0o777, 0o700);
+        assert.equal((await stat(join(runtimeCodexHome, "sessions", "nested"))).mode & 0o777, 0o700);
+      }
+      assert.equal(
+        await readFile(join(runtimeCodexHome, "sessions", "nested", "rollout-linked.jsonl"), "utf-8"),
+        "linked-session\n",
+      );
+      assert.equal(existsSync(join(runtimeCodexHome, "sessions", "nested", "nested-escape.jsonl")), false);
+      assert.equal((await lstat(join(runtimeCodexHome, "history.jsonl"))).isSymbolicLink(), false);
+      assert.equal(await readFile(join(runtimeCodexHome, "history.jsonl"), "utf-8"), '{"session_id":"linked-session"}\n');
+      assert.equal(existsSync(join(runtimeCodexHome, "session_index.jsonl")), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("skips same-inode history content mutations during file publication", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-content-race-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const sourceHistory = join(wd, "source-history.jsonl");
+      await mkdir(sourceCodexHome, { recursive: true });
+      await writeFile(sourceHistory, "original\n");
+      await symlink(sourceHistory, join(sourceCodexHome, "history.jsonl"));
+      const originalStat = statSync(sourceHistory);
+      const runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-content-race",
+        sourceCodexHome,
+        {
+          includeHistoryArtifacts: true,
+          afterHistorySourceOpen: async (entryName, source) => {
+            if (entryName !== "history.jsonl") return;
+            await writeFile(source, "mutated!\n");
+            utimesSync(source, originalStat.atime, originalStat.mtime);
+          },
+        },
+      );
+      assert.equal(existsSync(join(runtimeCodexHome, "history.jsonl")), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("merges a symlinked primary history tree with an independent source", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-symlink-merge-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const primarySessions = join(wd, "primary-sessions");
+      const extraCodexHome = join(wd, "extra-codex-home");
+      await mkdir(sourceCodexHome, { recursive: true });
+      await mkdir(primarySessions, { recursive: true });
+      await mkdir(join(extraCodexHome, "sessions"), { recursive: true });
+      await writeFile(join(primarySessions, "rollout-primary.jsonl"), "primary-session\n");
+      await writeFile(join(extraCodexHome, "sessions", "rollout-extra.jsonl"), "extra-session\n");
+      chmodSync(primarySessions, 0o700);
+      chmodSync(join(extraCodexHome, "sessions"), 0o755);
+      await symlink(primarySessions, join(sourceCodexHome, "sessions"), "dir");
+
+      const runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-symlink-merge",
+        sourceCodexHome,
+        { includeHistoryArtifacts: true, extraHistoryCodexHomes: [extraCodexHome] },
+      );
+
+      assert.equal((await lstat(join(runtimeCodexHome, "sessions"))).isSymbolicLink(), false);
+      if (process.platform !== "win32") {
+        assert.equal((await stat(join(runtimeCodexHome, "sessions"))).mode & 0o777, 0o700);
+      }
+      assert.equal(
+        await readFile(join(runtimeCodexHome, "sessions", "rollout-primary.jsonl"), "utf-8"),
+        "primary-session\n",
+      );
+      assert.equal(
+        await readFile(join(runtimeCodexHome, "sessions", "rollout-extra.jsonl"), "utf-8"),
+        "extra-session\n",
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("populates read-only history directories before restoring modes", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-read-only-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const sourceSessions = join(wd, "source-sessions");
+      const nestedSessions = join(sourceSessions, "nested");
+      const sourceMtime = new Date("2024-08-09T10:11:12Z");
+      const nestedMtime = new Date("2024-08-09T10:11:13Z");
+      await mkdir(nestedSessions, { recursive: true });
+      await writeFile(join(nestedSessions, "rollout.jsonl"), "read-only-session\n");
+      utimesSync(sourceSessions, sourceMtime, sourceMtime);
+      utimesSync(nestedSessions, nestedMtime, nestedMtime);
+      chmodSync(sourceSessions, 0o555);
+      chmodSync(nestedSessions, 0o500);
+      await mkdir(sourceCodexHome, { recursive: true });
+      await symlink(sourceSessions, join(sourceCodexHome, "sessions"), "dir");
+
+      const readOnlyRuntimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-read-only",
+        sourceCodexHome,
+        { includeHistoryArtifacts: true },
+      );
+
+      assert.equal(
+        await readFile(join(readOnlyRuntimeCodexHome, "sessions", "nested", "rollout.jsonl"), "utf-8"),
+        "read-only-session\n",
+      );
+      if (process.platform !== "win32") {
+        const copiedSessions = await stat(join(readOnlyRuntimeCodexHome, "sessions"));
+        const copiedNested = await stat(join(readOnlyRuntimeCodexHome, "sessions", "nested"));
+        assert.equal(copiedSessions.mode & 0o777, 0o555);
+        assert.equal(copiedNested.mode & 0o777, 0o500);
+        assert.equal(copiedSessions.mtime.toISOString(), sourceMtime.toISOString());
+        assert.equal(copiedNested.mtime.toISOString(), nestedMtime.toISOString());
+      }
+    } finally {
+      if (existsSync(join(wd, "source-sessions"))) chmodSync(join(wd, "source-sessions"), 0o700);
+      if (existsSync(join(wd, "source-sessions", "nested"))) chmodSync(join(wd, "source-sessions", "nested"), 0o700);
+      if (existsSync(join(wd, ".omx", "runtime", "codex-home"))) {
+        chmodSync(join(wd, ".omx", "runtime", "codex-home"), 0o700);
+      }
+      if (existsSync(join(wd, ".omx", "runtime", "codex-home", "session-history-read-only", "sessions"))) {
+        chmodSync(join(wd, ".omx", "runtime", "codex-home", "session-history-read-only", "sessions"), 0o700);
+      }
+      if (existsSync(join(wd, ".omx", "runtime", "codex-home", "session-history-read-only", "sessions", "nested"))) {
+        chmodSync(join(wd, ".omx", "runtime", "codex-home", "session-history-read-only", "sessions", "nested"), 0o700);
+      }
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("anchors cleanup locking in a writable resolved history target", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-writable-anchor-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      const resolvedSessions = join(projectCodexHome, "sessions-target");
+      const runtimeCodexHome = join(wd, "runtime-codex-home");
+      await mkdir(resolvedSessions, { recursive: true });
+      await mkdir(join(runtimeCodexHome, "sessions"), { recursive: true });
+      await writeFile(join(runtimeCodexHome, "sessions", "rollout.jsonl"), "read-only-root-safe\n");
+      await symlink(resolvedSessions, join(projectCodexHome, "sessions"), "dir");
+      chmodSync(projectCodexHome, 0o555);
+
+      await cleanupRuntimeCodexHome(runtimeCodexHome, projectCodexHome);
+
+      assert.equal(
+        await readFile(join(resolvedSessions, "rollout.jsonl"), "utf-8"),
+        "read-only-root-safe\n",
+      );
+    } finally {
+      if (existsSync(join(wd, ".codex"))) chmodSync(join(wd, ".codex"), 0o700);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("skips an extra history home that disappears during preparation", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-disappearing-extra-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const sourceSessions = join(wd, "source-sessions");
+      const extraCodexHome = join(wd, "extra-codex-home");
+      await mkdir(sourceCodexHome, { recursive: true });
+      await mkdir(sourceSessions, { recursive: true });
+      await mkdir(join(extraCodexHome, "sessions"), { recursive: true });
+      await writeFile(join(sourceSessions, "rollout-primary.jsonl"), "primary-session\n");
+      await writeFile(join(extraCodexHome, "sessions", "rollout-extra.jsonl"), "extra-session\n");
+      await symlink(sourceSessions, join(sourceCodexHome, "sessions"), "dir");
+
+      const runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-disappearing-extra",
+        sourceCodexHome,
+        {
+          includeHistoryArtifacts: true,
+          extraHistoryCodexHomes: [extraCodexHome],
+          afterHistoryEntryValidation: async (entryName) => {
+            if (entryName === "sessions") await rm(join(extraCodexHome, "sessions"), { recursive: true, force: true });
+          },
+        },
+      );
+
+      assert.equal(
+        await readFile(join(runtimeCodexHome, "sessions", "rollout-primary.jsonl"), "utf-8"),
+        "primary-session\n",
+      );
+      assert.equal(existsSync(join(runtimeCodexHome, "sessions", "rollout-extra.jsonl")), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps group-only history readable and traversable by the destination owner", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-group-only-"));
+    let runtimeCodexHome: string | undefined;
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const sourceSessions = join(wd, "source-sessions");
+      await mkdir(sourceSessions, { recursive: true });
+      await writeFile(join(sourceSessions, "rollout.jsonl"), "group-only-session\n");
+      if (process.platform !== "win32") {
+        chownSync(sourceSessions, process.getuid!(), process.getgid!());
+        chownSync(join(sourceSessions, "rollout.jsonl"), process.getuid!(), process.getgid!());
+      }
+      chmodSync(join(sourceSessions, "rollout.jsonl"), 0o404);
+      chmodSync(sourceSessions, 0o505);
+      await mkdir(sourceCodexHome, { recursive: true });
+      await symlink(sourceSessions, join(sourceCodexHome, "sessions"), "dir");
+
+      runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-group-only",
+        sourceCodexHome,
+        { includeHistoryArtifacts: true },
+      );
+
+      assert.equal(
+        await readFile(join(runtimeCodexHome, "sessions", "rollout.jsonl"), "utf-8"),
+        "group-only-session\n",
+      );
+      if (process.platform !== "win32") {
+        assert.equal((await stat(join(runtimeCodexHome, "sessions"))).mode & 0o700, 0o500);
+        assert.equal((await stat(join(runtimeCodexHome, "sessions", "rollout.jsonl"))).mode & 0o700, 0o400);
+      }
+    } finally {
+      if (existsSync(join(wd, "source-sessions", "rollout.jsonl"))) chmodSync(join(wd, "source-sessions", "rollout.jsonl"), 0o600);
+      if (existsSync(join(wd, "source-sessions"))) chmodSync(join(wd, "source-sessions"), 0o700);
+      if (runtimeCodexHome && existsSync(join(runtimeCodexHome, "sessions"))) {
+        chmodSync(join(runtimeCodexHome, "sessions"), 0o700);
+        if (existsSync(join(runtimeCodexHome, "sessions", "rollout.jsonl"))) {
+          chmodSync(join(runtimeCodexHome, "sessions", "rollout.jsonl"), 0o600);
+        }
+      }
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes group-owned replacement modes for the new owner", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-owner-mode-"));
+    try {
+      const groupWritable = join(wd, "group-writable.jsonl");
+      const groupReadable = join(wd, "group-readable.jsonl");
+      await writeFile(groupWritable, "group-writable\n");
+      await writeFile(groupReadable, "group-readable\n");
+      chmodSync(groupWritable, 0o660);
+      chmodSync(groupReadable, 0o440);
+
+      const writableMode = historyDestinationMode(0o060);
+      const readableMode = historyDestinationMode(0o040);
+      assert.equal(writableMode & 0o700, 0o600);
+      assert.equal(readableMode & 0o700, 0o400);
+      chmodSync(groupWritable, writableMode);
+      chmodSync(groupReadable, readableMode);
+      await writeFile(groupWritable, "owner-can-append\n", { flag: "a" });
+      assert.match(await readFile(groupWritable, "utf-8"), /owner-can-append/);
+      assert.equal(await readFile(groupReadable, "utf-8"), "group-readable\n");
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("skips cyclic durable history links without aborting preparation", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-cyclic-link-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      await mkdir(join(sourceCodexHome, "sessions"), { recursive: true });
+      await symlink("history.jsonl", join(sourceCodexHome, "history.jsonl"));
+
+      const runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-cyclic-link",
+        sourceCodexHome,
+        { includeHistoryArtifacts: true },
+      );
+
+      assert.equal(existsSync(join(runtimeCodexHome, "history.jsonl")), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects source swaps and replaces nested destination links safely", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-toctou-"));
+    try {
+      const sourceCodexHome = join(wd, "source-codex-home");
+      const sourceSessions = join(wd, "source-sessions");
+      const replacementSessions = join(wd, "replacement-sessions");
+      const outsideDestination = join(wd, "outside-destination.jsonl");
+      await mkdir(sourceCodexHome, { recursive: true });
+      await mkdir(sourceSessions, { recursive: true });
+      await mkdir(replacementSessions, { recursive: true });
+      await writeFile(join(sourceSessions, "rollout.jsonl"), "original\n");
+      await writeFile(join(replacementSessions, "rollout.jsonl"), "replacement\n");
+      await writeFile(outsideDestination, "must-remain\n");
+      await symlink(sourceSessions, join(sourceCodexHome, "sessions"), "dir");
+
+      const swappedSourceRuntime = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-source-swap",
+        sourceCodexHome,
+        {
+          includeHistoryArtifacts: true,
+          afterHistoryEntryValidation: async (entryName, source) => {
+            if (entryName !== "sessions") return;
+            await rm(source, { force: true });
+            await symlink(replacementSessions, source, "dir");
+          },
+        },
+      );
+      assert.equal(existsSync(join(swappedSourceRuntime, "sessions")), false);
+      assert.equal(existsSync(join(swappedSourceRuntime, "sessions", "rollout.jsonl")), false);
+
+      const destinationSourceHome = join(wd, "destination-source-home");
+      const destinationSessions = join(wd, "destination-sessions");
+      await mkdir(destinationSourceHome, { recursive: true });
+      await mkdir(destinationSessions, { recursive: true });
+      await writeFile(join(destinationSessions, "rollout.jsonl"), "destination-safe\n");
+      await symlink(destinationSessions, join(destinationSourceHome, "sessions"), "dir");
+      const safeDestinationRuntime = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-destination-swap",
+        destinationSourceHome,
+        {
+          includeHistoryArtifacts: true,
+          afterHistoryEntryValidation: async (entryName, _source, destination) => {
+            if (entryName !== "sessions") return;
+            await mkdir(destination, { recursive: true });
+            await symlink(outsideDestination, join(destination, "rollout.jsonl"));
+          },
+        },
+      );
+      assert.equal(await readFile(join(outsideDestination), "utf-8"), "must-remain\n");
+      assert.equal(
+        await readFile(join(safeDestinationRuntime, "sessions", "rollout.jsonl"), "utf-8"),
+        "destination-safe\n",
+      );
+      assert.equal((await lstat(join(safeDestinationRuntime, "sessions", "rollout.jsonl"))).isSymbolicLink(), false);
+
+      const emptyDestinationSourceHome = join(wd, "empty-destination-source-home");
+      const emptyDestinationSessions = join(wd, "empty-destination-sessions");
+      await mkdir(emptyDestinationSourceHome, { recursive: true });
+      await mkdir(emptyDestinationSessions, { recursive: true });
+      await writeFile(join(emptyDestinationSessions, "rollout.jsonl"), "empty-destination-safe\n");
+      await symlink(emptyDestinationSessions, join(emptyDestinationSourceHome, "sessions"), "dir");
+      const emptyDestinationRuntime = await prepareRuntimeCodexHomeForProjectLaunch(
+        wd,
+        "session-history-empty-destination-swap",
+        emptyDestinationSourceHome,
+        {
+          includeHistoryArtifacts: true,
+          afterHistoryEntryValidation: async (entryName, _source, destination) => {
+            if (entryName === "sessions") await mkdir(destination, { recursive: true });
+          },
+        },
+      );
+      assert.equal(
+        await readFile(join(emptyDestinationRuntime, "sessions", "rollout.jsonl"), "utf-8"),
+        "empty-destination-safe\n",
+      );
+
+      const stagedSourceHome = join(wd, "staged-source-home");
+      const stagedSessions = join(wd, "staged-sessions");
+      const outsideStageDirectory = join(wd, "outside-stage-directory");
+      await mkdir(stagedSourceHome, { recursive: true });
+      await mkdir(stagedSessions, { recursive: true });
+      await mkdir(outsideStageDirectory, { recursive: true });
+      await writeFile(join(stagedSessions, "rollout.jsonl"), "staged-safe\n");
+      await writeFile(join(outsideStageDirectory, "sentinel"), "must-remain\n");
+      await symlink(stagedSessions, join(stagedSourceHome, "sessions"), "dir");
+      await assert.rejects(
+        () => prepareRuntimeCodexHomeForProjectLaunch(
+          wd,
+          "session-history-staging-swap",
+          stagedSourceHome,
+          {
+            includeHistoryArtifacts: true,
+            afterHistoryEntryStage: async (entryName, temporary) => {
+              if (entryName !== "sessions") return;
+              await rm(temporary, { recursive: true, force: true });
+              await symlink(outsideStageDirectory, temporary, "dir");
+            },
+          },
+        ),
+        /history staging path is not a directory/,
+      );
+      assert.equal(await readFile(join(outsideStageDirectory, "sentinel"), "utf-8"), "must-remain\n");
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("copies non-symlink runtime Codex transcript artifacts before cleanup", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-copyback-"));
     try {
@@ -3022,8 +3599,151 @@ describe("project launch scope helpers", () => {
       );
       assert.equal(await readFile(join(projectCodexHome, "history.jsonl"), "utf-8"), '{"session_id":"session-2835"}\n');
       assert.equal(await readFile(join(projectCodexHome, "session_index.jsonl"), "utf-8"), '{"id":"session-2835"}\n');
-      assert.equal(await readFile(join(projectCodexHome, "auth.json"), "utf-8"), '{"token":"opaque"}\n');
+      // Issue #3629: runtime auth.json is never persisted into the project.
+      assert.equal(existsSync(join(projectCodexHome, "auth.json")), false);
       assert.equal(existsSync(runtimeCodexHome), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("persists materialized sessions through symlinked authorized roots", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-persist-symlink-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      const projectCodexHomeReal = join(wd, ".codex-real");
+      const projectSessions = join(projectCodexHomeReal, "sessions-target");
+      const runtimeCodexHome = join(wd, "runtime-codex-home");
+      await mkdir(projectSessions, { recursive: true });
+      await mkdir(join(runtimeCodexHome, "sessions", "2026"), { recursive: true });
+      await symlink(projectCodexHomeReal, projectCodexHome, "dir");
+      await symlink(projectSessions, join(projectCodexHomeReal, "sessions"), "dir");
+      await writeFile(join(runtimeCodexHome, "sessions", "2026", "rollout.jsonl"), "persisted-session\n");
+
+      await cleanupRuntimeCodexHome(runtimeCodexHome, projectCodexHome);
+
+      assert.equal(
+        await readFile(join(projectSessions, "2026", "rollout.jsonl"), "utf-8"),
+        "persisted-session\n",
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not rewrite canonical history when runtime and project paths alias", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-self-copyback-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      const runtimeAlias = join(wd, "runtime-alias");
+      await mkdir(projectCodexHome, { recursive: true });
+      await writeFile(join(projectCodexHome, "history.jsonl"), '{"session_id":"existing"}\n');
+      await symlink(projectCodexHome, runtimeAlias, "dir");
+
+      await cleanupRuntimeCodexHome(runtimeAlias, projectCodexHome);
+
+      assert.equal(
+        await readFile(join(projectCodexHome, "history.jsonl"), "utf-8"),
+        '{"session_id":"existing"}\n',
+      );
+      assert.equal(existsSync(runtimeAlias), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes concurrent JSONL cleanup appends without losing either source", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-concurrent-copyback-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      const runtimeOne = join(wd, "runtime-one");
+      const runtimeTwo = join(wd, "runtime-two");
+      await mkdir(runtimeOne, { recursive: true });
+      await mkdir(runtimeTwo, { recursive: true });
+      await writeFile(join(runtimeOne, "history.jsonl"), '{"session_id":"one"}\n');
+      await writeFile(join(runtimeTwo, "history.jsonl"), '{"session_id":"two"}\n');
+
+      await Promise.all([
+        cleanupRuntimeCodexHome(runtimeOne, projectCodexHome),
+        cleanupRuntimeCodexHome(runtimeTwo, projectCodexHome),
+      ]);
+
+      const persisted = await readFile(join(projectCodexHome, "history.jsonl"), "utf-8");
+      assert.match(persisted, /"session_id":"one"/);
+      assert.match(persisted, /"session_id":"two"/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a live history lock through its stale age", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-lock-lease-"));
+    try {
+      const first = await acquireHistoryPersistenceLock(wd, { staleMs: 30, heartbeatMs: 5 });
+      let contenderAcquired = false;
+      const contender = acquireHistoryPersistenceLock(wd, { timeoutMs: 500, staleMs: 30, heartbeatMs: 5 }).then((lease) => {
+        contenderAcquired = true;
+        return lease;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(contenderAcquired, false);
+      await releaseHistoryPersistenceLock(first);
+      const second = await contender;
+      await releaseHistoryPersistenceLock(second);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an old lock owner remove a replacement lock", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-lock-owner-"));
+    try {
+      const oldLease = await acquireHistoryPersistenceLock(wd);
+      await rm(oldLease.lockPath, { recursive: true, force: true });
+      const newLease = await acquireHistoryPersistenceLock(wd);
+      await releaseHistoryPersistenceLock(oldLease);
+      assert.equal((await lstat(newLease.lockPath)).isDirectory(), true);
+      await releaseHistoryPersistenceLock(newLease);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when a heartbeat owner record is interposed", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-lock-heartbeat-"));
+    try {
+      const first = await acquireHistoryPersistenceLock(wd, { staleMs: 30, heartbeatMs: 5 });
+      const ownerPath = join(first.lockPath, "owner.json");
+      await writeFile(ownerPath, "{\"token\":");
+      utimesSync(ownerPath, new Date(Date.now() - 1_000), new Date(Date.now() - 1_000));
+      await assert.rejects(
+        () => acquireHistoryPersistenceLock(wd, { timeoutMs: 100, staleMs: 30, heartbeatMs: 5 }),
+        /timed out waiting for history persistence lock/,
+      );
+      await releaseHistoryPersistenceLock(first);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("reaps a stale lock only when process-start identity proves PID reuse", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-runtime-history-lock-pid-"));
+    try {
+      const lockPath = join(wd, ".omx-history.lock");
+      const ownerPath = join(lockPath, "owner.json");
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(ownerPath, JSON.stringify({ token: "old", pid: process.pid, startIdentity: "reused" }));
+      utimesSync(ownerPath, new Date(Date.now() - 1_000), new Date(Date.now() - 1_000));
+      if (process.platform === "linux") {
+        const lease = await acquireHistoryPersistenceLock(wd, { staleMs: 30 });
+        await releaseHistoryPersistenceLock(lease);
+      } else {
+        await assert.rejects(
+          acquireHistoryPersistenceLock(wd, { staleMs: 30, timeoutMs: 100 }),
+          /timed out waiting for history persistence lock/,
+        );
+        assert.equal(JSON.parse(await readFile(ownerPath, "utf-8")).token, "old");
+      }
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3092,7 +3812,68 @@ describe("project launch scope helpers", () => {
     }
   });
 
-  it("persists project-scope Codex auth written into the runtime CODEX_HOME mirror", async () => {
+  it("preserves exactly one user-global AGENTS file in project-scope runtime homes", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-launch-runtime-agents-"));
+    const fakeUserHome = await mkdtemp(join(tmpdir(), "omx-launch-user-agents-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      const userCodexHome = join(fakeUserHome, ".codex");
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await mkdir(userCodexHome, { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      await writeFile(join(projectCodexHome, "AGENTS.md"), "project-local collision\n");
+      await writeFile(join(projectCodexHome, "AGENTS.override.md"), "project-local override collision\n");
+      await writeFile(join(userCodexHome, "AGENTS.md"), "user global fallback\n");
+      await writeFile(join(userCodexHome, "AGENTS.override.md"), "user global override\n", { mode: 0o600 });
+
+      const overridePrepared = await prepareCodexHomeForLaunch(wd, "session-agents-override", {
+        HOME: fakeUserHome,
+      });
+      assert.equal(
+        await readFile(join(overridePrepared.codexHomeOverride!, "AGENTS.override.md"), "utf-8"),
+        "user global override\n",
+      );
+      assert.equal(existsSync(join(overridePrepared.codexHomeOverride!, "AGENTS.md")), false);
+      if (process.platform !== "win32") {
+        assert.equal(
+          (await stat(join(overridePrepared.codexHomeOverride!, "AGENTS.override.md"))).mode & 0o777,
+          0o600,
+        );
+      }
+
+      await writeFile(join(userCodexHome, "AGENTS.override.md"), " \n\t\n");
+      const fallbackPrepared = await prepareCodexHomeForLaunch(wd, "session-agents-fallback", {
+        HOME: fakeUserHome,
+      });
+      assert.equal(
+        await readFile(join(fallbackPrepared.codexHomeOverride!, "AGENTS.md"), "utf-8"),
+        "user global fallback\n",
+      );
+      assert.equal(existsSync(join(fallbackPrepared.codexHomeOverride!, "AGENTS.override.md")), false);
+
+      await rm(join(userCodexHome, "AGENTS.override.md"));
+      await rm(join(userCodexHome, "AGENTS.md"));
+      const absentPrepared = await prepareCodexHomeForLaunch(wd, "session-agents-absent", {
+        HOME: fakeUserHome,
+      });
+      assert.equal(existsSync(join(absentPrepared.codexHomeOverride!, "AGENTS.md")), false);
+      assert.equal(existsSync(join(absentPrepared.codexHomeOverride!, "AGENTS.override.md")), false);
+      assert.equal(await readFile(join(projectCodexHome, "AGENTS.md"), "utf-8"), "project-local collision\n");
+      assert.equal(
+        await readFile(join(projectCodexHome, "AGENTS.override.md"), "utf-8"),
+        "project-local override collision\n",
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(fakeUserHome, { recursive: true, force: true });
+    }
+  });
+
+  it("never persists runtime CODEX_HOME auth into the project (issue #3629)", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-launch-runtime-auth-home-"));
     try {
       const projectCodexHome = join(wd, ".codex");
@@ -3115,8 +3896,73 @@ describe("project launch scope helpers", () => {
         prepared.projectLocalCodexHomeForCleanup,
       );
 
-      assert.equal(await readFile(join(projectCodexHome, "auth.json"), "utf-8"), opaqueAuthState);
+      // Credentials never reach the durable project directory.
+      assert.equal(existsSync(join(projectCodexHome, "auth.json")), false);
+      // Non-secret config persistence is unchanged.
       assert.equal(await readFile(join(projectCodexHome, "config.toml"), "utf-8"), 'model = "gpt-5.6-sol"\n');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds the caller's auth.json into the ephemeral runtime home without touching the project (issue #3629)", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-issue-3629-"));
+    try {
+      const projectCodexHome = join(wd, ".codex");
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      await writeFile(join(projectCodexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
+      await writeFile(join(projectCodexHome, "hooks.json"), '{"hooks":{}}\n');
+
+      // Fake, non-secret marker credential in an isolated user home; point the
+      // process HOME at it so codexHome() resolves there, without touching host state.
+      const fakeUserHome = await mkdtemp(join(tmpdir(), "omx-issue-3629-home-"));
+      await mkdir(join(fakeUserHome, ".codex"), { recursive: true });
+      await writeFile(join(fakeUserHome, ".codex", "auth.json"), '{"FAKE_MARKER":true}\n', {
+        mode: 0o600,
+      });
+
+      const savedHome = process.env.HOME;
+      const savedCodeHome = process.env.CODEX_HOME;
+      delete process.env.CODEX_HOME;
+      process.env.HOME = fakeUserHome;
+      try {
+        const prepared = await prepareCodexHomeForLaunch(wd, "session-3629", {});
+        const runtimeCodexHome = runtimeCodexHomePath(wd, "session-3629");
+        assert.equal(prepared.codexHomeOverride, runtimeCodexHome);
+
+        const runtimeEntries = await fsReaddir(prepared.codexHomeOverride);
+        assert.equal(runtimeEntries.includes("auth.json"), true);
+        assert.equal(
+          await readFile(join(prepared.codexHomeOverride, "auth.json"), "utf-8"),
+          '{"FAKE_MARKER":true}\n',
+        );
+        assert.equal(((await lstat(join(prepared.codexHomeOverride, "auth.json"))).mode & 0o777), 0o600);
+        // No secret ever lands in the durable project home.
+        assert.equal((await fsReaddir(projectCodexHome)).includes("auth.json"), false);
+        // Project config still preserved; hooks still single-loaded.
+        assert.equal(
+          await readFile(join(prepared.codexHomeOverride, "config.toml"), "utf-8"),
+          'model = "gpt-5.6-sol"\n',
+        );
+        assert.equal(runtimeEntries.includes("hooks.json"), false);
+      } finally {
+        process.env.HOME = savedHome;
+        if (savedCodeHome !== undefined) process.env.CODEX_HOME = savedCodeHome;
+      }
+
+      // Explicit CODEX_HOME remains authoritative: project branch skipped, no seeding.
+      const explicitHome = await mkdtemp(join(tmpdir(), "omx-issue-3629-explicit-"));
+      await mkdir(join(explicitHome, "sessions"), { recursive: true });
+      const preparedExplicit = await prepareCodexHomeForLaunch(wd, "session-3629-explicit", {
+        CODEX_HOME: explicitHome,
+      });
+      assert.equal(preparedExplicit.codexHomeOverride, explicitHome);
+      assert.equal((await fsReaddir(explicitHome)).includes("auth.json"), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -3955,9 +4801,9 @@ describe("tmux HUD pane helpers", () => {
       calls.push(args);
       if (args.at(-1) === "#{pane_id}") return "%1\n%2\n";
       return [
-        "%1\x1fcodex\x1f0\x1f0\x1f100\x1f40\x1f39\x1f100\x1f40\x1fcodex\x1f/repo\x1f0\x1f101",
-        "%2\x1fnode\x1f0\x1f40\x1f100\x1f3\x1f42\x1f100\x1f43\x1fexec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' node /tmp/bin/dist/cli/omx.js hud --watch\x1f/repo\x1f0\x1f202",
-      ].join("\n");
+        "%1\x1fcodex\x1f0\x1f0\x1f100\x1f40\x1f39\x1f100\x1f40\x1f\x1f\x1f0\x1f101\x1fcodex\x1f/repo",
+        "%2\x1fnode\x1f0\x1f40\x1f100\x1f3\x1f42\x1f100\x1f43\x1f\x1f\x1f0\x1f202\x1fexec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' node /tmp/bin/dist/cli/omx.js hud --watch\x1f/repo",
+      ].join("\n") + "\n";
     });
 
     assert.deepEqual(panes, []);
@@ -3977,10 +4823,12 @@ describe("tmux HUD pane helpers", () => {
         "#{pane_bottom}",
         "#{window_width}",
         "#{window_height}",
-        "#{pane_start_command}",
-        "#{pane_current_path}",
+        "#{session_id}",
+        "#{window_id}",
         "#{pane_dead}",
         "#{pane_pid}",
+        "#{pane_start_command}",
+        "#{pane_current_path}",
       ].join("\x1f"),
     ]);
   });
@@ -4829,7 +5677,9 @@ exit 0
     const hud = {
       paneId: "%77",
       panePid: 7700,
+      sessionName: "omx-detached",
       sessionId: "$1",
+      sessionCreated: "1700000000",
       windowId: "@1",
       operationMarker: "operation-1",
     };
@@ -5485,7 +6335,7 @@ exit 0
     assert.equal(attachIndex > scheduleIndex, true);
     assert.equal(names.includes("register-resize-hook"), true);
     assert.equal(names.includes("reconcile-hud-resize"), true);
-    assert.equal(DETACHED_TMUX_HISTORY_LIMIT, 500);
+    assert.equal(DETACHED_TMUX_HISTORY_LIMIT, 5000);
     const historyHook = steps.find((step) => step.name === "register-detached-history-prune-hook");
     assert.ok(historyHook);
     assert.deepEqual(historyHook.args.slice(0, 3), ["set-hook", "-t", "omx-demo"]);
@@ -6169,9 +7019,31 @@ describe("readTopLevelTomlString", () => {
     );
     assert.equal(value, null);
   });
+
+  it("ignores array-of-tables values", () => {
+    const value = readTopLevelTomlString(
+      '[[entries]] # array of tables\nmodel_reasoning_effort = "low"\n',
+      "model_reasoning_effort",
+    );
+    assert.equal(value, null);
+  });
 });
 
 describe("injectModelInstructionsBypassArgs", () => {
+  it("advertises startup instructions only when OMX injects its session file", () => {
+    const cwd = "/tmp/my-project";
+    const sessionId = "sess-startup";
+    const expected = join(cwd, ".omx", "state", "sessions", sessionId, "AGENTS.md");
+    assert.equal(buildStartupModelInstructionsEnv(cwd, [], sessionId, {}).OMX_STARTUP_MODEL_INSTRUCTIONS_FILE, expected);
+    assert.equal(buildStartupModelInstructionsEnv(cwd, ["--", "-c", 'model_instructions_file="prompt"'], sessionId, {}).OMX_STARTUP_MODEL_INSTRUCTIONS_FILE, expected);
+    for (const args of [["-c", 'model_instructions_file="custom"'], ['--config=model_instructions_file="custom"']]) {
+      assert.equal(buildStartupModelInstructionsEnv(cwd, args, sessionId, {}).OMX_STARTUP_MODEL_INSTRUCTIONS_FILE, "");
+    }
+    for (const env of [{ OMX_BYPASS_DEFAULT_SYSTEM_PROMPT: "0" }, { OMX_MODEL_INSTRUCTIONS_FILE: "custom" }]) {
+      assert.equal(buildStartupModelInstructionsEnv(cwd, [], sessionId, env).OMX_STARTUP_MODEL_INSTRUCTIONS_FILE, "");
+    }
+  });
+
   it("appends model_instructions_file override by default", () => {
     const args = injectModelInstructionsBypassArgs(
       "/tmp/my-project",
@@ -6281,6 +7153,25 @@ describe("upsertTopLevelTomlString", () => {
       updated,
       'model_reasoning_effort = "xhigh"\n[tui]\nstatus_line = []\n',
     );
+  });
+
+  it("preserves array-of-tables values when inserting a top-level key", () => {
+    const content = '[[entries]] # array of tables\nmodel_reasoning_effort = "low"\n';
+    const updated = upsertTopLevelTomlString(content, "model_reasoning_effort", "high");
+    assert.equal(updated, `model_reasoning_effort = "high"\n${content}`);
+  });
+
+  it("inserts before an array of tables that precedes an ordinary table", () => {
+    const content = [
+      "[[skills.config]]",
+      'path = "/tmp/skill/SKILL.md"',
+      "enabled = false",
+      "[tui]",
+      "status_line = []",
+      "",
+    ].join("\r\n");
+    const updated = upsertTopLevelTomlString(content, "model_reasoning_effort", "high");
+    assert.equal(updated, `model_reasoning_effort = "high"\r\n${content}`);
   });
 });
 
@@ -6490,5 +7381,38 @@ describe("detached control-plane binding", () => {
     assert.equal(payload.parentEnv?.OMX_PROVIDER_URL, "https://provider.invalid");
     assert.equal(payload.parentEnv?.Path, "/system/path");
     assert.equal(payload.parentEnv?.Omx_Notify_Fallback, "1");
+  });
+});
+
+describe("resolveDetachedTmuxHistoryLimit (#3611)", () => {
+  it("defaults to a scrollback size that holds a real transcript", () => {
+    assert.equal(resolveDetachedTmuxHistoryLimit({}), DETACHED_TMUX_HISTORY_LIMIT);
+    assert.equal(DETACHED_TMUX_HISTORY_LIMIT >= 5000, true);
+  });
+
+  it("honors a valid operator override", () => {
+    assert.equal(resolveDetachedTmuxHistoryLimit({ OMX_TMUX_HISTORY_LIMIT: "12000" }), 12000);
+    assert.equal(resolveDetachedTmuxHistoryLimit({ OMX_TMUX_HISTORY_LIMIT: " 9000 " }), 9000);
+  });
+
+  it("clamps overrides into the supported range", () => {
+    assert.equal(
+      resolveDetachedTmuxHistoryLimit({ OMX_TMUX_HISTORY_LIMIT: "0" }),
+      DETACHED_TMUX_HISTORY_LIMIT_MIN,
+    );
+    assert.equal(
+      resolveDetachedTmuxHistoryLimit({ OMX_TMUX_HISTORY_LIMIT: "99999999" }),
+      DETACHED_TMUX_HISTORY_LIMIT_MAX,
+    );
+  });
+
+  it("falls back to the default for unusable overrides instead of shrinking scrollback", () => {
+    for (const raw of ["", "abc", "-1", "1e4", "1_000", "500.5"]) {
+      assert.equal(
+        resolveDetachedTmuxHistoryLimit({ OMX_TMUX_HISTORY_LIMIT: raw }),
+        DETACHED_TMUX_HISTORY_LIMIT,
+        `expected default for ${JSON.stringify(raw)}`,
+      );
+    }
   });
 });

@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile, rm, mkdir } from "fs/promises";
-import { join } from "path";
+import { dirname, join } from "path";
+import { existsSync } from "fs";
 import { tmpdir } from "os";
 import {
   generateWorkerOverlay,
@@ -52,7 +53,7 @@ describe("worker bootstrap", () => {
 
     assert.match(workerSkill, /omx team api claim-task/);
     assert.match(workerSkill, /omx team api transition-task-status/);
-    assert.match(workerSkill, /omx team api release-task-claim/);
+    assert.match(workerSkill, /release-task-claim/);
     assert.match(
       workerSkill,
       /\$\{CODEX_HOME:-~\/\.codex\}\/skills\/worker\/SKILL\.md/,
@@ -68,21 +69,19 @@ describe("worker bootstrap", () => {
     );
   });
 
-  it("team and worker skills document coordination activation heuristics", async () => {
+  it("slim team and worker cards defer durable coordination rules to AGENTS.md", async () => {
     const teamSkill = await readFile(join(process.cwd(), "skills", "team", "SKILL.md"), "utf8");
     const workerSkill = await readFile(join(process.cwd(), "skills", "worker", "SKILL.md"), "utf8");
 
-    for (const content of [teamSkill, workerSkill]) {
-      assert.match(content, /Team Big Five/i);
-      assert.match(content, /ATEM/i);
-      assert.match(content, /independent fan-out/i);
-      assert.match(content, /shared mental model|single source of truth/i);
-      assert.match(content, /closed-loop communication|ACK-readback/i);
-      assert.match(content, /mutual performance monitoring/i);
-      assert.match(content, /backup\/reassignment|backup behavior/i);
-      assert.match(content, /adaptability checkpoint/i);
-      assert.match(content, /team orientation/i);
-    }
+    assert.match(teamSkill, /explicit `\$team` request|omx team/i);
+    assert.match(teamSkill, /tmux/i);
+    assert.match(teamSkill, /AGENTS\.md#durable-runtime-invariants-canonical-ssot/i);
+    assert.match(workerSkill, /OMX_TEAM_WORKER/i);
+    assert.match(workerSkill, /claim-task/);
+    assert.match(workerSkill, /transition-task-status/);
+    assert.match(workerSkill, /AGENTS\.md#durable-runtime-invariants-canonical-ssot/i);
+    assert.ok(teamSkill.split("\n").length <= 120, `team skill should remain slim (<=120 lines)`);
+    assert.ok(workerSkill.split("\n").length <= 120, `worker skill should remain slim (<=120 lines)`);
   });
 
   it("generateWorkerOverlay produces markdown with correct start/end markers", () => {
@@ -309,6 +308,7 @@ describe("worker bootstrap", () => {
       /<team_state_root>\/team\/team-inbox\/tasks\/task-<id>\.json/,
     );
     assert.match(inbox, /omx team api claim-task/);
+    assert.doesNotMatch(inbox, /Do NOT re-claim|claim_token:/);
     assert.match(inbox, /omx team api transition-task-status/);
     assert.match(inbox, /omx team api release-task-claim/);
     assert.match(
@@ -928,6 +928,7 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /team_state_root/);
     assert.match(inbox, /team\/team-followup\/tasks\/task-42\.json/);
     assert.match(inbox, /omx team api claim-task/);
+    assert.doesNotMatch(inbox, /Do NOT re-claim|claim_token:/);
     assert.match(inbox, /omx team api transition-task-status/);
     assert.match(inbox, /omx team api release-task-claim/);
     assert.doesNotMatch(
@@ -1112,6 +1113,16 @@ describe("worker bootstrap", () => {
     assert.ok(message.length < 200);
   });
 
+  it("leader mailbox notices handle a team removed before the queued notice is read", () => {
+    for (const root of [".omx/state", "$OMX_TEAM_STATE_ROOT", "/tmp/omx-run/.omx/state"]) {
+      const directive = buildLeaderMailboxTriggerDirective("finished-team", "worker-3", root);
+      assert.equal(directive.intent, "pending-mailbox-review");
+      assert.match(directive.text, /Team gone: ignore stale notice; don't ask user or restart/);
+      assert.match(directive.text, /Otherwise review; decide next step/);
+      assert.ok(directive.text.includes(`${root}/team/finished-team/mailbox/leader-fixed.json`));
+    }
+  });
+
   it("generateLeaderMailboxTriggerMessage tells the leader to read the mailbox and decide the next step", () => {
     const message = generateLeaderMailboxTriggerMessage(
       "team-mail",
@@ -1121,15 +1132,15 @@ describe("worker bootstrap", () => {
       message,
       /Read .*\.omx\/state\/team\/team-mail\/mailbox\/leader-fixed\.json/,
     );
-    assert.match(message, /worker-2 sent a new message/);
-    assert.match(message, /Review it and decide the next concrete step/);
+    assert.match(message, /msg from worker-2/);
+    assert.match(message, /Otherwise review; decide next step/);
     assert.doesNotMatch(message, /\bReply\b/i);
   });
 
   it("buildLeaderMailboxTriggerDirective records leader mailbox-review intent separately", () => {
     const directive = buildLeaderMailboxTriggerDirective("team-mail", "worker-2");
     assert.equal(directive.intent, "pending-mailbox-review");
-    assert.match(directive.text, /worker-2 sent a new message/);
+    assert.match(directive.text, /msg from worker-2/);
     assert.doesNotMatch(directive.text, /OMX_INTENT/);
   });
 
@@ -1143,8 +1154,8 @@ describe("worker bootstrap", () => {
       message,
       /read .*\$OMX_TEAM_STATE_ROOT\/team\/team-mail\/mailbox\/leader-fixed\.json/i,
     );
-    assert.match(message, /new msg from worker-2/i);
-    assert.match(message, /review it; decide next step/i);
+    assert.match(message, /msg from worker-2/i);
+    assert.match(message, /Otherwise review; decide next step/i);
     assert.doesNotMatch(message, /\breply\b/i);
     assert.ok(message.length < 200);
   });
@@ -1310,9 +1321,8 @@ describe("worker bootstrap", () => {
 
       const content = await readFile(outPath, "utf8");
       assert.match(content, /<identity>You are Writer\.<\/identity>/);
-      assert.match(content, /exact gpt-5\.6-terra model/);
-      assert.match(content, /strict execution order: inspect -> plan -> act -> verify/);
-      assert.equal((content.match(/<exact_model_guidance>/g) || []).length, 1);
+      assert.doesNotMatch(content, /exact gpt-5\.6-terra model/);
+      assert.doesNotMatch(content, /<exact_model_guidance>/);
       assert.equal((content.match(/resolved_model: gpt-5\.6-terra/g) || []).length, 1);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -1338,15 +1348,16 @@ describe("worker bootstrap", () => {
     assert.match(content, /<identity>You are Writer\.<\/identity>/);
   });
 
-  it("writeWorkerWorktreeRootAgentsFile composes project AGENTS while remove restores tracked content", async () => {
+  it("writeWorkerWorktreeRootAgentsFile writes instructions to .omx state and preserves tracked worktree AGENTS", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-worker-root-agents-"));
     const worktree = join(cwd, "worktree");
     try {
       await mkdir(join(cwd, ".omx", "state", "team", "restore-team", "workers", "worker-1"), { recursive: true });
       await mkdir(worktree, { recursive: true });
+      const originalAgents = "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n";
       await writeFile(
         join(worktree, "AGENTS.md"),
-        "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n",
+        originalAgents,
         "utf8",
       );
 
@@ -1360,15 +1371,27 @@ describe("worker bootstrap", () => {
         worktreePath: worktree,
       });
 
+      // Instructions file should be in .omx state directory, not the worktree
+      assert.equal(outPath, join(cwd, ".omx", "state", "team", "restore-team", "workers", "worker-1", "AGENTS.md"));
+
       const generated = await readFile(outPath, "utf8");
       assert.match(generated, /# Base tracked AGENTS/);
       assert.match(generated, /MUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL/);
       assert.match(generated, /Team Worker Runtime Instructions/);
       assert.match(generated, /Writer role prompt/);
 
+      // Verify worktree AGENTS.md is NOT modified
+      const worktreeContent = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(worktreeContent, originalAgents);
+
+      // Remove should delete the instructions file from .omx state
       await removeWorkerWorktreeRootAgentsFile("restore-team", "worker-1", join(cwd, ".omx", "state"), worktree);
-      const restored = await readFile(join(worktree, "AGENTS.md"), "utf8");
-      assert.equal(restored, "# Base tracked AGENTS\n\nMUST_PRESERVE_PROJECT_GUIDANCE_SENTINEL\n");
+      const instructionsExist = existsSync(outPath);
+      assert.equal(instructionsExist, false);
+
+      // Worktree AGENTS.md should still have original content
+      const worktreeContentAfter = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(worktreeContentAfter, originalAgents);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1379,12 +1402,13 @@ describe("worker bootstrap", () => {
     const worktree = join(cwd, "worktree");
     const codexHome = join(cwd, "codex-home");
     const restoreCodexHome = setMockCodexHome(codexHome);
+    const projectAgents = "# Project Instructions\n\nPROJECT_SENTINEL\n";
     try {
       await mkdir(join(cwd, ".omx", "state", "team", "compose-team", "workers", "worker-1"), { recursive: true });
       await mkdir(worktree, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await writeFile(join(codexHome, "AGENTS.md"), "# User Instructions\n\nUSER_SENTINEL\n", "utf8");
-      await writeFile(join(worktree, "AGENTS.md"), "# Project Instructions\n\nPROJECT_SENTINEL\n", "utf8");
+      await writeFile(join(worktree, "AGENTS.md"), projectAgents, "utf8");
 
       const outPath = await writeWorkerWorktreeRootAgentsFile({
         teamName: "compose-team",
@@ -1396,6 +1420,9 @@ describe("worker bootstrap", () => {
         worktreePath: worktree,
       });
 
+      // Verify instructions are written to .omx state directory
+      assert.equal(outPath, join(cwd, ".omx", "state", "team", "compose-team", "workers", "worker-1", "AGENTS.md"));
+
       const generated = await readFile(outPath, "utf8");
       assert.match(generated, /# User Instructions/);
       assert.match(generated, /USER_SENTINEL/);
@@ -1405,6 +1432,10 @@ describe("worker bootstrap", () => {
       assert.match(generated, /<identity>Writer role prompt<\/identity>/);
       assert.ok(generated.indexOf("USER_SENTINEL") < generated.indexOf("PROJECT_SENTINEL"));
       assert.ok(generated.indexOf("PROJECT_SENTINEL") < generated.indexOf("Team Worker Runtime Instructions"));
+
+      // Verify worktree AGENTS.md is NOT modified
+      const worktreeContent = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(worktreeContent, projectAgents);
     } finally {
       restoreCodexHome();
       await rm(cwd, { recursive: true, force: true });
@@ -1637,6 +1668,123 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /--codex-goal-json/);
     assert.match(inbox, /fresh_leader_get_goal_required/);
     assert.doesNotMatch(inbox, /workers? checkpoint Ultragoal/i);
+  });
+
+  it("removeWorkerWorktreeRootAgentsFile restores from legacy v0.21.6 backup path via git rev-parse", async () => {
+    const { execSync } = await import("child_process");
+    const cwd = await mkdtemp(join(tmpdir(), "omx-legacy-backup-"));
+    const worktree = join(cwd, "worktree");
+    try {
+      // Create a real git repo in the worktree
+      await mkdir(worktree, { recursive: true });
+      await mkdir(join(cwd, ".omx", "state", "team", "legacy-team", "workers", "worker-1"), { recursive: true });
+      
+      // Initialize git repo
+      execSync("git init", { cwd: worktree, stdio: "ignore" });
+      execSync("git config user.email 'test@example.com'", { cwd: worktree, stdio: "ignore" });
+      execSync("git config user.name 'Test User'", { cwd: worktree, stdio: "ignore" });
+      
+      // Create original AGENTS.md content and commit it
+      const originalAgents = "# Original AGENTS\n\nThis is the original content.\n";
+      await writeFile(join(worktree, "AGENTS.md"), originalAgents, "utf8");
+      execSync("git add AGENTS.md", { cwd: worktree, stdio: "ignore" });
+      execSync("git commit -m 'Add AGENTS.md'", { cwd: worktree, stdio: "ignore" });
+      
+      // Create the legacy backup file at .git/omx/root-agents-backup.json
+      const gitDir = join(worktree, ".git");
+      const legacyBackupDir = join(gitDir, "omx");
+      await mkdir(legacyBackupDir, { recursive: true });
+      const legacyBackupPath = join(legacyBackupDir, "root-agents-backup.json");
+      const backup = {
+        existed: true,
+        tracked: true,
+        previousContent: originalAgents,
+        skipWorktreeApplied: true,
+      };
+      await writeFile(legacyBackupPath, JSON.stringify(backup), "utf8");
+      
+      // Simulate v0.21.6 behavior: apply skip-worktree and modify AGENTS.md
+      const modifiedAgents = "# Modified by Team Worker\n\nThis is modified content.\n";
+      await writeFile(join(worktree, "AGENTS.md"), modifiedAgents, "utf8");
+      execSync("git update-index --skip-worktree AGENTS.md", { cwd: worktree, stdio: "ignore" });
+      
+      // Call removeWorkerWorktreeRootAgentsFile
+      await removeWorkerWorktreeRootAgentsFile(
+        "legacy-team",
+        "worker-1",
+        join(cwd, ".omx", "state"),
+        worktree
+      );
+      
+      // Verify that AGENTS.md was restored from the legacy backup
+      const restoredContent = await readFile(join(worktree, "AGENTS.md"), "utf8");
+      assert.equal(restoredContent, originalAgents, "AGENTS.md should be restored from legacy backup");
+      
+      // Verify that the legacy backup file was deleted
+      const backupExists = existsSync(legacyBackupPath);
+      assert.equal(backupExists, false, "Legacy backup file should be deleted");
+      
+      // Verify that skip-worktree was cleared
+      const skipWorktreeOutput = execSync("git ls-files -v AGENTS.md", { cwd: worktree, encoding: "utf-8" });
+      assert.doesNotMatch(skipWorktreeOutput, /^S /m, "skip-worktree flag should be cleared");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("removeWorkerWorktreeRootAgentsFile uses the team-state backup inside a git repo when no legacy backup exists", async () => {
+    const { execSync } = await import("child_process");
+    const cwd = await mkdtemp(join(tmpdir(), "omx-team-backup-git-"));
+    const worktree = join(cwd, "worktree");
+    const stateRoot = join(cwd, ".omx", "state");
+    const workerDir = join(stateRoot, "team", "t", "workers", "worker-1");
+    try {
+      await mkdir(worktree, { recursive: true });
+      await mkdir(workerDir, { recursive: true });
+      execSync("git init -q", { cwd: worktree });
+      const originalAgents = "# Original AGENTS\n";
+      await writeFile(join(workerDir, "root-agents-backup.json"), JSON.stringify({ existed: true, tracked: false, previousContent: originalAgents }), "utf8");
+      await writeFile(join(worktree, "AGENTS.md"), "# Generated worker AGENTS\n", "utf8");
+
+      await removeWorkerWorktreeRootAgentsFile("t", "worker-1", stateRoot, worktree);
+
+      assert.equal(await readFile(join(worktree, "AGENTS.md"), "utf8"), originalAgents);
+      assert.equal(existsSync(join(workerDir, "root-agents-backup.json")), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("removeWorkerWorktreeRootAgentsFile restores a legacy v0.21.6 backup in a linked worktree (absolute --git-path)", async () => {
+    const { execSync } = await import("child_process");
+    const cwd = await mkdtemp(join(tmpdir(), "omx-legacy-backup-linked-"));
+    const repo = join(cwd, "repo");
+    const worktree = join(cwd, "linked");
+    try {
+      await mkdir(repo, { recursive: true });
+      execSync("git init -q", { cwd: repo });
+      execSync("git config user.email 'test@example.com'", { cwd: repo });
+      execSync("git config user.name 'Test User'", { cwd: repo });
+      const originalAgents = "# Original AGENTS\n";
+      await writeFile(join(repo, "AGENTS.md"), originalAgents, "utf8");
+      execSync("git add AGENTS.md && git commit -q -m init", { cwd: repo });
+      execSync(`git worktree add -q ${JSON.stringify(worktree)}`, { cwd: repo });
+
+      const legacyBackupPath = execSync("git rev-parse --git-path omx/root-agents-backup.json", { cwd: worktree, encoding: "utf-8" }).trim();
+      assert.ok(legacyBackupPath.startsWith("/") || /^[A-Za-z]:/.test(legacyBackupPath), "linked worktree --git-path is absolute");
+      await mkdir(dirname(legacyBackupPath), { recursive: true });
+      await writeFile(legacyBackupPath, JSON.stringify({ existed: true, tracked: true, previousContent: originalAgents, skipWorktreeApplied: true }), "utf8");
+      await writeFile(join(worktree, "AGENTS.md"), "# Generated worker AGENTS\n", "utf8");
+      execSync("git update-index --skip-worktree AGENTS.md", { cwd: worktree });
+
+      await removeWorkerWorktreeRootAgentsFile("legacy-team", "worker-1", join(cwd, ".omx", "state"), worktree);
+
+      assert.equal(await readFile(join(worktree, "AGENTS.md"), "utf8"), originalAgents);
+      assert.equal(existsSync(legacyBackupPath), false);
+      assert.doesNotMatch(execSync("git ls-files -v AGENTS.md", { cwd: worktree, encoding: "utf-8" }), /^S /m);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
 });

@@ -17,7 +17,7 @@ describe('config generator', () => {
       const notifyIdx = toml.indexOf('notify =');
       const reasoningIdx = toml.indexOf('model_reasoning_effort =');
       const devInstrIdx = toml.indexOf('developer_instructions =');
-      const modelIdx = toml.indexOf('model = "gpt-5.6-sol"');
+      const modelIdx = toml.indexOf('model = "gpt-6.2-sol"');
       const featuresIdx = toml.indexOf('[features]');
 
       assert.ok(notifyIdx >= 0, 'notify not found');
@@ -49,14 +49,15 @@ describe('config generator', () => {
     }
   });
 
-  it('does not seed context defaults for fresh configs', async () => {
+  it('defaults fresh configs to Astra with unchanged medium reasoning and no context overrides', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
     try {
       const configPath = join(wd, 'config.toml');
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, 'utf-8');
 
-      assert.match(toml, /^model = "gpt-5\.6-sol"$/m);
+      assert.match(toml, /^model = "gpt-6.2-sol"$/m);
+      assert.match(toml, /^model_reasoning_effort = "medium"$/m);
       assert.doesNotMatch(toml, /seeded behavioral defaults/);
       assert.doesNotMatch(toml, /^model_context_window\s*=/m);
       assert.doesNotMatch(toml, /^model_auto_compact_token_limit\s*=/m);
@@ -142,7 +143,7 @@ describe('config generator', () => {
       // Features correct
       assert.equal((rerun.match(/^\[features\]$/gm) ?? []).length, 1);
       assert.doesNotMatch(rerun, /^multi_agent\s*=/m);
-      assert.match(rerun, /^child_agents_md = true$/m);
+      assert.doesNotMatch(rerun, /^child_agents_md\s*=/m);
 
       // User content preserved
       assert.match(rerun, /^\[user.settings\]$/m);
@@ -342,7 +343,7 @@ describe('config generator', () => {
       assert.equal((merged.match(/^\[features\]$/gm) ?? []).length, 1);
       assert.match(merged, /^custom_user_flag = false$/m);
       assert.doesNotMatch(merged, /^multi_agent\s*=/m);
-      assert.match(merged, /^child_agents_md = true$/m);
+      assert.doesNotMatch(merged, /^child_agents_md\s*=/m);
       assert.match(merged, /^hooks = true$/m);
       assert.match(merged, /^goals = true$/m);
       assert.doesNotMatch(merged, /^goal\s*=/m);
@@ -443,6 +444,16 @@ describe('config generator', () => {
       assert.match(merged, /^custom_user_flag = false$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('migrates removed plugin_hooks to unified hooks without duplicate native flags', () => {
+    for (const config of ['', '[features]\nplugin_hooks = true\nhooks = false\ncodex_hooks = true\n']) {
+      const options = { pluginScopedHooks: true, pluginHookFeatureFlag: 'hooks' as const, preserveNativeHooks: true };
+      const result = upsertPluginModeRuntimeFeatureFlags(config, 'hooks', options);
+      assert.equal((result.match(/^hooks = true$/gm) ?? []).length, 1);
+      assert.doesNotMatch(result, /^(?:plugin_hooks|codex_hooks)\s*=/m);
+      assert.equal(upsertPluginModeRuntimeFeatureFlags(result, 'hooks', options), result);
     }
   });
 

@@ -243,6 +243,7 @@ export interface CheckpointOptions {
   evidence?: string;
   codexGoal?: unknown;
   qualityGate?: unknown;
+  strict?: boolean;
   allowActiveFinalCodexGoal?: boolean;
   now?: Date;
 }
@@ -678,10 +679,22 @@ function buildCompletedLegacyGoalRemediation(goal: UltragoalItem): string {
   ].join(' ');
 }
 
-function buildUnavailableCodexGoalRemediation(goal: UltragoalItem): string {
+function buildUnavailableCodexGoalRemediation(
+  goal: UltragoalItem,
+  reason: 'db_schema_context_error' | 'tool_unavailable',
+): string {
+  const detail = reason === 'tool_unavailable'
+    ? {
+      failure: 'the native get_goal tool is missing from the Codex tool catalog',
+      evidence: '<get_goal unavailable because the native tool catalog does not expose get_goal; completion is not verified>',
+    }
+    : {
+      failure: 'a Codex DB/schema/context error, such as "no such table: thread_goals"',
+      evidence: '<get_goal unavailable due to Codex DB/schema/context error; safe recovery requires a working Codex goal context>',
+    };
   return [
-    'If get_goal itself is unavailable due to a Codex DB/schema/context error, such as "no such table: thread_goals", do not repeat --status complete or mark the Codex goal complete from shell state.',
-    `Record an auditable non-terminal blocker with: omx ultragoal checkpoint --goal-id ${goal.id} --status blocked --evidence "<get_goal unavailable due to Codex DB/schema/context error; safe recovery requires a working Codex goal context>" --codex-goal-json "<unavailable get_goal error JSON or path>".`,
+    `If get_goal itself is unavailable due to ${detail.failure}, do not repeat --status complete or mark the Codex goal complete from shell state.`,
+    `Record an auditable non-terminal blocker with: omx ultragoal checkpoint --goal-id ${goal.id} --status blocked --evidence "${detail.evidence}" --codex-goal-json "<unavailable get_goal error JSON or path>".`,
     'Then continue from a Codex goal context where get_goal works and strict completion reconciliation can be proven.',
   ].join(' ');
 }
@@ -1678,9 +1691,27 @@ function validateArchitectureInvariantGate(gate: Partial<UltragoalQualityGate>, 
   }
 }
 
-function validateQualityGate(value: unknown, requiredInvariants: readonly RequiredArchitectureInvariant[] = []): UltragoalQualityGate {
+function validateQualityGate(value: unknown, requiredInvariants: readonly RequiredArchitectureInvariant[] = [], opts: { strict?: boolean } = {}): UltragoalQualityGate | undefined {
+  const strict = opts.strict === true;
+  if (!strict) {
+    // Ordinary mode: targeted verification only, advisory review lanes.
+    // Accepts missing gate (returns undefined) or any gate that at least has passing verification.
+    // Full cohort fields are advisory and not enforced.
+    if (!value || typeof value !== 'object') return undefined;
+    const gate = value as Partial<UltragoalQualityGate>;
+    const verification = gate.verification;
+    // If gate provided without verification, treat as advisory-only and allow.
+    if (!verification || typeof verification !== 'object') return undefined;
+    // Require targeted verification when present, but don't fail closed on cohort fields.
+    if (verification.status === 'passed' && Array.isArray(verification.commands) && verification.commands.length > 0) {
+      try { assertNonEmpty(verification.evidence, 'verification.evidence'); } catch { return undefined; }
+      // Return advisory gate without strict validation of cleaner/codeReview/invariants.
+      return gate as UltragoalQualityGate;
+    }
+    return undefined;
+  }
   if (!value || typeof value !== 'object') {
-    throw new UltragoalError('Final ultragoal completion requires --quality-gate-json with ai-slop-cleaner, verification, code-review, and architecture-invariant evidence.');
+    throw new UltragoalError('Final ultragoal completion requires --quality-gate-json with ai-slop-cleaner, verification, code-review, and architecture-invariant evidence. Pass --strict to enforce the cohort gate; ordinary completes with targeted verification only.');
   }
   const gate = value as Partial<UltragoalQualityGate>;
   const cleaner = gate.aiSlopCleaner;
@@ -1776,7 +1807,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       throw new UltragoalError(`Cannot record a blocked checkpoint for ${goal.id} while it is ${goal.status}; start or resume the ultragoal before recording a non-terminal blocker.`);
     }
     const snapshot = options.codexGoal === undefined ? null : parseCodexGoalSnapshot(options.codexGoal);
-    if (snapshot?.unavailableReason === 'db_schema_context_error') {
+    if (snapshot?.unavailableReason === 'db_schema_context_error' || snapshot?.unavailableReason === 'tool_unavailable') {
       goal.updatedAt = now;
       goal.failureReason = assertNonEmpty(options.evidence, '--evidence');
       plan.activeGoalId = goal.id;
@@ -1789,12 +1820,12 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
         status: goal.status,
         evidence: options.evidence,
         codexGoal: options.codexGoal,
-        message: 'Codex get_goal was unavailable due to a DB/schema/context error; strict completion reconciliation is deferred until get_goal works.',
+        message: 'Codex get_goal was unavailable (database/schema/context or native tool catalog); strict completion reconciliation is deferred until get_goal works.',
       });
       return plan;
     }
     if (!snapshot?.available) {
-      throw new UltragoalError('Blocked ultragoal checkpoints require either a get_goal snapshot for the completed legacy Codex goal that blocked create_goal, an unavailable get_goal error JSON for a Codex DB/schema/context failure, or a matching native blocked snapshot; pass --codex-goal-json.');
+      throw new UltragoalError('Blocked ultragoal checkpoints require either a get_goal snapshot for the completed legacy Codex goal that blocked create_goal, an unavailable get_goal error JSON for a Codex DB/schema/context failure or missing native get_goal tool catalog, or a matching native blocked snapshot; pass --codex-goal-json.');
     }
     if (!snapshot.objective) {
       throw new UltragoalError('Blocked ultragoal checkpoint Codex snapshot is missing objective text.');
@@ -1902,7 +1933,8 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
           && normalizeObjective(reconciliation.snapshot.objective ?? '') !== normalizeObjective(expectedObjective)
           ? ` ${buildCompletedLegacyGoalRemediation(goal)}`
           : reconciliation.snapshot.unavailableReason === 'db_schema_context_error'
-            ? ` ${buildUnavailableCodexGoalRemediation(goal)}`
+            || reconciliation.snapshot.unavailableReason === 'tool_unavailable'
+            ? ` ${buildUnavailableCodexGoalRemediation(goal, reconciliation.snapshot.unavailableReason)}`
           : '';
         throw new UltragoalError(`${formatCodexGoalReconciliation(reconciliation)}${taskScopedRequirement}${remediation}`);
       }
@@ -1925,12 +1957,17 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
     }
     if (finalRunCheckpoint && !options.allowActiveFinalCodexGoal) goal.evidence = options.evidence;
   }
-  const requiredArchitectureInvariants = options.status === 'complete' && (aggregateCompletion !== undefined || (isFinalRunCompletionCandidate(plan, goal) && !options.allowActiveFinalCodexGoal))
+  const isStrict = options.strict === true;
+  const isFinalGateCandidate = options.status === 'complete' && (aggregateCompletion !== undefined || (isFinalRunCompletionCandidate(plan, goal) && !options.allowActiveFinalCodexGoal));
+  const requiredArchitectureInvariants = isFinalGateCandidate
     ? await collectRequiredArchitectureInvariants(cwd)
     : [];
-  const qualityGate = options.status === 'complete' && (aggregateCompletion !== undefined || (isFinalRunCompletionCandidate(plan, goal) && !options.allowActiveFinalCodexGoal))
-    ? validateQualityGate(options.qualityGate, requiredArchitectureInvariants)
+  const qualityGate = isFinalGateCandidate
+    ? validateQualityGate(options.qualityGate, requiredArchitectureInvariants, { strict: isStrict })
     : undefined;
+  if (isFinalGateCandidate && isStrict && !qualityGate) {
+    throw new UltragoalError('Final ultragoal completion requires --quality-gate-json with ai-slop-cleaner, verification, code-review, and architecture-invariant evidence. Pass --strict to enforce the cohort gate; ordinary completes with targeted verification only.');
+  }
   if (aggregateCompletion) {
     goal.status = 'complete';
     goal.completedAt = now;
@@ -2134,14 +2171,19 @@ export async function recordFinalReviewBlockers(cwd: string, options: RecordFina
   });
 }
 
-function codexGoalConductorGuidance(options: CodexGoalInstructionOptions): string {
+export function codexGoalConductorGuidance(options: CodexGoalInstructionOptions): string {
   if (options.nativeSubagentSupport?.status === 'role_routing_unavailable') {
     return buildRoleRoutingUnavailableGuidance(options.nativeSubagentSupport);
   }
-  if (options.nativeSubagentSupport?.status !== 'unsupported') return LEADER_CONDUCTOR_BLOCK;
+  if (options.nativeSubagentSupport?.status === 'unsupported') {
+    return [
+      buildUnsupportedNativeSubagentGuidance(options.nativeSubagentSupport),
+      'Native independent review unavailable: do not treat final review as clean, do not call update_goal for clean completion, and use omx ultragoal record-review-blockers to create a non-clean blocker for the missing native independent review.',
+    ].join('\n');
+  }
   return [
-    buildUnsupportedNativeSubagentGuidance(options.nativeSubagentSupport),
-    'Native independent review unavailable: do not treat final review as clean, do not call update_goal for clean completion, and use omx ultragoal record-review-blockers to create a non-clean blocker for the missing native independent review.',
+    LEADER_CONDUCTOR_BLOCK,
+    'Native capability: under ordinary native support with inherited permissions, delegated performer lanes may implement, mutate, and report bounded work directly through the native result surface; ordinary native reporting is completion, not a separate authority grant.',
   ].join('\n');
 }
 

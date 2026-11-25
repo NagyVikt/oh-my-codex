@@ -1,8 +1,9 @@
+import { TASK_LEASE_INSTRUCTIONS } from './task-lease.js';
 import type { TeamTask, TeamTaskCoordinationMechanism } from "./state.js";
 import { existsSync } from "fs";
-import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
-import { dirname, join } from "path";
 import { execFileSync } from "child_process";
+import { mkdir, readFile, rm, stat, writeFile } from "fs/promises";
+import { dirname, join, resolve } from "path";
 import {
   getFixLoopInstructions,
   getVerificationInstructions,
@@ -48,29 +49,6 @@ interface WorkerRootAgentsBackup {
   skipWorktreeApplied?: boolean;
 }
 
-function buildWorkerRootAgentsBackupPath(
-  teamStateRoot: string,
-  teamName: string,
-  workerName: string,
-  worktreePath: string,
-): string {
-  const gitPath = tryReadGitValue(worktreePath, [
-    "rev-parse",
-    "--git-path",
-    "omx/root-agents-backup.json",
-  ]);
-  return gitPath
-    ? gitPath
-    : join(
-        teamStateRoot,
-        "team",
-        teamName,
-        "workers",
-        workerName,
-        "root-agents-backup.json",
-      );
-}
-
 export function generateWorkerRootAgentsContent(
   options: WorkerRootAgentsOptions,
 ): string {
@@ -109,6 +87,7 @@ ${renderCodeGraphInstructions(options.toolContext)}
 5. Read task files from \`${options.teamStateRoot}/team/${options.teamName}/tasks/task-<id>.json\` using bare \`task_id\` values in APIs.
 6. Use claim-safe lifecycle APIs only:
    - \`omx team api claim-task --json\`
+   ${TASK_LEASE_INSTRUCTIONS}
    - \`omx team api transition-task-status --json\`
    - \`omx team api release-task-claim --json\` only for rollback to pending
 7. Use mailbox delivery flow:
@@ -139,53 +118,6 @@ ${options.rolePromptContent.trim()}
 `;
 }
 
-function tryReadGitValue(cwd: string, args: string[]): string | null {
-  try {
-    const value = execFileSync("git", args, {
-      cwd,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    }).trim();
-    return value || null;
-  } catch {
-    return null;
-  }
-}
-
-function isTracked(worktreePath: string, fileName: string): boolean {
-  try {
-    execFileSync("git", ["ls-files", "--error-unmatch", fileName], {
-      cwd: worktreePath,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function ensureGitInfoExcludePattern(
-  worktreePath: string,
-  pattern: string,
-): Promise<void> {
-  const excludePath = tryReadGitValue(worktreePath, [
-    "rev-parse",
-    "--git-path",
-    "info/exclude",
-  ]);
-  if (!excludePath) return;
-  const existing = existsSync(excludePath)
-    ? await readFile(excludePath, "utf-8")
-    : "";
-  const lines = new Set(existing.split(/\r?\n/).filter(Boolean));
-  if (lines.has(pattern)) return;
-  const next = `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${pattern}\n`;
-  await mkdir(dirname(excludePath), { recursive: true });
-  await writeFile(excludePath, next, "utf-8");
-}
 async function buildWorkerRootAgentsContent(
   options: WorkerRootAgentsOptions,
   projectAgentsContent: string | undefined,
@@ -226,50 +158,82 @@ async function buildWorkerRootAgentsContent(
 export async function writeWorkerWorktreeRootAgentsFile(
   options: WorkerRootAgentsOptions,
 ): Promise<string> {
+  // Write worker runtime instructions to a team-scoped location in .omx state,
+  // not to the worker's tracked AGENTS.md. This ensures checkout/merge operations
+  // never commit OMX-injected runtime instructions to the leader's branch.
   const agentsPath = join(options.worktreePath, "AGENTS.md");
-  const tracked = isTracked(options.worktreePath, "AGENTS.md");
-  const existed = existsSync(agentsPath);
-  const previousContent = existed
+  const previousContent = existsSync(agentsPath)
     ? await readFile(agentsPath, "utf-8")
     : undefined;
-  let skipWorktreeApplied = false;
 
-  if (tracked) {
-    try {
-      execFileSync("git", ["update-index", "--skip-worktree", "AGENTS.md"], {
-        cwd: options.worktreePath,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-      skipWorktreeApplied = true;
-    } catch {
-      skipWorktreeApplied = false;
-    }
-  } else {
-    await ensureGitInfoExcludePattern(options.worktreePath, "AGENTS.md");
-  }
-
-  const backup: WorkerRootAgentsBackup = {
-    existed,
-    tracked,
-    previousContent,
-    skipWorktreeApplied,
-  };
-  const backupPath = buildWorkerRootAgentsBackupPath(
+  const outPath = join(
     options.teamStateRoot,
+    "team",
     options.teamName,
+    "workers",
     options.workerName,
-    options.worktreePath,
+    "AGENTS.md",
   );
-  await mkdir(dirname(backupPath), { recursive: true });
-  await writeFile(backupPath, JSON.stringify(backup, null, 2), "utf-8");
+  await mkdir(dirname(outPath), { recursive: true });
   await writeFile(
-    agentsPath,
+    outPath,
     await buildWorkerRootAgentsContent(options, previousContent),
     "utf-8",
   );
-  return agentsPath;
+  return outPath;
+}
+
+/**
+ * Try to read a git value from the worktree.
+ */
+function tryReadGitValue(
+  cwd: string,
+  args: string[],
+): string | null {
+  try {
+    const value = execFileSync("git", args, {
+      cwd,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    }).trim();
+    return value || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the backup path for a worker's root AGENTS.md.
+ * Prefers the team-state backup; falls back to the legacy v0.21.6 Git-dir backup only when that file exists.
+ */
+function buildWorkerRootAgentsBackupPath(
+  teamStateRoot: string,
+  teamName: string,
+  workerName: string,
+  worktreePath: string,
+): string {
+  const teamStatePath = join(
+    teamStateRoot,
+    "team",
+    teamName,
+    "workers",
+    workerName,
+    "root-agents-backup.json",
+  );
+  if (existsSync(teamStatePath)) return teamStatePath;
+  // v0.21.6 wrote the backup under the Git dir. `--git-path` is relative in a
+  // primary checkout but absolute in a linked worktree, so resolve, never join.
+  const gitPath = tryReadGitValue(worktreePath, [
+    "rev-parse",
+    "--git-path",
+    "omx/root-agents-backup.json",
+  ]);
+  if (gitPath) {
+    const legacyPath = resolve(worktreePath, gitPath);
+    if (existsSync(legacyPath)) return legacyPath;
+  }
+  return teamStatePath;
 }
 
 export async function removeWorkerWorktreeRootAgentsFile(
@@ -278,6 +242,7 @@ export async function removeWorkerWorktreeRootAgentsFile(
   teamStateRoot: string,
   worktreePath: string,
 ): Promise<void> {
+  // Restore the worktree's original AGENTS.md from backup, if it exists.
   const agentsPath = join(worktreePath, "AGENTS.md");
   const backupPath = buildWorkerRootAgentsBackupPath(
     teamStateRoot,
@@ -296,29 +261,53 @@ export async function removeWorkerWorktreeRootAgentsFile(
   }
 
   if (!backup) {
+    // Clean up the generated worker instructions file from .omx state only
+    const outPath = join(
+      teamStateRoot,
+      "team",
+      teamName,
+      "workers",
+      workerName,
+      "AGENTS.md",
+    );
+    await rm(outPath, { force: true }).catch(() => {});
     return;
   }
 
+  // Clear skip-worktree flag if it was applied
   if (backup.tracked && backup.skipWorktreeApplied) {
     try {
       execFileSync("git", ["update-index", "--no-skip-worktree", "AGENTS.md"], {
         cwd: worktreePath,
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
+        windowsHide: true,
+      });
     } catch {
       // Best-effort cleanup only.
     }
   }
 
+  // Restore the original content or delete the file
   if (backup.existed) {
     await writeFile(agentsPath, backup.previousContent ?? "", "utf-8");
   } else {
     await rm(agentsPath, { force: true }).catch(() => {});
   }
 
+  // Clean up the backup file
   await rm(backupPath, { force: true }).catch(() => {});
+
+  // Clean up the generated worker instructions file from .omx state
+  const outPath = join(
+    teamStateRoot,
+    "team",
+    teamName,
+    "workers",
+    workerName,
+    "AGENTS.md",
+  );
+  await rm(outPath, { force: true }).catch(() => {});
 }
 
 function buildVerificationSection(taskDescription: string): string {
@@ -337,6 +326,9 @@ ${fixLoop}
 When marking completion, include structured verification evidence in your task result:
 - \`Verification:\`
 - One or more PASS/FAIL checks with command/output references
+- Tasks marked \`requires_code_change:true\` must include both the structured \`Verification:\` summary above and \`EVIDENCE_RECORDED: .omx/evidence/<file>.json\` on its own line before completing; a marker alone is rejected.
+- Commit the code, verify that exact commit, and leave the worktree clean before completion. Write that JSON in your assigned worktree (or working directory) with \`teamName\`, \`taskId\`, \`claimTokenSha256\` (SHA-256 of the current claim token), \`verifiedHead\` (full \`git rev-parse HEAD\` SHA that was verified), \`summary\`, \`verification:[{command,result:"passed",output}]\`, and \`unverified:[]\` (list any checks not run).
+- Create/update the file after claiming. Missing, stale, mismatched, placeholder or symlinked evidence is rejected; the reported SHA must match the clean current HEAD. Later edits or a different HEAD require a new verified code-task handoff; research-only completion cannot authorize integration. It checks the report, not whether the commands actually ran.
 `;
 }
 
@@ -366,6 +358,7 @@ You are a team worker in team "${teamName}". Your identity and assigned tasks ar
 6. Task id format:
    - State/MCP APIs use task_id: "<id>" (example: "1"), never "task-1"
 7. Request a claim via CLI interop (\`omx team api claim-task --json\`); do not directly set lifecycle fields in the task file
+   ${TASK_LEASE_INSTRUCTIONS}
 8. Do the work using your tools
 9. After completing work, commit your changes before reporting completion:
    \`git add -A && git commit -m "task: <task-subject>"\`
@@ -901,6 +894,7 @@ ${approvedContextSection}${workerGoalSection}
 6. Task id format:
    - State/MCP APIs use \`task_id: "<id>"\` (example: \`"1"\`), not \`"task-1"\`.
 7. Request a claim via CLI interop (\`omx team api claim-task --json\`) to claim it
+   ${TASK_LEASE_INSTRUCTIONS}
 8. Complete the work described in the task
 9. After completing work, commit your changes before reporting completion:
    \`git add -A && git commit -m "task: <task-subject>"\`
@@ -982,6 +976,15 @@ export function generateTaskAssignmentInbox(
     : taskOrId;
   const taskId = task.id;
   const taskDescription = task.description;
+  const handedOffClaim = typeof taskOrId !== "string"
+    && taskOrId.status === "in_progress"
+    && taskOrId.claim?.owner === workerName
+    ? taskOrId.claim
+    : undefined;
+  const claimInstruction = handedOffClaim && typeof taskOrId !== "string"
+    ? `The leader already claimed this task for you. Do NOT re-claim it. Use the current handoff: \`claim_token: "${handedOffClaim.token}"\`, \`version: ${taskOrId.version}\`, \`leased_until: "${handedOffClaim.leased_until}"\`. Include this \`claim_token\` in lifecycle transitions and rollback. If the lease has expired or the task file no longer matches, stop and ask the leader for a current assignment.`
+    : "Request a claim via CLI interop (`omx team api claim-task --json`)";
+
   const workerGoalSection = typeof taskOrId === "string"
     ? ""
     : renderTeamWorkerGoalInstruction({
@@ -1019,7 +1022,8 @@ ${workerGoalSection}
 1. Resolve canonical team state root and read the task file at \`<team_state_root>/team/${teamName}/tasks/task-${taskId}.json\`
 2. Task id format:
    - State/MCP APIs use \`task_id: "${taskId}"\` (not \`"task-${taskId}"\`).
-3. Request a claim via CLI interop (\`omx team api claim-task --json\`)
+3. ${claimInstruction}
+   ${TASK_LEASE_INSTRUCTIONS}
 4. Complete the work
 5. After completing work, commit your changes before reporting completion:
    \`git add -A && git commit -m "task: <task-subject>"\`
@@ -1160,14 +1164,10 @@ export function buildLeaderMailboxTriggerDirective(
     "mailbox",
     "leader-fixed.json",
   );
-  if (teamStateRoot !== ".omx/state") {
-    return {
-      intent: "pending-mailbox-review",
-      text: `Read ${mailboxPath}; new msg from ${fromWorker}. Review it; decide next step.`,
-    };
-  }
+  // A queued nudge may be read after shutdown removes the team's mailbox.
+  // Keep terminal handling in the notice itself, not in the deleted state.
   return {
     intent: "pending-mailbox-review",
-    text: `Read ${mailboxPath}; ${fromWorker} sent a new message. Review it and decide the next concrete step.`,
+    text: `Read ${mailboxPath}; msg from ${fromWorker}. Team gone: ignore stale notice; don't ask user or restart. Otherwise review; decide next step.`,
   };
 }

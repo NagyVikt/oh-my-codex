@@ -21,6 +21,70 @@ const legacy = () => ({
 });
 
 describe('buildRepoAwareTeamExecutionPlan', () => {
+  it('distinguishes report file outputs from labeled analysis and evaluated alternatives', () => {
+    const cwd = repo();
+    writeFileSync(join(cwd, '.omx/plans/team-dag-demo.json'), JSON.stringify({
+      schema_version: 1,
+      nodes: [
+        { id: 'report', role: 'executor', subject: 'Analyze request latency', description: 'Write findings to docs/latency-report.md' },
+        { id: 'label', role: 'executor', subject: 'Task: Analyze request latency', description: 'Read existing measurements' },
+        { id: 'audience', role: 'executor', subject: 'Write a report for the team in docs/latency.md', description: 'Use measurements' },
+        { id: 'no-change', role: 'executor', subject: 'Please do not change any files', description: 'Only summarize the current behavior' },
+        { id: 'options', role: 'executor', subject: 'Evaluate package options: replace package A, modify the adapter, or retain the current package', description: 'Report recommendations' },
+        { id: 'implement', role: 'executor', subject: 'Evaluate package options: replace package A or retain it', description: 'Implement the approved option' },
+        { id: 'apply', role: 'executor', subject: 'Investigate the TypeScript build failure', description: 'Apply the approved patch' },
+        { id: 'question', role: 'executor', subject: 'How does the TypeScript build work, and can you please fix the compilation error?', description: 'Read measurements' },
+      ],
+    }));
+    const plan = buildRepoAwareTeamExecutionPlan({ task: 'review', workerCount: 4, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: true, cwd, buildLegacyPlan: legacy, allowDagHandoff: true });
+    assert.deepEqual(plan.tasks.map(task => task.requires_code_change), [true, false, true, false, false, true, true, true]);
+  });
+
+  it('classifies DAG field boundaries and preserves explicit evidence overrides', () => {
+    const cwd = repo();
+    writeFileSync(join(cwd, '.omx/plans/team-dag-demo.json'), JSON.stringify({
+      schema_version: 1,
+      nodes: [
+        { id: 'subject-code', role: 'executor', subject: 'Implement a cache fix', description: 'Analyze request latency and report findings' },
+        { id: 'description-code', role: 'executor', subject: 'Analyze request latency', description: 'Implement the approved cache fix and report findings' },
+        { id: 'explanation', role: 'executor', subject: 'Explain how authentication is wired', description: 'Read existing code' },
+        { id: 'subordinate', role: 'executor', subject: 'Investigate authentication failures', description: 'Investigate authentication failures before implementing a fix with regression tests' },
+        { id: 'localized', role: 'executor', subject: '빌드 오류 수정', description: '컴파일 오류 해결' },
+        { id: 'short-analysis', role: 'executor', subject: 'Analyze request latency', description: 'Inspect measurements' },
+        { id: 'mutation', role: 'executor', subject: 'Analyze request latency', description: 'Edit src/cache.ts and report findings' },
+        { id: 'explicit-false', role: 'executor', subject: 'Implement the cache', description: 'Change runtime', requires_code_change: false },
+        { id: 'explicit-true', role: 'verifier', subject: 'Analyze latency', description: 'Report findings', requires_code_change: true },
+        { id: 'metadata-analysis', role: 'executor', subject: 'Analyze request latency', description: 'Inspect measurements', domains: ['build'], filePaths: ['fix/cache.ts'] },
+        { id: 'sentence-code', role: 'executor', subject: 'Analyze request latency', description: 'Analyze measurements. Change src/cache.ts to fix it' },
+      ],
+    }));
+    const input = { task: 'latency', workerCount: 4, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: true, cwd, buildLegacyPlan: legacy, allowDagHandoff: true };
+    const plan = buildRepoAwareTeamExecutionPlan(input);
+    assert.deepEqual(plan.tasks.map(task => [task.symbolic_id, task.requires_code_change]), [
+      ['subject-code', true], ['description-code', true], ['explanation', false], ['subordinate', true], ['localized', true], ['short-analysis', false], ['mutation', true], ['explicit-false', false], ['explicit-true', true], ['metadata-analysis', false], ['sentence-code', true],
+    ]);
+    const explicit = buildRepoAwareTeamExecutionPlan({ ...input, agentType: 'debugger', explicitAgentType: true });
+    assert.deepEqual(explicit.tasks.map(task => task.requires_code_change), [false, false, false, false, false, false, false, false, true, false, false]);
+  });
+
+  it('defaults code-capable DAG roles to evidence and preserves explicit read-only overrides', () => {
+    const cwd = repo();
+    writeFileSync(join(cwd, '.omx/plans/team-dag-demo.json'), JSON.stringify({
+      schema_version: 1,
+      nodes: [
+        { id: 'impl', role: 'executor', subject: 'Implement limiter', description: 'Change runtime' },
+        { id: 'tests', role: 'test-engineer', subject: 'Write tests', description: 'Add regression tests' },
+        { id: 'review', role: 'verifier', subject: 'Review', description: 'Read-only verification' },
+        { id: 'explicit', role: 'executor', subject: 'Inspect', description: 'Explicit read-only task', requires_code_change: false },
+      ],
+    }));
+    const plan = buildRepoAwareTeamExecutionPlan({
+      task: 'implement', workerCount: 4, agentType: 'executor', explicitAgentType: false, explicitWorkerCount: true,
+      cwd, buildLegacyPlan: legacy, allowDagHandoff: true,
+    });
+    assert.deepEqual(plan.tasks.map((task) => task.requires_code_change), [true, true, false, false]);
+  });
+
   it('falls back to legacy text decomposition when no DAG exists', () => {
     const cwd = repo();
     const plan = buildRepoAwareTeamExecutionPlan({

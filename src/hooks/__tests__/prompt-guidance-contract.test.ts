@@ -19,14 +19,29 @@ describe('prompt guidance contract', () => {
     }
   });
 
-  it('keeps native children non-writing while a Conductor workflow is active', () => {
+  it('keeps the Conductor native capability contract reachable under inherited permissions (#3635)', () => {
     const content = loadSurface('templates/AGENTS.md');
-    assert.match(content, /Conductor workflow is active.*native children are verification\/advice-only/i);
-    assert.match(content, /child-to-leader reporting also requires separate host-authenticated caller, parent, and target proof/i);
-    assert.match(content, /Codex 0\.145\.0 does not expose that proof.*collaboration reporting and source\/product mutations remain denied/i);
-    assert.match(content, /return a bounded read-only result or blocker/i);
-    assert.match(content, /Route implementation through Team only after Team's separate host-authority checks pass/i);
-    assert.match(content, /local state, task text, session fields, trackers, or child provenance as authority/i);
+    assert.match(content, /under ordinary native support with inherited permissions/i);
+    assert.match(content, /may implement, mutate, and report bounded delegated work directly/i);
+    assert.match(content, /reporting back through the native result surface is ordinary completion/i);
+    assert.match(content, /Scope the Main-root Conductor write restriction to the Main lane only/i);
+    assert.match(content, /local state, task text, session fields, trackers, or child provenance remain routing\/diagnostic data/i);
+    assert.match(content, /return a bounded read-only result or blocker with the supported recovery path/i);
+    assert.doesNotMatch(content, /native children are verification\/advice-only/i);
+    assert.doesNotMatch(content, /child-to-leader reporting also requires separate host-authenticated caller, parent, and target proof/i);
+    assert.doesNotMatch(content, /collaboration reporting and source\/product mutations remain denied/i);
+  });
+
+  it('keeps capability guidance free of semver-pinned Codex claims', () => {
+    const pinnedCapabilityClaim = /Codex\s+\d+\.\d+\.\d+\s+does not expose/;
+    for (const surface of listTrackedAgentSurfaces()) {
+      const content = loadSurface(surface);
+      assert.doesNotMatch(
+        content,
+        pinnedCapabilityClaim,
+        `${surface} must state the delegation capability gate by capability, not by a pinned Codex version (issue #3545)`,
+      );
+    }
   });
 
   it('tracked AGENTS and core prompt surfaces stay action-first and avoid permission-seeking softeners', () => {
@@ -40,10 +55,8 @@ describe('prompt guidance contract', () => {
     }
   });
 
-  it('tracked AGENTS and core prompt surfaces encode AUTO-CONTINUE vs ASK autonomy steering', () => {
-    const surfaces = [...listTrackedAgentSurfaces(), ...CORE_ROLE_CONTRACTS.map((contract) => contract.path)];
-
-    for (const surface of surfaces) {
+  it('keeps AUTO-CONTINUE vs ASK autonomy steering in AGENTS.md only', () => {
+    for (const surface of listTrackedAgentSurfaces()) {
       const content = loadSurface(surface);
       assert.match(content, /AUTO-CONTINUE.*clear.*already-requested.*low-risk.*reversible.*local/i);
       assert.match(
@@ -51,6 +64,12 @@ describe('prompt guidance contract', () => {
         /ASK only.*destructive.*irreversible.*credential-gated.*external-production.*materially scope-changing/i,
       );
       assert.match(content, /AUTO-CONTINUE branches.*permission-handoff phrasing/i);
+    }
+
+    for (const contract of CORE_ROLE_CONTRACTS) {
+      const content = loadSurface(contract.path);
+      assert.doesNotMatch(content, /AUTO-CONTINUE.*already-requested/i);
+      assert.doesNotMatch(content, /ASK only.*credential-gated/i);
     }
   });
 });

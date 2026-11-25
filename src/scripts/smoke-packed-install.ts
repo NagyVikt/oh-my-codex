@@ -21,7 +21,7 @@ import { pathToFileURL } from 'node:url';
 import { TextDecoder } from 'node:util';
 
 import TOML, { parse as parseToml } from '@iarna/toml';
-import { isManagedCodexHookCommand, planManagedCodexHooksRemoval } from '../config/codex-hooks.js';
+import { MANAGED_HOOK_EVENTS, isManagedCodexHookCommand, planManagedCodexHooksRemoval } from '../config/codex-hooks.js';
 import {
   spawnPlatformCommand,
   spawnPlatformCommandSync,
@@ -46,15 +46,7 @@ export const PACKED_INSTALL_SMOKE_CORE_COMMANDS = [
   ['sparkshell', '--help'],
 ] as const;
 
-export const MANAGED_CODEX_HOOK_EVENTS = [
-  'SessionStart',
-  'PreToolUse',
-  'PostToolUse',
-  'UserPromptSubmit',
-  'PreCompact',
-  'PostCompact',
-  'Stop',
-] as const;
+export const MANAGED_CODEX_HOOK_EVENTS = MANAGED_HOOK_EVENTS;
 
 export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'directive-use-ralplan', prompt: 'use $ralplan plan this', expectedSkill: 'ralplan', expectedStopBlock: true },
@@ -126,7 +118,7 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'compact-explicit-negation', prompt: '$ralplan,$autopilot are prohibited', expectedSkill: null, expectedStopBlock: false },
   { name: 'compact-implicit-negation', prompt: 'Autopilot mode،deep interview are prohibited.', expectedSkill: null, expectedStopBlock: false },
   { name: 'doc-clause-local-prefix', prompt: '$ralplan; $autopilot is documented in the guide.', expectedSkill: 'ralplan', expectedStopBlock: true },
-  { name: 'doc-chain-described', prompt: 'use $ralplan is the workflow command; autopilot mode is documented in the guide; $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
+  { name: 'doc-chain-described', prompt: 'use $ralplan is the workflow command; autopilot mode is documented in the guide; $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
   { name: 'doc-chain-workflow', prompt: 'use $ralplan is the workflow command; autopilot mode is workflow documentation; use $ralph execute it', expectedSkill: 'ralph', expectedStopBlock: true },
   { name: 'ref-inline-explicit', prompt: '[docs]: $ralplan\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'ref-inline-prompts', prompt: '[docs]: /prompts:architect\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
@@ -152,10 +144,10 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'neg-fw-dot-reopen', prompt: 'Do not run $ralplan． use $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'neg-greek-q-reopen', prompt: 'Do not run $ralplan; use $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'unicode-attached-contrast', prompt: 'Do not use deep interview яbut use autopilot mode.', expectedSkill: null, expectedStopBlock: false },
-  { name: 'prefix-list-followup', prompt: 'Do not run $ralplan, $autopilot; use $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
+  { name: 'prefix-list-followup', prompt: 'Do not run $ralplan, $autopilot; use $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
   { name: 'mixed-postposed-chain', prompt: '$ralplan, autopilot mode, $team are prohibited.', expectedSkill: null, expectedStopBlock: false },
-  { name: 'implicit-first-doc-chain', prompt: 'Autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
-  { name: 'both-mixed-doc-followup', prompt: 'Both autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: false, insideTmux: true },
+  { name: 'implicit-first-doc-chain', prompt: 'Autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
+  { name: 'both-mixed-doc-followup', prompt: 'Both autopilot mode and $ralplan are workflow commands; use $team execute it', expectedSkill: 'team', expectedStopBlock: true, insideTmux: true },
   { name: 'doc-semicolon-preserves-earlier', prompt: 'Use autopilot mode; use $ralplan is the workflow command.', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'doc-independent-comma', prompt: 'Use autopilot mode, and $ralplan is documented in the guide.', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'reference-unclosed-quote-destination', prompt: '[docs]: "target\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
@@ -203,7 +195,7 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'percent-suffix', prompt: '$ralplan%docs', expectedSkill: null, expectedStopBlock: false },
   { name: 'fullwidth-percent-suffix', prompt: '$ralplan％docs', expectedSkill: null, expectedStopBlock: false },
   { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
-  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: [] },
+  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
   { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
   { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
@@ -211,15 +203,30 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
 
 export function assertPackedRegressionWorkflowState(
   testCase: { readonly name: string; readonly expectedSkill: string },
-  skillState: { readonly active?: boolean; readonly skill?: string; readonly phase?: string; readonly error?: string; readonly active_skills?: readonly unknown[] },
+  skillState: {
+    readonly active?: boolean;
+    readonly skill?: string;
+    readonly phase?: string;
+    readonly error?: string;
+    readonly transition_error?: string;
+    readonly active_skills?: readonly unknown[];
+  },
 ): void {
-  const matchesExpectedState = testCase.expectedSkill === 'autopilot'
-    ? skillState.active === false
-      && skillState.skill === 'autopilot'
-      && skillState.phase === 'failed'
-      && skillState.error === 'documented_host_consensus_receipt_unavailable'
-      && skillState.active_skills?.length === 0
-    : skillState.active === true && skillState.skill === testCase.expectedSkill;
+  // `$ralph` is a retired skill token in 0.21.0. UserPromptSubmit must leave a
+  // durable failed sunset receipt instead of activating the legacy workflow.
+  if (testCase.expectedSkill === 'ralph') {
+    const sunsetError = skillState.transition_error ?? skillState.error ?? '';
+    if (
+      skillState.active !== false
+      || skillState.skill !== 'ralph'
+      || skillState.phase !== 'failed'
+      || !sunsetError.includes('Skill "$ralph" has been removed. Use "$ultragoal" instead.')
+    ) {
+      throw new Error(`packed regression ${testCase.name} persisted unexpected retired ralph state`);
+    }
+    return;
+  }
+  const matchesExpectedState = skillState.active === true && skillState.skill === testCase.expectedSkill;
   if (!matchesExpectedState) {
     throw new Error(`packed regression ${testCase.name} persisted unexpected workflow state`);
   }
@@ -228,12 +235,15 @@ export function assertPackedRegressionWorkflowState(
 export function shouldPackedRegressionStopBlock(
   testCase: { readonly expectedSkill: string | null; readonly expectedStopBlock: boolean },
 ): boolean {
-  return testCase.expectedSkill === 'autopilot' ? false : testCase.expectedStopBlock;
+  // A retired `$ralph` prompt records a terminal sunset receipt and must not
+  // prevent Stop from completing.
+  return testCase.expectedSkill !== 'ralph' && testCase.expectedStopBlock;
 }
 
 export function buildPackedRegressionEnvironment(
   testCase: { readonly name: string; readonly insideTmux?: boolean },
   baseEnv: NodeJS.ProcessEnv = process.env,
+  runtimeBinary?: string,
 ): NodeJS.ProcessEnv {
   const insideTmux = testCase.insideTmux === true;
   return {
@@ -253,6 +263,7 @@ export function buildPackedRegressionEnvironment(
     OMX_TMUX_HUD_OWNER: '',
     TMUX: insideTmux ? '/tmp/tmux-pr3140-regression' : '',
     TMUX_PANE: insideTmux ? '%3140' : '',
+    ...(runtimeBinary ? { OMX_RUNTIME_BINARY: runtimeBinary } : {}),
   };
 }
 
@@ -274,6 +285,12 @@ const CODEX_TRUST_STATUSES = new Set([
   'modified',
 ]);
 
+const CODEX_HOOK_SOURCES = new Set([
+  'system', 'user', 'project', 'mdm', 'sessionFlags', 'plugin',
+  'cloudRequirements', 'cloudManagedConfig', 'legacyManagedConfigFile',
+  'legacyManagedConfigMdm', 'unknown',
+]);
+
 const CODEX_EVENT_LABELS: Readonly<Record<string, string>> = {
   preToolUse: 'PreToolUse',
   permissionRequest: 'PermissionRequest',
@@ -281,13 +298,16 @@ const CODEX_EVENT_LABELS: Readonly<Record<string, string>> = {
   preCompact: 'PreCompact',
   postCompact: 'PostCompact',
   sessionStart: 'SessionStart',
+  sessionEnd: 'SessionEnd',
   userPromptSubmit: 'UserPromptSubmit',
   subagentStart: 'SubagentStart',
   subagentStop: 'SubagentStop',
   stop: 'Stop',
+  interrupt: 'Interrupt',
 };
 
-const PINNED_CODEX_VERSION = '0.142.5';
+const PINNED_CODEX_VERSION = '0.153.4';
+
 const PINNED_CODEX_VERSION_OUTPUT = `codex-cli ${PINNED_CODEX_VERSION}`;
 
 /** Sanitized Codex 0.144.5 PreToolUse shape: documented fields only, with no pointer or tracker state. */
@@ -950,11 +970,28 @@ export function parseCodexHooksListResult(
   const hooks = entry.hooks.map((value, index) => {
     const hook = requireRecord(value, `hooks/list hook ${index}`);
     const rawEvent = requireString(hook.eventName, `hooks[${index}].eventName`);
-    const event = CODEX_EVENT_LABELS[rawEvent] ?? rawEvent;
+    if (!Object.hasOwn(CODEX_EVENT_LABELS, rawEvent)) {
+      throw new Error(`Codex hooks/list response has unsupported eventName ${rawEvent}`);
+    }
+    const event = CODEX_EVENT_LABELS[rawEvent];
+    const handlerType = requireString(hook.handlerType, `hooks[${index}].handlerType`);
+    if (handlerType !== 'command') {
+      throw new Error(`Codex hooks/list hook ${index} is not a command handler`);
+    }
     const command = requireString(hook.command, `hooks[${index}].command`);
-    const enabled = hook.enabled === undefined ? true : hook.enabled;
-    if (enabled !== true) {
+    const enabled = hook.enabled;
+    if (typeof enabled !== 'boolean' || enabled !== true) {
       throw new Error(`Codex hooks/list hook ${index} is not an enabled command handler`);
+    }
+    if (typeof hook.isManaged !== 'boolean') {
+      throw new Error(`Codex hooks/list response has invalid hooks[${index}].isManaged`);
+    }
+    const source = requireString(hook.source, `hooks[${index}].source`);
+    if (!CODEX_HOOK_SOURCES.has(source)) {
+      throw new Error(`Codex hooks/list response has unsupported source ${source}`);
+    }
+    if (typeof hook.timeoutSec !== 'number' || !Number.isSafeInteger(hook.timeoutSec) || hook.timeoutSec < 0) {
+      throw new Error(`Codex hooks/list response has invalid hooks[${index}].timeoutSec`);
     }
     const sourcePath = requireString(hook.sourcePath, `hooks[${index}].sourcePath`);
     const key = requireString(hook.key, `hooks[${index}].key`);
@@ -967,7 +1004,6 @@ export function parseCodexHooksListResult(
     if (!CODEX_TRUST_STATUSES.has(trustStatus)) {
       throw new Error(`Codex hooks/list response has unsupported trustStatus ${trustStatus}`);
     }
-
 
     if (sourcePath !== hooksPath) {
       throw new Error(`Codex hooks/list sourcePath mismatch: expected ${hooksPath}, got ${sourcePath}`);
@@ -2284,6 +2320,24 @@ export function buildNativeHookSmokePayload(
         transcript_path: join(smokeCwd, 'nonexistent-transcript.jsonl'),
         prompt: 'packed install native hook smoke test',
       };
+    case 'SubagentStart':
+      return {
+        ...base,
+        agent_id: base.session_id,
+        agent_type: 'executor',
+        turn_id: 'packed-install-smoke-child-turn',
+        transcript_path: null,
+      };
+    case 'SubagentStop':
+      return {
+        ...base,
+        agent_id: 'packed-install-smoke-child',
+        agent_type: 'executor',
+        turn_id: 'packed-install-smoke-child-turn',
+        agent_transcript_path: null,
+        last_assistant_message: null,
+        stop_hook_active: false,
+      };
     case 'PreCompact':
     case 'PostCompact':
     case 'Stop':
@@ -2301,21 +2355,97 @@ function parseNativeHookSmokeOutput(probe: string, stdout: string): Record<strin
   return parsed as Record<string, unknown>;
 }
 
-function requireNativeHookPermissionDeny(probe: string, output: Record<string, unknown>, reason: RegExp): void {
-  const hookSpecificOutput = output.hookSpecificOutput;
-  if (!hookSpecificOutput || typeof hookSpecificOutput !== 'object' || Array.isArray(hookSpecificOutput)) {
-    throw new Error(`native hook ${probe} did not emit hookSpecificOutput`);
+/**
+ * #3497/#3481 contract: PreToolUse is advisory-only. Former conductor/planning
+ * hard-gate deny probes now pin the advisory surface instead. Accepts the two
+ * documented advisory shapes (empty no-op output, or systemMessage plus optional
+ * PreToolUse additionalContext) and rejects anything that would hide a real
+ * regression: a hard block, stopped continuation, a stopReason, any
+ * permissionDecision (deny or allow), or unexpected/malformed fields.
+ */
+export function assertNativeHookAdvisoryPreToolUse(
+  probe: string,
+  output: Record<string, unknown>,
+): void {
+  if (output.decision === 'block') {
+    throw new Error(`native hook ${probe} emitted a hard block; PreToolUse is advisory-only`);
   }
-  const hookOutput = hookSpecificOutput as Record<string, unknown>;
-  if (hookOutput.permissionDecision !== 'deny') {
-    throw new Error(`native hook ${probe} did not deny permission`);
+  if (output.continue === false) {
+    throw new Error(`native hook ${probe} stopped continuation; PreToolUse is advisory-only`);
   }
-  if (!reason.test(String(hookOutput.permissionDecisionReason ?? ''))) {
-    throw new Error(`native hook ${probe} denial did not match ${reason.source}`);
+  if (output.decision !== undefined || output.continue !== undefined) {
+    throw new Error(`native hook ${probe} emitted an unexpected decision/continue shape`);
+  }
+  if (output.stopReason !== undefined) {
+    throw new Error(`native hook ${probe} emitted stopReason ${JSON.stringify(output.stopReason)}`);
+  }
+  const systemMessage = output.systemMessage;
+  if (systemMessage !== undefined && (typeof systemMessage !== 'string' || systemMessage.trim() === '')) {
+    throw new Error(`native hook ${probe} emitted a malformed systemMessage`);
+  }
+  const hasHookSpecificOutput = output.hookSpecificOutput !== undefined;
+  const hookOutput = !hasHookSpecificOutput
+    ? {}
+    : (typeof output.hookSpecificOutput === 'object' && output.hookSpecificOutput !== null && !Array.isArray(output.hookSpecificOutput))
+      ? output.hookSpecificOutput as Record<string, unknown>
+      : null;
+  if (hookOutput === null) {
+    throw new Error(`native hook ${probe} emitted a malformed hookSpecificOutput`);
+  }
+  if (hookOutput.permissionDecision !== undefined) {
+    throw new Error(
+      `native hook ${probe} emitted permissionDecision ${JSON.stringify(hookOutput.permissionDecision)}; PreToolUse is advisory-only`,
+    );
+  }
+  if (hookOutput.hookEventName !== undefined && hookOutput.hookEventName !== 'PreToolUse') {
+    throw new Error(`native hook ${probe} hookSpecificOutput names ${JSON.stringify(hookOutput.hookEventName)}`);
+  }
+  for (const key of Object.keys(output)) {
+    if (key !== 'systemMessage' && key !== 'hookSpecificOutput') {
+      throw new Error(`native hook ${probe} emitted unexpected top-level field ${JSON.stringify(key)}`);
+    }
+  }
+  for (const key of Object.keys(hookOutput)) {
+    if (key !== 'hookEventName' && key !== 'additionalContext') {
+      throw new Error(`native hook ${probe} hookSpecificOutput emitted unexpected field ${JSON.stringify(key)}`);
+    }
+  }
+  if (hasHookSpecificOutput) {
+    if (hookOutput.hookEventName !== 'PreToolUse' || typeof hookOutput.additionalContext !== 'string' || hookOutput.additionalContext.trim() === '') {
+      throw new Error(`native hook ${probe} emitted a malformed PreToolUse advisory envelope`);
+    }
+    if (systemMessage !== hookOutput.additionalContext) {
+      throw new Error(`native hook ${probe} advisory envelope does not mirror systemMessage`);
+    }
   }
 }
+/**
+ * Lists persisted artifacts (files or symlinks) under a state root. The
+ * advisory hook may bootstrap an empty `.omx/state` directory (#3497); only
+ * persisted entries constitute authority-sensitive state creation.
+ */
+export function listPersistedStateFiles(root: string): string[] {
+  let rootStat;
+  try {
+    rootStat = lstatSync(root);
+  } catch (error) {
+    if (isNodeErrorWithCode(error, 'ENOENT')) return [];
+    throw error;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [root];
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) walk(fullPath);
+      else files.push(fullPath);
+    }
+  };
+  walk(root);
+  return files;
+}
 
-function smokeInstalledNativeHookDist(prefixDir: string): void {
+function smokeInstalledNativeHookDist(prefixDir: string, runtimeBinary: string): void {
 function runPackedTransportRegressions(hookScript: string, smokeCwd: string): void {
   const invoke = (cwd: string, environment: NodeJS.ProcessEnv, payload: Record<string, unknown>) => run(process.execPath, [realpathSync(hookScript)], {
     cwd, env: environment, input: JSON.stringify(payload),
@@ -2344,7 +2474,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   ] as const) {
     writeFileSync(path, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', session_id: g1bSession, thread_id: g1bThread, turn_id: g1bPriorTurn, marker }));
   }
-  const g1bEnv = { ...buildPackedRegressionEnvironment({ name: 'g1bu' }), OMX_TEAM_MODE: 'disabled' };
+  const g1bEnv = { ...buildPackedRegressionEnvironment({ name: 'g1bu' }, process.env, runtimeBinary), OMX_TEAM_MODE: 'disabled' };
   const g1bPrompt = '$team $autopilot restart — café';
   const g1bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g1bCwd, session_id: g1bSession, thread_id: g1bThread, turn_id: g1bTurn, prompt: g1bPrompt };
   validateHookStdout('UserPromptSubmit', String(invoke(g1bCwd, g1bEnv, g1bPayload).stdout || ''));
@@ -2364,7 +2494,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g2aFiles = [join(g2aStateDir, 'skill-active-state.json'), join(g2aStateDir, 'ralplan-state.json'), join(g2aSessionDir, 'skill-active-state.json'), join(g2aSessionDir, 'ralplan-state.json'), join(g2aStateDir, 'session.json')];
   mkdirSync(g2aCwd, { recursive: true });
   if (g2aFiles.some((file) => existsSync(file))) throw new Error('packed G2a fixture unexpectedly contains state');
-  const g2aEnv = buildPackedRegressionEnvironment({ name: 'g2a' });
+  const g2aEnv = buildPackedRegressionEnvironment({ name: 'g2a' }, process.env, runtimeBinary);
   const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: g2aSession, thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: 'use $ralplan is the consensus-planning command' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2aCwd, g2aEnv, g2aPayload).stdout || ''));
   if (g2aFiles.some((file) => existsSync(file))) throw new Error('packed G2a stale predecessor created skill/detail state');
@@ -2383,7 +2513,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   writeFileSync(g2bFiles[3]!, JSON.stringify({ mode: 'autopilot', active: false, current_phase: 'complete', completed_at: '2026-06-01T00:00:04.004Z', session_id: g2bSession, thread_id: 'g2b-session-thread', turn_id: 'g2b-session-detail-turn', marker: 'g2b-session-detail' }));
   writeFileSync(g2bFiles[4]!, JSON.stringify({ session_id: g2bSession, cwd: g2bCwd, created_at: '2026-06-01T00:00:05.005Z', updated_at: '2026-06-01T00:00:06.006Z', last_turn_id: 'g2b-session-json-turn', marker: 'g2b-session-json' }));
   const g2bBefore: Buffer[] = g2bFiles.map((file) => readFileSync(file));
-  const g2bEnv = buildPackedRegressionEnvironment({ name: 'g2b' });
+  const g2bEnv = buildPackedRegressionEnvironment({ name: 'g2b' }, process.env, runtimeBinary);
   const g2bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2bCwd, session_id: g2bSession, thread_id: 'g2b-prompt-thread', turn_id: 'g2b-prompt-turn', prompt: 'do not start $autopilot — café' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2bCwd, g2bEnv, g2bPayload).stdout || ''));
   for (const [index, file] of g2bFiles.entries()) if (Buffer.compare(readFileSync(file), g2bBefore[index]!) !== 0) throw new Error(`packed G2b negated prompt mutated terminal state ${file}`);
@@ -2393,11 +2523,17 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g2cCwd = join(smokeCwd, 'g2c-01445');
   mkdirSync(g2cCwd, { recursive: true });
   const g2cPayload = { ...PACKED_CODEX_01445_NO_POINTER_NO_TRACKER_FIXTURE, cwd: g2cCwd };
-  const g2cResult = invoke(g2cCwd, buildPackedRegressionEnvironment({ name: 'g2c-01445' }), g2cPayload);
+  const g2cResult = invoke(g2cCwd, buildPackedRegressionEnvironment({ name: 'g2c-01445' }, process.env, runtimeBinary), g2cPayload);
   const g2cStdout = String(g2cResult.stdout || '');
-  const g2cExpected = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"unsupported_documented_leader_proof: Codex hooks do not expose a documented, non-user-mintable root identity required for adapted Ralplan."}}\n';
-  if (g2cStdout !== g2cExpected) throw new Error('packed Codex 0.144.5 fixture returned unexpected PreToolUse bytes');
-  if (existsSync(join(g2cCwd, '.omx', 'state'))) throw new Error('packed Codex 0.144.5 fixture created pointer or tracker state');
+  // #3497: this historical adapted-Ralplan PreToolUse deny is now advisory;
+  // the CLI preflight still fails closed when the role intent is executed.
+  assertNativeHookAdvisoryPreToolUse(
+    'PreToolUse packed Codex 0.144.5 fixture',
+    parseNativeHookSmokeOutput('PreToolUse packed Codex 0.144.5 fixture', g2cStdout),
+  );
+  if (listPersistedStateFiles(join(g2cCwd, '.omx', 'state')).length > 0) {
+    throw new Error('packed Codex 0.144.5 fixture persisted pointer or tracker state');
+  }
 }
 
   const globalNodeModules = resolveGlobalNodeModules(prefixDir);
@@ -2652,7 +2788,9 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         thread_id: leaderAgentId,
       }, teamEnv).stdout),
     );
-    requireNativeHookPermissionDeny('PreToolUse leader with Team environment', leaderOutput, /Main-root Conductor mode is active/);
+    // #3497/#3481: conductor hard gates were deleted; the leader with Team
+    // environment is no longer denied and must emit advisory-only output.
+    assertNativeHookAdvisoryPreToolUse('PreToolUse leader with Team environment', leaderOutput);
 
     const childEnv = {
       ...hookEnv,
@@ -2696,12 +2834,11 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       actor: 'main-root' | 'native-child',
       probe: string,
       output: Record<string, unknown>,
-      expectedReason = actor === 'native-child' ? /OWNER_CONFIRMATION_REQUIRED/ : /Main-root Conductor mode is active/,
-    ): void => requireNativeHookPermissionDeny(
-      `PreToolUse ${actor} ${probe}`,
-      output,
-      expectedReason,
-    );
+    ): void => {
+      // #3497/#3481: conductor/owner/provenance PreToolUse hard gates were
+      // deleted; these actor probes now pin the advisory-only contract.
+      assertNativeHookAdvisoryPreToolUse(`PreToolUse ${actor} ${probe}`, output);
+    };
     for (const actor of ['main-root', 'native-child'] as const) {
       for (const [probe, command] of [
         ['finite cp directory leaf symlink', 'cp .omx/state/payload .omx/state/inbox'],
@@ -2803,8 +2940,8 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         requireActorDeny(actor, probe, runActorProbe(actor, probe, 'Bash', { command }));
       }
     }
-    requireNativeHookPermissionDeny(
-      'identityless remote mutation',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse identityless remote mutation',
       parseNativeHookSmokeOutput(
         'PreToolUse identityless remote mutation',
         String(invokeAuthorizationProbe({
@@ -2816,7 +2953,6 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
           tool_input: { command: 'PATH=/usr/bin:/bin gh issue create --title x --body y' },
         }, childEnv).stdout),
       ),
-      /OWNER_CONFIRMATION_REQUIRED/,
     );
     for (const [probe, identity] of [
       ['conflicting owner and current thread aliases', { owner_codex_thread_id: leaderAgentId, thread_id: 'agent-packed-install-child' }],
@@ -2824,8 +2960,8 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       ['reversed conflicting session aliases', { session_id: 'foreign-session', sessionId, agent_id: leaderAgentId, thread_id: leaderAgentId }],
       ['conflicting owner and agent aliases', { owner_codex_thread_id: 'foreign-owner', agent_id: leaderAgentId }],
     ] as const) {
-      requireNativeHookPermissionDeny(
-        probe,
+      assertNativeHookAdvisoryPreToolUse(
+        `PreToolUse ${probe}`,
         parseNativeHookSmokeOutput(
           probe,
           String(invokeAuthorizationProbe({
@@ -2838,15 +2974,14 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
             tool_input: { command: 'PATH=/usr/bin:/bin gh issue create --title x --body y' },
           }, childEnv).stdout),
         ),
-        /PROVENANCE_DENIED/,
       );
     }
     for (const [probe, identity] of [
       ['foreign active session', { session_id: 'foreign-session', agent_id: leaderAgentId, thread_id: leaderAgentId }],
       ['absent active session', { agent_id: leaderAgentId, thread_id: leaderAgentId }],
     ] as const) {
-      requireNativeHookPermissionDeny(
-        probe,
+      assertNativeHookAdvisoryPreToolUse(
+        `PreToolUse ${probe}`,
         parseNativeHookSmokeOutput(
           probe,
           String(invokeAuthorizationProbe({
@@ -2858,7 +2993,6 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
             tool_input: { file_path: 'src/session-bypass.ts', content: 'owned\n' },
           }, childEnv).stdout),
         ),
-        /PROVENANCE_DENIED/,
       );
     }
     for (const [order, sessionAliases] of [
@@ -2870,8 +3004,8 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         ['bash', 'Bash', { command: 'printf pwn >& src/alias-bypass.ts' }],
         ['state', 'mcp__omx_state__state_write', { mode: 'ultragoal', active: true }],
       ] as const) {
-        requireNativeHookPermissionDeny(
-          `session alias ${order}/${transport}`,
+        assertNativeHookAdvisoryPreToolUse(
+          `PreToolUse session alias ${order}/${transport}`,
           parseNativeHookSmokeOutput(
             `PreToolUse session alias ${order}/${transport}`,
             String(invokeAuthorizationProbe({
@@ -2885,12 +3019,11 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
               tool_input: toolInput,
             }, childEnv).stdout),
           ),
-          /PROVENANCE_DENIED/,
         );
       }
     }
-    requireNativeHookPermissionDeny(
-      'noncanonical cwd metadata target',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse noncanonical cwd metadata target',
       parseNativeHookSmokeOutput(
         'PreToolUse noncanonical cwd metadata target',
         String(invokeAuthorizationProbe({
@@ -2904,10 +3037,9 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
           tool_input: { file_path: '.omx/state/inbox/cwd-bypass', content: 'owned\n' },
         }, childEnv).stdout),
       ),
-      /Main-root Conductor mode is active/,
     );
-    requireNativeHookPermissionDeny(
-      'identityless native-session remote mutation',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse identityless native-session remote mutation',
       parseNativeHookSmokeOutput(
         'PreToolUse identityless native-session remote mutation',
         String(invokeAuthorizationProbe({
@@ -2919,7 +3051,6 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
           tool_input: { path: 'src/session-bypass.ts' },
         }, childEnv).stdout),
       ),
-      /OWNER_CONFIRMATION_REQUIRED|Main-root Conductor mode is active/,
     );
     if (Object.keys(runActorProbe('main-root', 'finite cp metadata leaf control', 'Bash', {
       command: 'cp .omx/state/payload .omx/handoffs/run-1/payload',
@@ -2943,8 +3074,17 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
     }
     if (Object.keys(runActorProbe('main-root', 'zsh fast startup control', 'Bash', {
       command: `zsh -f -c ':'`,
-    })).length !== 0) {
+    }, { OMX_RUNTIME_BINARY: runtimeBinary })).length !== 0) {
       throw new Error('packed main-root zsh fast startup control should be allowed');
+    }
+    if (Object.keys(runActorProbe('main-root', 'zsh fast startup control ambient startup environment', 'Bash', {
+      command: `zsh -f -c ':'`,
+    }, {
+      OMX_RUNTIME_BINARY: runtimeBinary,
+      ENV: '/dev/null',
+      ZDOTDIR: join(smokeCwd, '.omx', 'state', 'zsh-home'),
+    })).length !== 0) {
+      throw new Error('packed main-root zsh fast startup control should remain allowed with ambient shell-startup environment');
     }
     const boxedPlanningRoot = join(smokeCwd, 'boxed-planning-root');
     const boxedPlanningStateDir = join(boxedPlanningRoot, '.omx', 'state');
@@ -2976,30 +3116,28 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       current_phase: 'planning',
       session_id: boxedPlanningSiblingSessionId,
     }));
-    requireNativeHookPermissionDeny(
-      'main-root boxed planning state symlink',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse main-root boxed planning state symlink',
       runActorProbe('main-root', 'boxed planning state symlink', 'Write', { file_path: boxedPlanningStatePath, content: 'owned\n' }, {
         OMX_ROOT: boxedPlanningRoot,
         OMX_TEAM_STATE_ROOT: '',
       }),
-      /(?:Ralplan is active|Main-root Conductor mode is active)/,
     );
-    requireNativeHookPermissionDeny(
-      'main-root boxed planning state hardlink',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse main-root boxed planning state hardlink',
       runActorProbe('main-root', 'boxed planning state hardlink', 'Write', { file_path: boxedPlanningHardLinkPath, content: 'owned\n' }, {
         OMX_ROOT: boxedPlanningRoot,
         OMX_TEAM_STATE_ROOT: '',
       }),
-      /(?:Ralplan is active|Main-root Conductor mode is active)/,
     );
-    requireNativeHookPermissionDeny(
-      'main-root boxed planning sibling session',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse main-root boxed planning sibling session',
       runActorProbe('main-root', 'boxed planning sibling session', 'Write', { file_path: boxedPlanningSiblingPath, content: 'owned\n' }, {
         OMX_ROOT: boxedPlanningRoot,
         OMX_TEAM_STATE_ROOT: '',
       }),
-      /(?:Ralplan is active|Main-root Conductor mode is active)/,
     );
+
     if (Object.keys(runActorProbe('main-root', 'hardlink metadata source control', 'Bash', {
       command: 'ln .omx/state/conductor-ledger.json .omx/handoffs/run-1/ledger-link',
     })).length !== 0) {
@@ -3046,7 +3184,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
           tool_input: { file_path: 'src/packed-conflict.ts', content: 'escaped' },
         }, childEnv).stdout),
       );
-      requireNativeHookPermissionDeny('PreToolUse conflicting leader identity', output, /PROVENANCE_DENIED/);
+      assertNativeHookAdvisoryPreToolUse('PreToolUse conflicting leader identity', output);
     }
     const consistentLeaderOutput = parseNativeHookSmokeOutput(
       'PreToolUse consistent leader identity',
@@ -3060,7 +3198,8 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         tool_input: { file_path: 'src/packed-consistent-leader.ts', content: 'escaped' },
       }, childEnv).stdout),
     );
-    requireNativeHookPermissionDeny('PreToolUse consistent leader identity', consistentLeaderOutput, /Main-root Conductor mode is active/);
+    // #3497: the consistent leader identity is no longer conductor-denied.
+    assertNativeHookAdvisoryPreToolUse('PreToolUse consistent leader identity', consistentLeaderOutput);
     const ownerSessionClaimOutput = parseNativeHookSmokeOutput(
       'PreToolUse owner-session identity claim',
       String(invokeAuthorizationProbe({
@@ -3073,7 +3212,8 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         tool_input: { file_path: 'src/packed-session-claim.ts', content: 'escaped' },
       }, childEnv).stdout),
     );
-    requireNativeHookPermissionDeny('PreToolUse owner-session identity claim', ownerSessionClaimOutput, /OWNER_CONFIRMATION_REQUIRED/);
+    // #3481: owner-confirmation PreToolUse hard gate was removed.
+    assertNativeHookAdvisoryPreToolUse('PreToolUse owner-session identity claim', ownerSessionClaimOutput);
 
     const wgetReviewMutationCommands = [
       ['bare wget download', 'wget https://example.test/file'],
@@ -3819,8 +3959,8 @@ PY`],
     if (existsSync(join(packedCancelStateDir, 'skill-active-state.json'))) {
       throw new Error('packed issue 3280 cancellation mutated root compatibility state');
     }
-    requireNativeHookPermissionDeny(
-      'main-root boxed planning CLI poisoned state root',
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse main-root boxed planning CLI poisoned state root',
       runActorProbe(
         'main-root',
         'boxed planning CLI poisoned state root',
@@ -3828,7 +3968,6 @@ PY`],
         { command: `OMX_STATE_ROOT=${join(smokeCwd, 'src', 'state')} ${packedNpmCommandPrefix} omx state write --input '{"mode":"ralplan","active":true}' --json` },
         { OMX_ROOT: boxedPlanningRoot, OMX_TEAM_STATE_ROOT: '' },
       ),
-      /(?:Ralplan is active|Main-root Conductor mode is active)/,
     );
     const npmBinPathShadow = join(smokeCwd, '.omx', 'state', 'inbox', 'cat');
     symlinkSync('/usr/bin/touch', npmBinPathShadow);
@@ -4531,21 +4670,20 @@ PY`],
       'sessionless planning state write',
       'mcp__omx_state__state_write',
       { mode: 'ralplan', active: true, current_phase: 'planning' },
-    ), /PROVENANCE_DENIED/);
+    ));
     requireActorDeny('native-child', 'foreign planning state write', runActorProbe(
       'native-child',
       'foreign planning state write',
       'mcp__omx_state__state_write',
       { mode: 'ralplan', active: false, current_phase: 'complete', session_id: 'foreign-session' },
-    ), /PROVENANCE_DENIED/);
+    ));
     symlinkSync(join(smokeCwd, 'src'), join(smokeCwd, '.omx', 'drafts'));
     for (const actor of ['main-root', 'native-child'] as const) {
       const output = runActorProbe(actor, 'linked planning artifact redirect', 'Bash', {
         command: 'printf owned > .omx/drafts/linked-plan.md',
       });
-      if ((output.hookSpecificOutput as { permissionDecision?: string } | undefined)?.permissionDecision !== 'deny') {
-        throw new Error(`packed ${actor} linked planning artifact redirect should be denied`);
-      }
+      // #3497: planning artifact redirects are advisory-only now.
+      assertNativeHookAdvisoryPreToolUse(`PreToolUse ${actor} linked planning artifact redirect`, output);
     }
     writeFileSync(join(stateDir, 'sessions', sessionId, 'skill-active-state.json'), JSON.stringify({
       active: true,
@@ -4578,7 +4716,7 @@ PY`],
     mkdirSync(roleIntentHome, { recursive: true });
     mkdirSync(roleIntentCodexHome, { recursive: true });
     const roleIntentEnvironment = {
-      ...buildPackedRegressionEnvironment({ name: 'issue-3194-role-intent' }),
+      ...buildPackedRegressionEnvironment({ name: 'issue-3194-role-intent' }, process.env, runtimeBinary),
       HOME: roleIntentHome,
       CODEX_HOME: roleIntentCodexHome,
     };
@@ -4596,12 +4734,17 @@ PY`],
         tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
       }),
     });
-    const preToolUseExpected = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"unsupported_documented_leader_proof: Codex hooks do not expose a documented, non-user-mintable root identity required for adapted Ralplan."}}\n';
-    if (String(preToolUseResult.stdout || '') !== preToolUseExpected) {
-      throw new Error('installed #3212 PreToolUse did not emit the exact unsupported denial');
-    }
+    // #3497: the documented-leader PreToolUse hard gate is deleted; the hook
+    // must not hard-deny or emit the unsupported-proof reason. The CLI-level
+    // fail-closed contract below still guards the actual authority boundary.
+    assertNativeHookAdvisoryPreToolUse(
+      'PreToolUse installed #3212 role-intent',
+      parseNativeHookSmokeOutput('PreToolUse installed #3212 role-intent', String(preToolUseResult.stdout || '')),
+    );
     const authorityStateRoot = join(roleIntentCwd, '.omx', 'state');
-    if (existsSync(authorityStateRoot)) throw new Error('installed #3212 PreToolUse created authority-sensitive state');
+    if (listPersistedStateFiles(authorityStateRoot).length > 0) {
+      throw new Error('installed #3212 PreToolUse persisted authority-sensitive state');
+    }
 
     const roleIntentCliResult = spawnSync(process.execPath, [realpathSync(join(packageRoot, 'dist', 'cli', 'omx.js')), 'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', roleIntentNativeSessionId, '--json'], {
       cwd: roleIntentCwd,
@@ -4613,13 +4756,15 @@ PY`],
     if (String(roleIntentCliResult.stdout || '') !== '{"ok":false,"reason":"unsupported_documented_leader_proof"}\n') {
       throw new Error('installed #3212 role-intent CLI returned an unexpected fail-closed denial');
     }
-    if (existsSync(authorityStateRoot)) throw new Error('installed #3212 role-intent CLI created authority-sensitive state');
+    if (listPersistedStateFiles(authorityStateRoot).length > 0) {
+      throw new Error('installed #3212 role-intent CLI persisted authority-sensitive state');
+    }
 
     for (const [caseIndex, testCase] of PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS.entries()) {
       const caseCwd = join(smokeCwd, testCase.name);
       const sessionId = `packed-regression-${caseIndex}`;
       mkdirSync(caseCwd, { recursive: true });
-      const environment = buildPackedRegressionEnvironment(testCase);
+      const environment = buildPackedRegressionEnvironment(testCase, process.env, runtimeBinary);
       const promptPayload = {
         hook_event_name: 'UserPromptSubmit',
         cwd: caseCwd,
@@ -4880,7 +5025,7 @@ export interface PackedHookTrustLifecycleResult {
 export async function smokePackedHookTrustLifecycle(
   omxPath: string,
 ): Promise<PackedHookTrustLifecycleResult> {
-  const lifecycleRoot = mkdtempSync(join(tmpdir(), 'omx-packed-hook-trust-'));
+  const lifecycleRoot = realpathSync(mkdtempSync(join(tmpdir(), 'omx-packed-hook-trust-')));
   const projectDir = resolve(lifecycleRoot, 'project');
   const home = join(lifecycleRoot, 'home');
   const codexHome = join(lifecycleRoot, 'codex-home');
@@ -4967,7 +5112,7 @@ export async function smokePackedHookTrustLifecycle(
     const initialHooksContent = readFileSync(hooksPath, 'utf-8');
     assertForeignHookGroupsPreserved(preSetupForeignSnapshot, initialHooksContent, marker);
     if (rawManagedHookCount(initialHooksContent) !== MANAGED_CODEX_HOOK_EVENTS.length) {
-      throw new Error('packed setup did not install exactly seven managed native hooks');
+      throw new Error(`packed setup did not install exactly ${MANAGED_CODEX_HOOK_EVENTS.length} managed native hooks`);
     }
     assertManagedHooksAppendAfterForeign(initialHooksContent, marker);
     const generatedTrust = generatedHookTrustState(readFileSync(configPath, 'utf-8'));
@@ -5144,40 +5289,31 @@ export async function smokePackedHookTrustLifecycle(
       readFileSync(managedFirstHooksPath, 'utf-8'),
       managedFirstMarker,
     );
-    const managedFirstBeforeUninstallHooksBytes = readFileSync(managedFirstHooksPath);
-    const managedFirstBeforeUninstallConfigBytes = readFileSync(managedFirstConfigPath);
-
-    const expectedUnsafeManagedRemovalDiagnostic =
-      'Removing OMX hooks would shift a foreign coordinate or discard opaque metadata.';
-    const unsafeRemoval = planManagedCodexHooksRemoval(managedFirstBeforeRerunHooks, managedFirstHooksPath);
-    if (
-      unsafeRemoval.ok ||
-      unsafeRemoval.error.code !== 'unsafe_managed_removal' ||
-      unsafeRemoval.error.message !== expectedUnsafeManagedRemovalDiagnostic
-    ) {
-      throw new Error('packed managed-first fixture did not return the exact unsafe_managed_removal diagnostic');
+    const removalPlan = planManagedCodexHooksRemoval(managedFirstBeforeRerunHooks, managedFirstHooksPath);
+    if (!removalPlan.ok || removalPlan.coordinateMoves.length !== managedFirstForeignSnapshot.length) {
+      throw new Error('packed managed-first fixture did not plan every foreign coordinate move');
     }
-    const failedUninstall = spawnSync(omxPath, ['uninstall'], {
+    const uninstallResult = spawnSync(omxPath, ['uninstall'], {
       cwd: managedFirstProjectDir,
       env,
       encoding: 'utf-8',
       stdio: 'pipe',
     });
-    if (failedUninstall.error) throw failedUninstall.error;
-    if (failedUninstall.status !== 1) {
+    if (uninstallResult.error) throw uninstallResult.error;
+    if (uninstallResult.status !== 0) {
       throw new Error(
-        `packed unsafe uninstall exited ${String(failedUninstall.status)}, expected 1\nstdout:\n${failedUninstall.stdout || ''}\nstderr:\n${failedUninstall.stderr || ''}`,
+        `packed managed-first uninstall exited ${String(uninstallResult.status)}, expected 0\nstdout:\n${uninstallResult.stdout || ''}\nstderr:\n${uninstallResult.stderr || ''}`,
       );
     }
-    if (failedUninstall.stderr !== `Error: ${expectedUnsafeManagedRemovalDiagnostic}\n`) {
-      throw new Error(`packed unsafe uninstall returned an unexpected diagnostic: ${failedUninstall.stderr || ''}`);
-    }
-    if (!readFileSync(managedFirstHooksPath).equals(managedFirstBeforeUninstallHooksBytes)) {
-      throw new Error('unsafe packed uninstall changed raw hooks.json bytes');
-    }
-    if (!readFileSync(managedFirstConfigPath).equals(managedFirstBeforeUninstallConfigBytes)) {
-      throw new Error('unsafe packed uninstall changed raw config.toml bytes');
-    }
+    const expectedForeignAfterRemoval = managedFirstForeignSnapshot.map((entry) => {
+      const snapshot = entry as { groupIndex: number };
+      return { ...snapshot, groupIndex: snapshot.groupIndex - 1 };
+    });
+    assertForeignHookGroupsPreserved(
+      expectedForeignAfterRemoval,
+      readFileSync(managedFirstHooksPath, 'utf-8'),
+      managedFirstMarker,
+    );
     assertNoUninstallTransactionArtifacts(join(managedFirstProjectDir, '.codex'));
 
     return { codexVersion };
@@ -5301,10 +5437,16 @@ function smokeInstalledPluginHookLauncher(packageRoot: string, omxPath: string):
       if (String(result.stdout ?? '') !== expectedStdout) {
         throw new Error(`installed plugin hook ${name} stdout changed: expected ${JSON.stringify(expectedStdout)}, received ${JSON.stringify(String(result.stdout ?? ''))}`);
       }
-      assert.deepStrictEqual(readPackedPluginHookDelegateCalls(capturePath), [{
+      const calls = readPackedPluginHookDelegateCalls(capturePath);
+      assert.equal(calls.length, 1, `installed plugin hook ${name} must invoke exactly one delegate`);
+      assertPackedLaunchCwdPreserved(
+        hookCwd,
+        calls[0].cwd,
+        `installed plugin hook ${name} must preserve delegate cwd`,
+      );
+      assert.deepStrictEqual(calls.map(({ argv, stdin }) => ({ argv, stdin })), [{
         argv: ['codex-native-hook'],
         stdin,
-        cwd: hookCwd,
       }], `installed plugin hook ${name} must forward exact delegate argv and stdin`);
     };
 
@@ -5385,10 +5527,16 @@ function smokeInstalledPluginHookLauncher(packageRoot: string, omxPath: string):
       /codex-native-hook exited with code 23/,
       'installed plugin hook Stop delegate failure',
     );
-    assert.deepStrictEqual(readPackedPluginHookDelegateCalls(capturePath), [{
+    const failedStopCalls = readPackedPluginHookDelegateCalls(capturePath);
+    assert.equal(failedStopCalls.length, 1, 'installed plugin hook Stop failure must invoke exactly one delegate');
+    assertPackedLaunchCwdPreserved(
+      hookCwd,
+      failedStopCalls[0].cwd,
+      'installed plugin hook Stop failure must preserve delegate cwd',
+    );
+    assert.deepStrictEqual(failedStopCalls.map(({ argv, stdin }) => ({ argv, stdin })), [{
       argv: ['codex-native-hook'],
       stdin: failedStopInput,
-      cwd: hookCwd,
     }], 'installed plugin hook Stop failure must still delegate exact argv and stdin');
   } finally {
     if (originalPinnedLauncher === undefined) {
@@ -5628,11 +5776,11 @@ async function main(): Promise<void> {
     for (const argv of PACKED_INSTALL_SMOKE_CORE_COMMANDS) {
       run(omxPath, argv, { cwd: repoRoot, env: installEnv });
     }
-    smokeInstalledNativeHookDist(prefixDir);
+    smokeInstalledNativeHookDist(prefixDir, runtimeBinary);
     const lifecycle = await smokePackedHookTrustLifecycle(omxPath);
     console.log(
       lifecycle.codexVersion !== null
-        ? `packed install smoke: installed Codex 0.142.5 lifecycle passed (${lifecycle.codexVersion})`
+        ? `packed install smoke: installed Codex 0.153.4 lifecycle passed (${lifecycle.codexVersion})`
         : 'packed install smoke: Codex executable absent; installed-Codex trust leg skipped after deterministic lifecycle',
     );
 

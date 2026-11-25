@@ -144,7 +144,7 @@ export function parseSinceSpec(value: string | undefined, now = Date.now()): num
   throw new Error(`Invalid --since value "${value}". Use formats like 7d, 24h, or 2026-03-10.`);
 }
 
-async function listRolloutFiles(root: string): Promise<string[]> {
+export async function listRolloutFiles(root: string, failOnReadError = false): Promise<string[]> {
   if (!existsSync(root)) return [];
 
   const files: string[] = [];
@@ -153,7 +153,10 @@ async function listRolloutFiles(root: string): Promise<string[]> {
   while (queue.length > 0) {
     const dir = queue.pop();
     if (!dir) continue;
-    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    const entries = await readdir(dir, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (failOnReadError && error.code !== 'ENOENT') throw error;
+      return [];
+    });
     for (const entry of entries) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) {
@@ -480,4 +483,60 @@ export async function searchSessionHistory(options: SessionSearchOptions): Promi
     sources,
     results: limitedResults,
   };
+}
+
+export interface LatestSessionInfo {
+  session_id: string;
+  timestamp: string | null;
+  cwd: string | null;
+  transcript_path: string;
+}
+
+async function readFirstSessionMeta(filePath: string): Promise<SessionMeta | null> {
+  const reader = createInterface({ input: createReadStream(filePath, 'utf-8'), crlfDelay: Infinity });
+  try {
+    for await (const line of reader) {
+      if (line.trim() === '') continue;
+      return extractSessionMeta(safeParseJson(line));
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    reader.close();
+  }
+}
+
+/**
+ * Newest session (by rollout mtime) across the given Codex homes. This backs
+ * both the exit-time resume block and the `omx resume --last` pre-check, so
+ * they agree with `searchSessionHistory` on what a session is.
+ */
+export async function findLatestSession(options: {
+  codexHomeDirs: string[];
+  modifiedSinceMs?: number;
+  cwdFilter?: string;
+}): Promise<LatestSessionInfo | null> {
+  const sources = await normalizeExistingCodexHomeDirs(options.codexHomeDirs);
+  const candidates: Array<{ path: string; mtimeMs: number }> = [];
+  for (const source of sources) {
+    for (const path of await listRolloutFiles(join(source.dir, 'sessions'))) {
+      const info = await stat(path).catch(() => null);
+      if (!info) continue;
+      if (options.modifiedSinceMs != null && info.mtimeMs < options.modifiedSinceMs) continue;
+      candidates.push({ path, mtimeMs: info.mtimeMs });
+    }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || b.path.localeCompare(a.path));
+  for (const candidate of candidates) {
+    const meta = await readFirstSessionMeta(candidate.path);
+    if (meta) {
+      // Filter by cwd if specified to avoid picking up concurrent sessions from other launches
+      if (options.cwdFilter != null && meta.cwd !== options.cwdFilter) {
+        continue;
+      }
+      return { session_id: meta.sessionId, timestamp: meta.timestamp, cwd: meta.cwd, transcript_path: candidate.path };
+    }
+  }
+  return null;
 }

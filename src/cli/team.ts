@@ -1,3 +1,5 @@
+import { getAgent } from '../agents/definitions.js';
+import { inferTaskEvidenceIntent, QUOTED_LITERAL } from '../team/task-evidence-intent.js';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { updateModeState, startMode, readModeState } from '../modes/base.js';
@@ -28,9 +30,9 @@ import {
   executeTeamApiOperation,
   type TeamApiOperation,
 } from '../team/api-interop.js';
-import { teamReadConfig as readTeamConfig, teamReadPhase as readTeamPhase } from '../team/team-ops.js';
-import { resolveTeamNameForCurrentContext } from '../team/team-identity.js';
-import { recordLeaderRuntimeActivity } from '../team/leader-activity.js';
+import { teamReadConfig as readTeamConfig, teamReadConfigSnapshot as readTeamConfigSnapshot, teamReadPhase as readTeamPhase } from '../team/team-ops.js';
+import { resolveCurrentTeamName, resolveTeamNameForCurrentContext } from '../team/team-identity.js';
+import { resolveCanonicalTeamStateRoot } from '../team/state-root.js';
 import { readTeamPaneStatus } from '../team/pane-status.js';
 import {
   buildApprovedTeamExecutionBinding,
@@ -43,7 +45,7 @@ import {
   readPersistedTeamUltragoalContext,
   renderUltragoalCheckpointGuidanceText,
 } from '../team/ultragoal-context.js';
-import { resolveCodexHomeForLaunch } from './codex-home.js';
+import { resolveCodexHomeForChildExport, resolveCodexHomeForLaunch } from './codex-home.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -280,7 +282,7 @@ function isTerminalModePhase(phase: string): boolean {
 
 const TEAM_HELP = `
 Usage: omx team [N:agent-type] "<task description>"
-       omx team status <team-name> [--json] [--tail-lines <100-1000>] [--model-inspect]
+       omx team status [<team-name>] [--json] [--tail-lines <100-1000>] [--model-inspect]
        omx team await <team-name> [--timeout-ms <ms>] [--after-event-id <id>] [--json]
        omx team resume <team-name>
        omx team shutdown <team-name> [--force] [--confirm-issues]
@@ -331,6 +333,7 @@ const TEAM_API_OPERATION_REQUIRED_FIELDS: Record<TeamApiOperation, string[]> = {
   'list-tasks': ['team_name'],
   'update-task': ['team_name', 'task_id'],
   'claim-task': ['team_name', 'task_id', 'worker'],
+  'renew-task-claim': ['team_name', 'task_id', 'worker', 'claim_token'],
   'transition-task-status': ['team_name', 'task_id', 'from', 'to', 'claim_token'],
   'release-task-claim': ['team_name', 'task_id', 'claim_token', 'worker'],
   'read-config': ['team_name'],
@@ -374,6 +377,7 @@ const TEAM_API_OPERATION_OPTIONAL_FIELDS: Partial<Record<TeamApiOperation, strin
 };
 
 const TEAM_API_OPERATION_NOTES: Partial<Record<TeamApiOperation, string>> = {
+  'renew-task-claim': 'Renew an unexpired claim to at least 15 minutes from now using its current owner and token; expired claims cannot be revived.',
   'update-task': 'Only non-lifecycle task metadata can be updated.',
   'release-task-claim': 'Use this only for rollback/requeue to pending (not for completion).',
   'transition-task-status': 'Lifecycle flow is claim-safe and typically transitions in_progress -> completed|failed.',
@@ -483,14 +487,14 @@ function parseStatusTailLines(args: string[]): number {
       const next = args[index + 1];
       const parsed = Number.parseInt(next || '', 10);
       if (!Number.isFinite(parsed) || parsed < MIN_SPARKSHELL_TAIL_LINES || parsed > MAX_SPARKSHELL_TAIL_LINES) {
-        throw new Error(`Usage: omx team status <team-name> [--json] [--tail-lines <${MIN_SPARKSHELL_TAIL_LINES}-${MAX_SPARKSHELL_TAIL_LINES}>]`);
+        throw new Error(`Usage: omx team status [<team-name>] [--json] [--tail-lines <${MIN_SPARKSHELL_TAIL_LINES}-${MAX_SPARKSHELL_TAIL_LINES}>]`);
       }
       return parsed;
     }
     if (token.startsWith('--tail-lines=')) {
       const parsed = Number.parseInt(token.slice('--tail-lines='.length), 10);
       if (!Number.isFinite(parsed) || parsed < MIN_SPARKSHELL_TAIL_LINES || parsed > MAX_SPARKSHELL_TAIL_LINES) {
-        throw new Error(`Usage: omx team status <team-name> [--json] [--tail-lines <${MIN_SPARKSHELL_TAIL_LINES}-${MAX_SPARKSHELL_TAIL_LINES}>]`);
+        throw new Error(`Usage: omx team status [<team-name>] [--json] [--tail-lines <${MIN_SPARKSHELL_TAIL_LINES}-${MAX_SPARKSHELL_TAIL_LINES}>]`);
       }
       return parsed;
     }
@@ -966,6 +970,7 @@ type DecompositionStrategy = 'numbered' | 'bulleted' | 'conjunction' | 'atomic';
 interface DecompositionCandidate {
   subject: string;
   description: string;
+  requires_code_change?: boolean;
 }
 
 interface DecompositionPlan {
@@ -975,7 +980,7 @@ interface DecompositionPlan {
 
 export interface TeamExecutionPlan {
   workerCount: number;
-  tasks: Array<{ subject: string; description: string; owner: string; role?: string }>;
+  tasks: Array<{ subject: string; description: string; owner: string; role?: string; requires_code_change?: boolean }>;
   overOrchestrationNotice?: {
     code: 'team_over_orchestration_warning' | 'explicit_team_override_acknowledged';
     message: string;
@@ -1035,7 +1040,11 @@ export function buildTeamExecutionPlan(
   explicitAgentType: boolean,
   explicitWorkerCount = false,
 ): TeamExecutionPlan {
-  const plan = splitTaskString(task);
+  let plan = splitTaskString(task);
+  // Keep the original request when splitting changes a described action into a command.
+  if (inferTaskEvidenceIntent(task).analysisOnly && plan.subtasks.some(part => inferTaskEvidenceIntent(part.description).codeChangeRequested)) {
+    plan = { strategy: 'atomic', subtasks: [{ subject: task.slice(0, 80), description: task }] };
+  }
   const taskSize = classifyTaskSize(task).size;
   const effectiveWorkerCount = resolveTeamFanoutLimit(
     task,
@@ -1059,19 +1068,22 @@ export function buildTeamExecutionPlan(
         : undefined
     : undefined;
 
+  const assignRole = (st: DecompositionCandidate) => {
+    const role = explicitAgentType ? agentType
+      : routeTaskToRole(st.subject, st.description, 'team-exec', fallbackRole).role;
+    // CLI subjects are truncated for display; descriptions retain the full request.
+    const { codeChangeRequested, analysisOnly } = inferTaskEvidenceIntent(st.description);
+    const implicitAnalysis = !explicitAgentType && analysisOnly;
+    return { ...st, role, requires_code_change: !explicitAgentType && st.requires_code_change !== undefined
+      ? st.requires_code_change : (!explicitAgentType && codeChangeRequested) || (!implicitAnalysis && (getAgent(role)?.tools ?? 'execution') === 'execution') };
+  };
+
   let subtasks = plan.subtasks;
   const usedAspectSubtasks = subtasks.length <= 1 && effectiveWorkerCount > 1;
-  if (subtasks.length <= 1 && effectiveWorkerCount > 1) {
-    subtasks = createAspectSubtasks(task, effectiveWorkerCount);
+  if (usedAspectSubtasks) {
+    subtasks = createAspectSubtasks(task, effectiveWorkerCount, assignRole(subtasks[0]).requires_code_change);
   }
-
-  const tasksWithRoles = subtasks.map((st) => {
-    if (explicitAgentType) {
-      return { ...st, role: agentType };
-    }
-    const result = routeTaskToRole(st.subject, st.description, 'team-exec', fallbackRole);
-    return { ...st, role: result.role };
-  });
+  const tasksWithRoles = subtasks.map(assignRole);
 
   const normalizedRoles = new Set(tasksWithRoles.map((task) => (task.role ?? '').trim()));
   const tasks = usedAspectSubtasks && tasksWithRoles.length > 1 && normalizedRoles.size <= 1
@@ -1098,7 +1110,7 @@ export function decomposeTaskString(
   agentType: string,
   explicitAgentType: boolean,
   explicitWorkerCount = false,
-): Array<{ subject: string; description: string; owner: string; role?: string }> {
+): TeamExecutionPlan['tasks'] {
   return buildTeamExecutionPlan(task, workerCount, agentType, explicitAgentType, explicitWorkerCount).tasks;
 }
 
@@ -1107,7 +1119,7 @@ const TASK_LABEL_PREFIX = /^(?:task|step|phase|part)\s+[\w-]+(?:\s+[\w-]+)?$/i;
 const ANALYSIS_TASK_PREFIX = /^(?:analy(?:se|ze)|audit|assess|evaluate|explore|investigate|research|review|study|summari(?:s|z)e)\b/i;
 const ANALYSIS_DELIVERABLE_SIGNAL = /\b(?:actionable recommendations?|evidence(?: pointers?)?|findings?|issue|operator|report|root cause|summary|user impact|write-?up)\b/i;
 const CONTEXTUAL_DECOMPOSITION_CLAUSE = /\b(?:focusing on|focus on|including|covers?|covering|with|while|without|ensuring|suitable for|root cause|user impact|evidence pointers|actionable recommendations)\b/i;
-const BULLET_LINE_PATTERN = /^(?:[-*•]|(?:\[\s?[xX]?\]))\s+(.+)$/;
+const BULLET_LINE_PATTERN = /^[\t ]*(?:[-*•]|(?:\[[\t ]?[xX]?\]))[\t ]+(.+)$/gm;
 const FILE_REFERENCE_PATTERN = /(?:^|[\s`'"])([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)(?=$|[\s`'",;:])/g;
 const CODE_SYMBOL_PATTERN = /[`'][A-Za-z_][A-Za-z0-9_.-]*[`']/g;
 const PARALLELIZATION_SIGNAL = /\b(?:acceptance criteria|cross[\s-]cutting|independent|in parallel|separately|verification|verify|tests?|docs?|documentation|benchmarks?|migration|rollout)\b/i;
@@ -1148,10 +1160,17 @@ function canSafelySplitWeakTaskList(task: string, parts: string[]): boolean {
 
 /** Split a task string into sub-tasks using numbered lists or conservative delimiters. */
 function splitTaskString(task: string): DecompositionPlan {
+  if ([...task.matchAll(QUOTED_LITERAL)].some(([literal]) => /[,;\r\n]|\band\b|\d+[.)]\s/i.test(literal))) {
+    return { strategy: 'atomic', subtasks: [{ subject: task.slice(0, 80), description: task }] };
+  }
+
   // Try numbered list: "1. foo 2. bar 3. baz" or "1) foo 2) bar"
   const numberedPattern = /(?:^|\s)(\d+)[.)]\s+/g;
-  const numberedMatches = [...task.matchAll(numberedPattern)];
+  const numberedMatches = [...task.matchAll(numberedPattern)]
+    .filter(match => /^[\r\n]/.test(match[0]) || !/\b(?:version|release|revision|node|v)[\t ]*$/i.test(task.slice(0, match.index)));
   if (numberedMatches.length >= 2) {
+    const header = task.slice(0, numberedMatches[0].index).trim();
+    const analysisHeader = inferTaskEvidenceIntent(header).analysisOnly ? header : '';
     const parts: Array<{ subject: string; description: string }> = [];
     for (let i = 0; i < numberedMatches.length; i++) {
       const prefixLen = numberedMatches[i][0].length;
@@ -1159,21 +1178,25 @@ function splitTaskString(task: string): DecompositionPlan {
       const end = i + 1 < numberedMatches.length ? numberedMatches[i + 1].index! : task.length;
       const text = task.slice(contentStart, end).trim();
       if (text) {
-        parts.push({ subject: text.slice(0, 80), description: text });
+        parts.push({ subject: text.slice(0, 80), description: analysisHeader
+          ? `${analysisHeader}\n${numberedMatches[i][0].trim()} ${text}` : text });
       }
     }
     if (parts.length >= 2) return { strategy: 'numbered', subtasks: parts };
   }
 
-  const bulletParts = task
-    .split(/\r?\n+/)
-    .map((line) => line.trim())
-    .map((line) => line.match(BULLET_LINE_PATTERN)?.[1]?.trim() ?? '')
-    .filter((line) => line.length > 0);
-  if (bulletParts.length >= 2) {
+  const bulletMatches = [...task.matchAll(BULLET_LINE_PATTERN)];
+  if (bulletMatches.length >= 2) {
+    const header = task.slice(0, bulletMatches[0].index).trim();
+    const analysisHeader = inferTaskEvidenceIntent(header).analysisOnly ? header : '';
     return {
       strategy: 'bulleted',
-      subtasks: bulletParts.map((part) => ({ subject: part.slice(0, 80), description: part })),
+      subtasks: bulletMatches.map((match, index) => {
+        const end = bulletMatches[index + 1]?.index ?? task.length;
+        const contentStart = match.index! + match[0].length - match[1].length;
+        return { subject: match[1].trim().slice(0, 80), description: analysisHeader
+          ? `${analysisHeader}\n${task.slice(match.index, end).trim()}` : task.slice(contentStart, end).trim() };
+      }),
     };
   }
 
@@ -1204,11 +1227,12 @@ function splitTaskString(task: string): DecompositionPlan {
 function createAspectSubtasks(
   task: string,
   workerCount: number,
-): Array<{ subject: string; description: string }> {
+  requiresCodeChange: boolean,
+): DecompositionCandidate[] {
   const aspects = [
-    { subject: `Implement: ${task}`.slice(0, 80), description: `Implement the core functionality for: ${task}` },
-    { subject: `Test: ${task}`.slice(0, 80), description: `Write tests and verify: ${task}` },
-    { subject: `Review and document: ${task}`.slice(0, 80), description: `Review code quality and update documentation for: ${task}` },
+    { subject: `Implement: ${task}`.slice(0, 80), description: `Implement the core functionality for: ${task}`, requires_code_change: requiresCodeChange },
+    { subject: `Test: ${task}`.slice(0, 80), description: `Write tests and verify: ${task}`, requires_code_change: requiresCodeChange },
+    { subject: `Review and document: ${task}`.slice(0, 80), description: `Review code quality and update documentation for: ${task}`, requires_code_change: false },
   ];
 
   // Return up to workerCount aspects, repeating implementation for extra workers
@@ -1218,6 +1242,7 @@ function createAspectSubtasks(
     result.push({
       subject: `Additional work (${idx + 1}): ${task}`.slice(0, 80),
       description: `Continue implementation work on: ${task}`,
+      requires_code_change: requiresCodeChange,
     });
   }
   return result;
@@ -1225,10 +1250,10 @@ function createAspectSubtasks(
 
 /** Distribute tasks across workers using an inspectable allocation policy. */
 function distributeTasksToWorkers(
-  tasks: Array<{ subject: string; description: string; role?: string; blocked_by?: string[] }>,
+  tasks: Array<{ subject: string; description: string; role?: string; blocked_by?: string[]; requires_code_change?: boolean }>,
   workerCount: number,
   workerRole?: string,
-): Array<{ subject: string; description: string; owner: string; role?: string }> {
+): TeamExecutionPlan['tasks'] {
   const workers = Array.from({ length: workerCount }, (_, index) => ({
     name: `worker-${index + 1}`,
     role: workerRole,
@@ -1400,7 +1425,12 @@ export function buildLeaderMonitoringHints(teamName: string): string[] {
 
 export async function teamCommand(args: string[], _options: TeamCliOptions = {}): Promise<void> {
   const cwd = process.cwd();
-  const codexHomeOverride = resolveCodexHomeForLaunch(cwd, process.env);
+  const codexHomeOverride = resolveCodexHomeForChildExport(process.env);
+  // Issue #3629: keep the project-derived home for model/reasoning planning
+  // (buildFollowupStaffingPlan), but export only a child-safe CODEX_HOME into
+  // startTeam, which copies it into worker environments. Project-scope
+  // workers resolve scope and credential provenance in their own process.
+  const codexHomeForPlanning = resolveCodexHomeForLaunch(cwd, process.env);
   const parsedWorktree = parseWorktreeMode(args);
   const worktreeMode = resolveDefaultTeamWorktreeMode(parsedWorktree.mode);
   const teamArgs = parsedWorktree.remainingArgs;
@@ -1474,28 +1504,35 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   }
 
   if (subcommand === 'status') {
-    const name = teamArgs[1];
-    const wantsJson = teamArgs.includes('--json');
-    if (!name) throw new Error('Usage: omx team status <team-name> [--json]');
-    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
-    await recordLeaderRuntimeActivity(cwd, 'team_status', resolvedName);
-    const snapshot = await monitorTeam(resolvedName, cwd);
+    const statusArgs = teamArgs.slice(1);
+    const tailLines = parseStatusTailLines(statusArgs);
+    const modelInspect = parseStatusModelInspect(statusArgs);
+    const name = statusArgs.find((token, index) => !token.startsWith('-')
+      && (index === 0 || statusArgs[index - 1] !== '--tail-lines'));
+    const wantsJson = statusArgs.includes('--json');
+    const resolvedName = name
+      ? resolveTeamNameForCurrentContext(name, cwd)
+      : resolveCurrentTeamName(cwd);
+    if (!resolvedName) throw new Error('Usage: omx team status [<team-name>] [--json]');
+    const snapshot = await monitorTeam(resolvedName, cwd, { readOnly: true });
     if (!snapshot) {
+      const stateRoot = resolveCanonicalTeamStateRoot(cwd);
+      const statePath = join(stateRoot, 'team', resolvedName);
       if (wantsJson) {
         console.log(JSON.stringify({
           ...buildJsonBase(),
           command: 'omx team status',
-          team_name: name,
+          team_name: name ?? resolvedName,
           status: 'missing',
+          state_root: stateRoot,
+          state_path: statePath,
         }));
         return;
       }
-      console.log(`No team state found for ${name}`);
+      console.log(`No team state found for ${name} (searched: ${statePath})`);
       return;
     }
-    const tailLines = parseStatusTailLines(teamArgs.slice(2));
-    const modelInspect = parseStatusModelInspect(teamArgs.slice(2));
-    const config = await readTeamConfig(resolvedName, cwd);
+    const config = await readTeamConfigSnapshot(resolvedName, cwd);
     const paneStatus = await readTeamPaneStatus(config, cwd, snapshot, tailLines);
     const ultragoalContext = await readPersistedTeamUltragoalContext(
       resolvedName,
@@ -1689,7 +1726,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     const staffingPlan = buildFollowupStaffingPlan('team', runtime.config.task, availableAgentTypes, {
       workerCount: runtime.config.worker_count,
       fallbackRole: resolveImplicitTeamFallbackRole(runtime.config.agent_type, false),
-      codexHomeOverride,
+      codexHomeOverride: codexHomeForPlanning,
     });
     await renderStartSummary(runtime, staffingPlan);
     return;
@@ -1719,7 +1756,12 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         error: error instanceof Error ? error.message : String(error),
       });
     });
-    console.log(`Team shutdown complete: ${name}`);
+    if (summary.configExisted) {
+      console.log(`Team shutdown complete: ${name}`);
+    } else {
+      const statePath = join(resolveCanonicalTeamStateRoot(cwd), 'team', resolvedName);
+      console.log(`No team state found for ${name} (searched: ${statePath}); cleanup of selected scope completed.`);
+    }
     if (summary.commitHygieneArtifacts) {
       console.log(`commit_hygiene_context_json: ${summary.commitHygieneArtifacts.jsonPath}`);
       console.log(`commit_hygiene_context_md: ${summary.commitHygieneArtifacts.markdownPath}`);
@@ -1748,7 +1790,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   const staffingPlan = buildFollowupStaffingPlan('team', parsed.task, availableAgentTypes, {
     workerCount: executionPlan.workerCount,
     fallbackRole: resolveImplicitTeamFallbackRole(parsed.agentType, parsed.explicitAgentType),
-    codexHomeOverride,
+    codexHomeOverride: codexHomeForPlanning,
   });
   const runtime = await startTeam(
     parsed.teamName,
@@ -1758,7 +1800,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     tasks,
     cwd,
     {
-      codexHomeOverride,
+      codexHomeOverride, // child-safe export value (undefined for project scope)
       worktreeMode,
       decompositionMetadata: executionPlan.metadata,
       approvedExecution: parsed.approvedExecution ?? null,

@@ -270,6 +270,18 @@ describe('CI Rust gates', () => {
     assert.doesNotMatch(testJob, /^\s+npm run build$/m);
   });
 
+  it('provisions the current Rust runtime explicitly for Linux and Darwin state-mutating Node lanes', () => {
+    const workflow = readCiWorkflow();
+    for (const jobName of ['ralplan-preflight-macos', 'test', 'coverage-team-critical', 'ralph-persistence-gate']) {
+      const job = jobBlock(workflow, jobName);
+      assert.match(job, /OMX_RUNTIME_BINARY:\s*\$\{\{ github\.workspace \}\}\/target\/debug\/omx-runtime/);
+      assert.match(job, /uses:\s*dtolnay\/rust-toolchain@v1/);
+      assert.match(job, /toolchain:\s*stable/);
+      assert.match(job, /name:\s*Build current omx-runtime for state-mutating Node tests/);
+      assert.match(job, /run:\s*npm run build:runtime/);
+    }
+  });
+
   it('defines the native-cache-integrity matrix and aggregate-status contract exactly', () => {
     const workflow = readCiWorkflow();
     const nativeCacheJob = jobBlock(workflow, 'native-cache-integrity');
@@ -287,7 +299,7 @@ describe('CI Rust gates', () => {
     assert.match(nativeCacheJob, /node --test\s*\\\n\s+dist\/cli\/__tests__\/native-assets\.test\.js\s*\\\n\s+dist\/cli\/__tests__\/sparkshell-cli\.test\.js\s*\\\n\s+dist\/cli\/__tests__\/api\.test\.js\s*\\\n\s+dist\/scripts\/__tests__\/verify-native-release-assets\.test\.js\s*\\\n\s+dist\/verification\/__tests__\/native-release-manifest\.test\.js\s*\\\n\s+dist\/verification\/__tests__\/explore-harness-release-workflow\.test\.js\s*\\\n\s+dist\/verification\/__tests__\/ci-rust-gates\.test\.js/);
 
     assert.match(ciStatusJob, /^    if: always\(\)$/m);
-    assert.match(ciStatusJob, /^    needs:\s*\[changes, docs-check, rustfmt, clippy, rust-tests, native-rust-darwin, native-rust-windows, lint, typecheck, build-dist, ralplan-preflight-macos, test, coverage-team-critical, ralph-persistence-gate, native-cache-integrity, build\]$/m);
+    assert.match(ciStatusJob, /^    needs:\s*\[changes, docs-check, rustfmt, clippy, rust-tests, native-rust-darwin, native-rust-windows, lint, typecheck, build-dist, ralplan-preflight-macos, test, test-windows-js, coverage-team-critical, ralph-persistence-gate, native-cache-integrity, build\]$/m);
     assert.match(ciStatusJob, /NATIVE_CACHE_INTEGRITY_RESULT: \$\{\{ needs\.native-cache-integrity\.result \}\}/);
     assert.match(ciStatusJob, /if \[\[ "\$FULL_SUITE" == "true" \]\] \|\| bool_any "\$TS_CHANGED" "\$NATIVE_CHANGED" "\$SHARED_CONFIG_CHANGED"; then native_cache_integrity_active=true; fi/);
     assert.match(ciStatusJob, /check_job native-cache-integrity "\$NATIVE_CACHE_INTEGRITY_RESULT" "\$native_cache_integrity_active"/);
@@ -313,7 +325,7 @@ describe('CI Rust gates', () => {
   it('uses npm package caching without skipping clean dependency installs', () => {
     const workflow = readCiWorkflow();
 
-    for (const jobName of ['lint', 'typecheck', 'build-dist', 'test', 'coverage-team-critical', 'ralph-persistence-gate', 'native-cache-integrity', 'build']) {
+    for (const jobName of ['lint', 'typecheck', 'build-dist', 'test', 'test-windows-js', 'coverage-team-critical', 'ralph-persistence-gate', 'native-cache-integrity', 'build']) {
       const job = jobBlock(workflow, jobName);
 
       assert.match(job, /uses:\s*actions\/setup-node@v7/);
@@ -328,9 +340,17 @@ describe('CI Rust gates', () => {
       assert.match(jobBlock(workflow, jobName), /uses:\s*Swatinem\/rust-cache@v2/);
     }
 
+    const windowsHistoryJob = jobBlock(workflow, 'test-windows-js');
+    assert.match(windowsHistoryJob, /runs-on:\s*windows-latest/);
+    assert.match(windowsHistoryJob, /timeout-minutes:\s*30/);
+    assert.match(windowsHistoryJob, /run:\s*npm ci --ignore-scripts/);
+    assert.match(windowsHistoryJob, /node --test/);
+    assert.match(windowsHistoryJob, /serializes concurrent JSONL cleanup appends/);
+    assert.match(windowsHistoryJob, /runs project resume integration on Windows/);
+
     assert.match(
       workflow,
-      /needs:\s*\[changes, docs-check, rustfmt, clippy, rust-tests, native-rust-darwin, native-rust-windows, lint, typecheck, build-dist, ralplan-preflight-macos, test, coverage-team-critical, ralph-persistence-gate, native-cache-integrity, build\]/,
+      /needs:\s*\[changes, docs-check, rustfmt, clippy, rust-tests, native-rust-darwin, native-rust-windows, lint, typecheck, build-dist, ralplan-preflight-macos, test, test-windows-js, coverage-team-critical, ralph-persistence-gate, native-cache-integrity, build\]/,
     );
   });
 
@@ -358,6 +378,7 @@ describe('CI Rust gates', () => {
       'build-dist',
       'ralplan-preflight-macos',
       'test',
+      'test-windows-js',
       'coverage-team-critical',
       'ralph-persistence-gate',
       'native-cache-integrity',
@@ -366,7 +387,7 @@ describe('CI Rust gates', () => {
 
     assert.match(
       ciStatusJob,
-      /needs:\s*\[changes, docs-check, rustfmt, clippy, rust-tests, native-rust-darwin, native-rust-windows, lint, typecheck, build-dist, ralplan-preflight-macos, test, coverage-team-critical, ralph-persistence-gate, native-cache-integrity, build\]/,
+      /needs:\s*\[changes, docs-check, rustfmt, clippy, rust-tests, native-rust-darwin, native-rust-windows, lint, typecheck, build-dist, ralplan-preflight-macos, test, test-windows-js, coverage-team-critical, ralph-persistence-gate, native-cache-integrity, build\]/,
     );
 
     for (const jobName of requiredJobs) {

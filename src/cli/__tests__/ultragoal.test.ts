@@ -14,6 +14,9 @@ import {
   NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE,
   writeRoleRoutingMarker,
 } from '../../subagents/role-routing-marker.js';
+import { readHudConfig, readAllState, readUltragoalState } from '../../hud/state.js';
+import { renderHud } from '../../hud/render.js';
+import { parseCodexGoalSnapshot, reconcileCodexGoalSnapshot } from '../../goal-workflows/codex-goal-snapshot.js';
 import { ultragoalCommand, ULTRAGOAL_HELP } from '../ultragoal.js';
 
 async function withCwd<T>(run: (cwd: string) => Promise<T>): Promise<T> {
@@ -406,6 +409,25 @@ describe('cli/ultragoal', () => {
       assert.match(output, /ultragoal aggregate product: complete/);
       assert.match(output, /codex goal fallback: Codex goal DB\/schema\/context is unavailable/);
       assert.match(output, /codex goal warning: .*no such table: thread_goals/);
+    });
+  });
+
+  it('reports native get_goal tool catalog unavailability without claiming goal completion', async () => {
+    await withCwd(async () => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+      const status = await capture(() => ultragoalCommand([
+        'status', '--codex-goal-json',
+        JSON.stringify({ error: 'INVALID_ARGUMENT: Native nested tool inventory did not return one matching catalog record' }),
+        '--json',
+      ]));
+      assert.equal(status.exitCode, undefined);
+      const parsed = JSON.parse(status.stdout.join('\n')) as {
+        summary: { complete: number }; codexGoalFallback?: { reason: string; message: string };
+      };
+      assert.equal(parsed.summary.complete, 0);
+      assert.equal(parsed.codexGoalFallback?.reason, 'tool_unavailable');
+      assert.match(parsed.codexGoalFallback?.message ?? '', /native tool catalog/);
     });
   });
 
@@ -921,3 +943,128 @@ describe('cli/ultragoal', () => {
     });
   });
 });
+
+  it('checkpoint --strict enforces cohort gate while ordinary does not', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- Final milestone']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+      const goals = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as { codexObjective: string };
+      // Ordinary completes without gate.
+      const ordinary = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-final-milestone',
+        '--status', 'complete',
+        '--evidence', 'tests passed',
+        '--codex-goal-json', JSON.stringify({ goal: { objective: goals.codexObjective, status: 'complete' } }),
+        '--json',
+      ]));
+      assert.equal(ordinary.exitCode, undefined);
+
+      // New plan for strict test
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- Second milestone', '--force']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+      const goals2 = JSON.parse(await readFile(join(cwd, '.omx/ultragoal/goals.json'), 'utf-8')) as { codexObjective: string; goals: Array<{ id: string }> };
+      const gid = goals2.goals[0]!.id;
+      const strictFail = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', gid,
+        '--status', 'complete',
+        '--evidence', 'tests passed',
+        '--codex-goal-json', JSON.stringify({ goal: { objective: goals2.codexObjective, status: 'complete' } }),
+        '--strict',
+        '--json',
+      ]));
+      assert.equal(strictFail.exitCode, 1);
+      assert.match(strictFail.stderr.join('\n'), /quality-gate-json|quality gate/i);
+
+      const strictOk = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', gid,
+        '--status', 'complete',
+        '--evidence', 'tests passed',
+        '--codex-goal-json', JSON.stringify({ goal: { objective: goals2.codexObjective, status: 'complete' } }),
+        '--quality-gate-json', cleanQualityGate(),
+        '--strict',
+        '--json',
+      ]));
+      assert.equal(strictOk.exitCode, undefined);
+    });
+  });
+
+  it('keeps visible HUD, durable status, and null Codex goal state distinct for legacy plans', async () => {
+    await withCwd(async (cwd) => {
+      const planPath = join(cwd, '.omx', 'ultragoal', 'goals.json');
+      const ledgerPath = join(cwd, '.omx', 'ultragoal', 'ledger.jsonl');
+      const now = '2026-08-26T15:30:00.000Z';
+      const legacyGoal = {
+        id: 'G001-legacy',
+        title: 'Legacy HUD state',
+        objective: 'Reconcile legacy durable state',
+        attempt: 1,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const writePlan = async (goal: Record<string, unknown>, extra: Record<string, unknown> = {}) => {
+        await mkdir(join(cwd, '.omx', 'ultragoal'), { recursive: true });
+        await writeFile(planPath, `${JSON.stringify({
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+          briefPath: '.omx/ultragoal/brief.md',
+          goalsPath: '.omx/ultragoal/goals.json',
+          ledgerPath: '.omx/ultragoal/ledger.jsonl',
+          codexGoalMode: 'aggregate',
+          codexObjective: 'Complete the durable ultragoal plan in .omx/ultragoal/goals.json.',
+          goals: [goal],
+          ...extra,
+        }, null, 2)}\n`);
+        await writeFile(ledgerPath, '');
+      };
+
+      const nullCodexGoal = parseCodexGoalSnapshot({ goal: null });
+      assert.equal(nullCodexGoal.available, false);
+
+      await writePlan({ ...legacyGoal, status: 'complete', completedAt: now }, {
+        aggregateCompletion: { status: 'complete', completedAt: now, evidence: 'legacy completion receipt' },
+      });
+      const completedHud = await readUltragoalState(cwd);
+      const completedVisible = renderHud({
+        ...(await readAllState(cwd, await readHudConfig(cwd))),
+        ultragoal: completedHud,
+      }, 'focused');
+      const completedStatus = await capture(() => ultragoalCommand(['status', '--json']));
+      const completedStatusJson = JSON.parse(completedStatus.stdout.join('\n')) as {
+        summary: { aggregateComplete: boolean; artifactComplete: boolean };
+      };
+      assert.equal(completedHud?.active, false);
+      assert.doesNotMatch(completedVisible, /ultragoal/);
+      assert.equal(completedStatusJson.summary.aggregateComplete, true);
+      assert.equal(completedStatusJson.summary.artifactComplete, true);
+      assert.equal(reconcileCodexGoalSnapshot(nullCodexGoal, {
+        expectedObjective: 'Complete the durable ultragoal plan in .omx/ultragoal/goals.json.',
+      }).ok, true);
+
+      await writePlan({ ...legacyGoal, status: 'review_blocked', reviewBlockedAt: now }, {
+        activeGoalId: legacyGoal.id,
+      });
+      const blockedHud = await readUltragoalState(cwd);
+      const blockedVisible = renderHud({
+        ...(await readAllState(cwd, await readHudConfig(cwd))),
+        ultragoal: blockedHud,
+      }, 'focused');
+      const blockedStatus = await capture(() => ultragoalCommand(['status', '--json']));
+      const blockedStatusJson = JSON.parse(blockedStatus.stdout.join('\n')) as {
+        summary: { reviewBlocked: number };
+        reconciliation?: { snapshot: { available: boolean }; warnings: string[] };
+      };
+      assert.equal(blockedHud?.active, true);
+      assert.match(blockedVisible, /ultragoal/);
+      assert.equal(blockedStatusJson.summary.reviewBlocked, 1);
+      assert.equal(blockedStatusJson.reconciliation?.snapshot.available, false);
+      assert.match(blockedStatusJson.reconciliation?.warnings.join('\n') ?? '', /call get_goal/);
+
+      const create = await capture(() => ultragoalCommand(['create-goals', '--brief', '- replacement plan']));
+      assert.equal(create.exitCode, 1);
+      assert.match(create.stderr.join('\n'), /Refusing to overwrite existing/);
+    });
+  });

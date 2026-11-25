@@ -1,3 +1,5 @@
+import { getAgent } from '../agents/definitions.js';
+import { inferTaskEvidenceIntent } from './task-evidence-intent.js';
 import { existsSync } from 'node:fs';
 import { relative } from 'node:path';
 import { allocateTasksToWorkers } from './allocation-policy.js';
@@ -209,18 +211,25 @@ function buildFromDag(input: LegacyTeamExecutionPlanInput, resolution: TeamDagRe
     role: input.explicitAgentType ? input.agentType : undefined,
   }));
 
-  const allocationInput = sorted.map((node) => ({
-    subject: node.subject,
-    description: enrichNodeDescription(node, input.cwd),
-    role: input.explicitAgentType ? input.agentType : node.role,
-    blocked_by: node.depends_on ?? [],
-    symbolic_depends_on: node.depends_on ?? [],
-    requires_code_change: node.requires_code_change,
-    filePaths: node.filePaths,
-    domains: inferDomains(node),
-    lane: node.lane,
-    symbolic_id: node.id,
-  }));
+  const allocationInput = sorted.map((node) => {
+    const enrichedDescription = enrichNodeDescription(node, input.cwd);
+    const resolvedRole = input.explicitAgentType ? input.agentType : node.role ?? input.agentType;
+    const { analysisOnly } = inferTaskEvidenceIntent(node.subject, node.description);
+    const implicitAnalysis = !input.explicitAgentType && analysisOnly;
+    return {
+      subject: node.subject,
+      description: enrichedDescription,
+      role: resolvedRole,
+      blocked_by: node.depends_on ?? [],
+      symbolic_depends_on: node.depends_on ?? [],
+      requires_code_change: node.requires_code_change
+        ?? (implicitAnalysis ? false : (getAgent(resolvedRole)?.tools ?? 'execution') === 'execution'),
+      filePaths: node.filePaths,
+      domains: inferDomains(node),
+      lane: node.lane,
+      symbolic_id: node.id,
+    };
+  });
   const allocated = allocateTasksToWorkers(allocationInput, workers);
   const allocationReasons: Record<string, string> = {};
   const tasks = allocated.map((task): RepoAwareTask => {

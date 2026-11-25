@@ -1,4 +1,5 @@
 import { createHash } from "crypto";
+import { existsSync, realpathSync } from "fs";
 import { readdir, realpath } from "fs/promises";
 import { basename, dirname, join, relative, resolve, win32 } from "path";
 
@@ -9,6 +10,8 @@ export const MANAGED_HOOK_EVENTS = [
   "UserPromptSubmit",
   "PreCompact",
   "PostCompact",
+  "SubagentStart",
+  "SubagentStop",
   "Stop",
 ] as const;
 
@@ -77,6 +80,8 @@ const CODEX_HOOK_EVENT_LABELS: Record<ManagedHookEventName, string> = {
   UserPromptSubmit: "user_prompt_submit",
   PreCompact: "pre_compact",
   PostCompact: "post_compact",
+  SubagentStart: "subagent_start",
+  SubagentStop: "subagent_stop",
   Stop: "stop",
 };
 
@@ -223,10 +228,75 @@ export function resolveWindowsPowerShellPath(
   );
 }
 
+/**
+ * Homebrew and Linuxbrew expose node through stable `bin/node` symlinks that are
+ * repointed on every `brew upgrade node`, while `process.execPath` resolves to the
+ * version-pinned Cellar path (e.g. `/opt/homebrew/Cellar/node/26.0.0/bin/node`).
+ * Persisting that pinned path into `~/.codex/hooks.json` makes every managed
+ * codex hook exit 127 the moment node is upgraded and the old Cellar directory
+ * is cleaned up. When possible, normalize it to the stable symlink so hooks
+ * survive node upgrades. Non-Homebrew paths are returned unchanged.
+ *
+ * Stability check: only maps to stable path if it exists and either:
+ * - realpaths to the same binary, or
+ * - points to the same major version of node
+ */
+export function resolveStableNodePath(
+  execPath: string = process.execPath,
+): string {
+  // Check for Homebrew Cellar paths and map to stable symlink
+  const cellarMatch = execPath.match(/^(.+?)(\/Cellar\/node\/[^/]+)(\/bin\/node)$/);
+  if (!cellarMatch) return execPath;
+
+  const [, prefix, , ] = cellarMatch;
+  const stableNodePath = `${prefix}/bin/node`;
+
+  // Verify the stable path exists before using it
+  if (!existsSync(stableNodePath)) {
+    return execPath;
+  }
+
+  try {
+    // Verify that both paths exist and resolve to compatible versions
+    const currentRealpath = realpathSync(execPath);
+    const stableRealpath = realpathSync(stableNodePath);
+
+    // If they point to the same file, use the stable path
+    if (currentRealpath === stableRealpath) {
+      return stableNodePath;
+    }
+
+    // Check if they're different binaries of the same major version
+    // This handles the case where the Cellar path and stable path might point
+    // to different node binaries during a brew upgrade transitional state
+    // For now, fall back to execPath if they don't match exactly
+    return execPath;
+  } catch {
+    // If we can't verify, fall back to execPath
+    return execPath;
+  }
+}
+
 export function buildManagedCodexNativeHookWindowsShimPath(
   codexHomeDir: string,
 ): string {
   return win32.join(codexHomeDir, ...WINDOWS_NATIVE_HOOK_SHIM_RELATIVE_PATH);
+}
+
+/**
+ * Build a filesystem-compatible shim path for the current OS.
+ * Used when the shimPath needs to be written to or read from disk on non-Windows systems.
+ * On Windows, this is identical to buildManagedCodexNativeHookWindowsShimPath().
+ * On POSIX, this converts the Windows-formatted path to a POSIX path.
+ */
+export function buildManagedCodexNativeHookWindowsShimPathForFilesystem(
+  codexHomeDir: string,
+): string {
+  if (process.platform === "win32") {
+    return buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+  }
+  // On POSIX, use the host OS path module to build a proper POSIX path
+  return join(codexHomeDir, ...WINDOWS_NATIVE_HOOK_SHIM_RELATIVE_PATH);
 }
 
 export type ManagedCodexNativeHookWindowsShimOwnership =
@@ -343,7 +413,7 @@ export function buildManagedCodexNativeHookWindowsShimContent(
   const hookScript =
     options.hookScriptPath ??
     win32.join(pkgRoot, "dist", "scripts", "codex-native-hook.js");
-  const nodePath = options.nodePath ?? process.execPath;
+  const nodePath = options.nodePath ?? resolveStableNodePath();
 
   // Windows PowerShell 5.1 (powershell.exe) decodes BOM-less .ps1 files using
   // the system ANSI codepage, which mojibakes non-ASCII install paths embedded
@@ -391,7 +461,7 @@ export function buildManagedCodexNativeHookCommand(
   }
   const hookScript = join(pkgRoot, "dist", "scripts", "codex-native-hook.js");
 
-  return `${quoteCommandPart(process.execPath)} ${quoteCommandPart(hookScript)}`;
+  return `${quoteCommandPart(resolveStableNodePath())} ${quoteCommandPart(hookScript)}`;
 }
 
 function buildCommandHook(
@@ -441,6 +511,12 @@ export function buildManagedCodexHooksConfig(
         buildCommandHook(command),
       ],
       PostCompact: [
+        buildCommandHook(command),
+      ],
+      SubagentStart: [
+        buildCommandHook(command),
+      ],
+      SubagentStop: [
         buildCommandHook(command),
       ],
       Stop: [
@@ -627,6 +703,24 @@ export interface ManagedCodexHooksCoordinateProof {
   };
 }
 
+export interface ManagedCodexHookCoordinateMove {
+  eventName: string;
+  oldGroupIndex: number;
+  oldHandlerIndex: number;
+  newGroupIndex: number;
+  newHandlerIndex: number;
+  oldKey: string;
+  newKey: string;
+  /** Missing when the current definition contains metadata OMX cannot hash safely. */
+  expectedTrustedHash?: string;
+}
+
+export interface ManagedCodexHookRemovalCoordinate {
+  eventName: string;
+  groupIndex: number;
+  handlerIndex: number;
+}
+
 export interface ManagedCodexHooksPlan {
   ok: true;
   finalContent: string | null;
@@ -636,6 +730,8 @@ export interface ManagedCodexHooksPlan {
   hasForeignHooks: boolean;
   coordinateProof: ManagedCodexHooksCoordinateProof;
   priorTrustState: Record<string, ManagedCodexHookTrustState>;
+  removedCoordinates: ManagedCodexHookRemovalCoordinate[];
+  coordinateMoves: ManagedCodexHookCoordinateMove[];
   diagnostics: CodexHooksDiagnostic[];
   legacyTrustState: Record<string, CodexHooksJsonTrustStateEntry>;
 }
@@ -2106,13 +2202,18 @@ function versionForCodexTomlIdentity(value: unknown): string {
   return `sha256:${createHash("sha256").update(canonicalJsonString(value)).digest("hex")}`;
 }
 
+function codexHookEventLabel(eventName: CodexHookEventName): string {
+  return (CODEX_HOOK_EVENT_LABELS as Partial<Record<CodexHookEventName, string>>)[eventName] ??
+    eventName.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
 function managedHookStateKey(
   hooksPath: string,
-  eventName: ManagedHookEventName,
+  eventName: CodexHookEventName,
   groupIndex: number,
   handlerIndex: number,
 ): string {
-  return `${hooksPath}:${CODEX_HOOK_EVENT_LABELS[eventName]}:${groupIndex}:${handlerIndex}`;
+  return `${hooksPath}:${codexHookEventLabel(eventName)}:${groupIndex}:${handlerIndex}`;
 }
 
 function canonicalHookForEvent(entry: ManagedHookEntry): Record<string, unknown> {
@@ -2234,6 +2335,86 @@ function fullRemovalGroupKeys(
     keys.set(group.eventName, eventKeys);
   }
   return keys;
+}
+
+function foreignHookTrustHash(
+  eventName: CodexHookEventName,
+  group: RawGroupModel,
+  handler: RawHandlerModel,
+  options: ManagedCodexHookOptions,
+): string | undefined {
+  if (
+    group.opaque ||
+    hasOpaqueProperties(handler.node, KNOWN_COMMAND_FIELDS) ||
+    stringProperty(handler.node, "type") !== "command"
+  ) return undefined;
+
+  const command = effectiveCommandForPlatform(handler.node, options.platform ?? process.platform);
+  const timeout = objectProperty(handler.node, "timeout");
+  const timeoutValue = timeout?.value.kind === "number"
+    ? timeout.value.raw === "0"
+      ? 1
+      : new CanonicalJsonNumber(timeout.value.raw)
+    : 600;
+  const status = nullableStringProperty(handler.node, "statusMessage");
+  const asynchronous = objectProperty(handler.node, "async");
+  const matcher = matcherIsAware(eventName) ? groupMatcher(group.node) : undefined;
+
+  return versionForCodexTomlIdentity({
+    event_name: codexHookEventLabel(eventName),
+    ...(typeof matcher === "string" ? { matcher } : {}),
+    hooks: [{
+      type: "command",
+      command,
+      timeout: timeoutValue,
+      async: asynchronous?.value.kind === "boolean" && asynchronous.value.value,
+      ...(status !== undefined && status !== null ? { statusMessage: status } : {}),
+    }],
+  });
+}
+
+function foreignHookCoordinateMoves(
+  model: OwnershipModel,
+  ownersToRemove: ReadonlySet<ManagedOwner>,
+  hooksPath: string,
+  options: ManagedCodexHookOptions,
+): ManagedCodexHookCoordinateMove[] {
+  const removedGroups = fullRemovalGroupKeys(model, ownersToRemove);
+  const groupsByEvent = new Map<CodexHookEventName, RawGroupModel[]>();
+  for (const group of model.groups) {
+    const groups = groupsByEvent.get(group.eventName) ?? [];
+    groups.push(group);
+    groupsByEvent.set(group.eventName, groups);
+  }
+
+  const moves: ManagedCodexHookCoordinateMove[] = [];
+  for (const [eventName, groups] of groupsByEvent) {
+    const survivingGroups = groups.filter((group) => !removedGroups.get(eventName)?.has(group.groupIndex));
+    for (const group of groups) {
+      const newGroupIndex = survivingGroups.indexOf(group);
+      if (newGroupIndex < 0) continue;
+      const remainingHandlers = group.handlers.filter((handler) =>
+        !handler.owner || !ownersToRemove.has(handler.owner)
+      );
+      for (const [oldHandlerIndex, handler] of group.handlers.entries()) {
+        if (!handler.foreign) continue;
+        const newHandlerIndex = remainingHandlers.indexOf(handler);
+        if (group.groupIndex === newGroupIndex && oldHandlerIndex === newHandlerIndex) continue;
+        const expectedTrustedHash = foreignHookTrustHash(eventName, group, handler, options);
+        moves.push({
+          eventName,
+          oldGroupIndex: group.groupIndex,
+          oldHandlerIndex,
+          newGroupIndex,
+          newHandlerIndex,
+          oldKey: managedHookStateKey(hooksPath, eventName, group.groupIndex, oldHandlerIndex),
+          newKey: managedHookStateKey(hooksPath, eventName, newGroupIndex, newHandlerIndex),
+          ...(expectedTrustedHash ? { expectedTrustedHash } : {}),
+        });
+      }
+    }
+  }
+  return moves;
 }
 
 function arrayWithoutElements(
@@ -2545,6 +2726,8 @@ function finalizePlan(
   hooksPath: string,
   options: ManagedCodexHookOptions,
   priorTrustState: Record<string, ManagedCodexHookTrustState>,
+  coordinateMoves: ManagedCodexHookCoordinateMove[] = [],
+  removedCoordinates: ManagedCodexHookRemovalCoordinate[] = [],
 ): ManagedCodexHooksPlanResult {
   if (finalContent === null) {
     return {
@@ -2558,6 +2741,8 @@ function finalizePlan(
       coordinateProof,
       diagnostics: [],
       legacyTrustState,
+      coordinateMoves,
+      removedCoordinates,
     };
   }
   const validation = validateCodexHooksDocument(finalContent, options);
@@ -2573,6 +2758,8 @@ function finalizePlan(
     priorTrustState,
     hasForeignHooks: foreignHooksInDocument(validation, options),
     coordinateProof,
+    coordinateMoves,
+    removedCoordinates,
     diagnostics: validation.result.diagnostics,
     legacyTrustState,
   };
@@ -2668,7 +2855,21 @@ export function planManagedCodexHooksMerge(
     return planFailure(planError("invalid_document", "Source edits prevented a safe duplicate cleanup.", { cause: String(error) }), afterMerge.result.diagnostics);
   }
   if (finalContent instanceof ManagedCodexHooksPlanError) return planFailure(finalContent, afterMerge.result.diagnostics);
-  return finalizePlan(existingContent, finalContent, removeOwners.size, proof, prepared.legacyTrustState, hooksPath, resolvedOptions, priorScan.trustState);
+  const removedCoordinates = [...removeOwners]
+    .map(({ eventName, groupIndex, handlerIndex }) => ({ eventName, groupIndex, handlerIndex }))
+    .sort((left, right) => left.eventName.localeCompare(right.eventName) || left.groupIndex - right.groupIndex || left.handlerIndex - right.handlerIndex);
+  return finalizePlan(
+    existingContent,
+    finalContent,
+    removeOwners.size,
+    proof,
+    prepared.legacyTrustState,
+    hooksPath,
+    resolvedOptions,
+    priorScan.trustState,
+    [],
+    removedCoordinates,
+  );
 }
 
 export function planManagedCodexHooksRemoval(
@@ -2687,10 +2888,18 @@ export function planManagedCodexHooksRemoval(
   if (ownership instanceof ManagedCodexHooksPlanError) return planFailure(ownership, validation.result.diagnostics);
   const removeOwners = new Set(ownership.owners);
   const proof = removalProof(ownership, removeOwners);
-  if (!proof.safe) {
+  const coordinateMoves = foreignHookCoordinateMoves(ownership, removeOwners, hooksPath, resolvedOptions);
+  const proofOnlyReportsReorder = proof.shifted?.newCoordinate !== undefined;
+  if (!proof.safe && !proofOnlyReportsReorder) {
+    const moveSummary = coordinateMoves.length > 0
+      ? ` Coordinate changes: ${coordinateMoves.map((move) => `${move.eventName} [${move.oldGroupIndex},${move.oldHandlerIndex}] -> [${move.newGroupIndex},${move.newHandlerIndex}] (${JSON.stringify(move.oldKey)} -> ${JSON.stringify(move.newKey)})`).join("; ")}.`
+      : "";
     return {
       ok: false,
-      error: planError("unsafe_managed_removal", "Removing OMX hooks would shift a foreign coordinate or discard opaque metadata.", proof.shifted ? { shifted: proof.shifted } : {}),
+      error: planError("unsafe_managed_removal", `Removing OMX hooks would shift a foreign coordinate or discard opaque metadata.${moveSummary}`, {
+        ...(proof.shifted ? { shifted: proof.shifted } : {}),
+        ...(coordinateMoves.length > 0 ? { coordinateMoves } : {}),
+      }),
       diagnostics: validation.result.diagnostics,
     };
   }
@@ -2701,7 +2910,20 @@ export function planManagedCodexHooksRemoval(
     return planFailure(planError("invalid_document", "Source edits prevented safe removal.", { cause: String(error) }), validation.result.diagnostics);
   }
   if (finalContent instanceof ManagedCodexHooksPlanError) return planFailure(finalContent, validation.result.diagnostics);
-  return finalizePlan(existingContent, finalContent, removeOwners.size, proof, prepared.legacyTrustState, hooksPath, resolvedOptions, priorScan.trustState);
+  return finalizePlan(
+    existingContent,
+    finalContent,
+    removeOwners.size,
+    { safe: true },
+    prepared.legacyTrustState,
+    hooksPath,
+    resolvedOptions,
+    priorScan.trustState,
+    coordinateMoves,
+    [...removeOwners]
+      .map(({ eventName, groupIndex, handlerIndex }) => ({ eventName, groupIndex, handlerIndex }))
+      .sort((left, right) => left.eventName.localeCompare(right.eventName) || left.groupIndex - right.groupIndex || left.handlerIndex - right.handlerIndex),
+  );
 }
 
 function codexHookEntries(

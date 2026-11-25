@@ -63,6 +63,8 @@ import {
   waitForWorkerReadyAsync,
   paneIsBootstrapping,
   parseSplitWindowPaneId,
+  bindSplitReceiptToPaneCommand,
+  bindSplitWindowReceiptFormat,
   classifyWorkerStartupInjectSafety,
   checkWorkerStartupInjectSafety,
   dismissTrustPromptIfPresent,
@@ -78,6 +80,7 @@ import { readExactPaneProof, readExactPaneProofSync } from '../exact-pane.js';
 
 const fsMutable = fs as typeof fs & {
   existsSync: typeof fs.existsSync;
+  readFileSync: typeof fs.readFileSync;
   fsyncSync: typeof fs.fsyncSync;
   statSync: typeof fs.statSync;
 };
@@ -129,6 +132,19 @@ function withMockedFsyncSync<T>(mock: typeof fs.fsyncSync, fn: () => T): T {
   }
 }
 
+function neutralizeWslProcVersionForNativeWindowsTest(): () => void {
+  const original = fsMutable.readFileSync;
+  fsMutable.readFileSync = ((path: fs.PathOrFileDescriptor, ...args: any[]) => {
+    if (path === '/proc/version') return 'Linux version native-windows-test-host';
+    return (original as (...callArgs: any[]) => any)(path, ...args);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+  return () => {
+    fsMutable.readFileSync = original;
+    syncBuiltinESMExports();
+  };
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -139,6 +155,15 @@ const CLAUDE_BYPASS_PROMPT_CAPTURE = `Bypass Permissions mode
 2. Yes, I accept
 
 Press Enter to confirm`;
+
+const CLAUDE_BYPASS_PROMPT_2_1_CAPTURE = `WARNING: Claude Code running in Bypass Permissions mode.
+
+Claude Code may make mistakes. Bypassing permissions removes safety checks.
+
+1. No, exit
+2. Yes, I accept
+
+Do you want to confirm that you want to use this mode?`;
 
 const READY_HELPER_CAPTURE = `╭────────────────────────────────────────────╮
 │ >_ OpenAI Codex (v0.114.0)                 │
@@ -161,6 +186,28 @@ const VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE = `╭─────────�
 const VIEWPORT_SCROLLBACK_READY_CAPTURE = `${VIEWPORT_WITHOUT_VISIBLE_PROMPT_CAPTURE}
 
 › support lane on multi-image attach`;
+
+const CLAUDE_TRUST_PROMPT_2_1_CAPTURE = `Quick safety check: Is this a project you created or one you trust?
+
+1. Yes, I trust this folder
+2. No, exit`;
+
+const CODEX_TRUST_PROMPT_CAPTURE = `Do you trust the contents of this directory?
+
+Yes, continue
+No, quit`;
+
+const CODEX_FOLDER_ACCESS_CAPTURE = `Folder access
+/tmp/team/worktrees/worker-2
+
+Trust this folder? Codex can read, edit, and run files here, subject to your permission settings.
+Folder settings can run code automatically, even without a model request.
+Continue only if you trust these files. Your trust decision will be saved.
+
+› 1. Trust and continue
+  2. Quit
+
+enter continue · esc quit`;
 
 const QUEUED_AFTER_TOOL_CALL_CAPTURE = `• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
   ↳ Read $OMX_TEAM_STATE_ROOT/team/demo/workers/worker-1/inbox.md, work now, report progress
@@ -289,6 +336,12 @@ if [ "${'$'}1" = "if-shell" ] && [ "${'$'}{2:-}" = "-F" ] && [ "${'$'}{3:-}" = "
   receipt="$(printf '%s' "$success" | sed -n "s/.*\\(omx_source_[A-Za-z0-9_]*\\).*/\\1/p")"
   effect="${'$'}{success%% ; display-message*}"
   eval "set -- $effect"
+  split_format=''
+  previous=''
+  for arg in "${'$'}@"; do
+    if [ "$previous" = '-F' ]; then split_format="$arg"; break; fi
+    previous="$arg"
+  done
   output="$($0 "${'$'}@")" || exit 1
   case "${'$'}1" in
     split-window)
@@ -302,7 +355,7 @@ if [ "${'$'}1" = "if-shell" ] && [ "${'$'}{2:-}" = "-F" ] && [ "${'$'}{3:-}" = "
         mkdir -p "$source_state"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$session" "$session_id" "$created" "$index" "$window_id" "$created_pid" > "$source_state/$created_pane"
       }
-      printf '%s\t%s\n' "$created_pane" "$receipt"
+      printf '%s\n' "$split_format" | sed "s/#{pane_id}/$created_pane/g"
       ;;
     *) printf '%s\\n' "$receipt" ;;
   esac
@@ -342,7 +395,7 @@ esac
         const captured = spawnSync('tmux', ['display-message', '-p', '-t', '%1', '#{session_name}\t#{session_id}\t#{session_created}\t#{window_index}\t#{window_id}\t#{pane_id}\t#{pane_pid}'], { encoding: 'utf8' });
         assert.equal(captured.status, 0);
         assert.equal(captured.stdout, 'recycled\t$1\t1\t0\t@0\t%1\t101\n');
-        const guarded = spawnSync('tmux', ['if-shell', '-F', '-t', '%1', '#{==:#{pane_pid},101}', "split-window -h -t %1 -P -F '#{pane_id}\tomx_source_recycled' ; display-message -p 'omx_source_recycled'", "display-message -p ''"], { encoding: 'utf8' });
+        const guarded = spawnSync('tmux', ['if-shell', '-F', '-t', '%1', '#{==:#{pane_pid},101}', "split-window -h -t %1 -P -F '#{pane_id}:omx_source_recycled' ; display-message -p 'omx_source_recycled'", "display-message -p ''"], { encoding: 'utf8' });
         assert.equal(guarded.status, 0);
         assert.equal(guarded.stdout, '');
         assert.equal(fs.existsSync(`${logPath}.split`), false);
@@ -376,7 +429,7 @@ esac
         const guarded = spawnSync('tmux', [
           'if-shell', '-F', '-t', '%1',
           '#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_id},%1},#{&&:#{==:#{pane_pid},101},#{&&:#{==:#{session_id},$1},#{&&:#{==:#{session_created},1},#{&&:#{==:#{window_id},@0},#{==:#{@omx_team_pane_owner_id},team:original}}}}}}',
-          `split-window -h -t %1 -P -F '#{pane_id}\\t${receipt}' ; display-message -p '${receipt}'`,
+          `split-window -h -t %1 -P -F '#{pane_id}:${receipt}' ; display-message -p '${receipt}'`,
           "display-message -p ''",
         ], { encoding: 'utf8' });
         assert.equal(guarded.status, 0);
@@ -769,6 +822,68 @@ Press enter to continue`, 'codex'), {
   });
 });
 
+describe('trust and Claude bypass prompt detection', () => {
+  it('blocks the Codex folder-access numbered-choice dialog', () => {
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(CODEX_FOLDER_ACCESS_CAPTURE, 'codex'), {
+      safe: false,
+      reason: 'trust_prompt',
+    });
+    assert.equal(classifyWorkerStartupInjectSafety(CODEX_FOLDER_ACCESS_CAPTURE), 'trust_prompt');
+    assert.notEqual(
+      evaluateStartupDirectTriggerSafetyCapture('Trust this folder?\n1. Something unrelated', 'codex').reason,
+      'trust_prompt',
+    );
+  });
+
+  it('blocks folder access when wrapped explanations push the question beyond twelve rows', () => {
+    const capture = CODEX_FOLDER_ACCESS_CAPTURE.replace(
+      'Folder settings',
+      'Wrapped folder-access explanation.\n'.repeat(13) + 'Folder settings',
+    );
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(capture, 'codex'), {
+      safe: false,
+      reason: 'trust_prompt',
+    });
+    assert.equal(classifyWorkerStartupInjectSafety(capture), 'trust_prompt');
+  });
+
+  it('matches Codex and pre-2.1 Claude trust wording', () => {
+    assert.equal(
+      evaluateStartupDirectTriggerSafetyCapture('Do you trust the contents of this directory?\nPress enter to continue', 'codex').reason,
+      'trust_prompt',
+    );
+    assert.equal(evaluateStartupDirectTriggerSafetyCapture(CODEX_TRUST_PROMPT_CAPTURE, 'codex').reason, 'trust_prompt');
+  });
+
+  it('matches the Claude 2.1.x quick-safety-check numbered-choice trust prompt', () => {
+    assert.equal(
+      evaluateStartupDirectTriggerSafetyCapture(CLAUDE_TRUST_PROMPT_2_1_CAPTURE, 'claude').reason,
+      'trust_prompt',
+    );
+    assert.equal(classifyWorkerStartupInjectSafety(CLAUDE_TRUST_PROMPT_2_1_CAPTURE), 'trust_prompt');
+  });
+
+  it('does not flag ordinary pane text as a trust prompt', () => {
+    assert.notEqual(evaluateStartupDirectTriggerSafetyCapture(READY_HELPER_CAPTURE, 'codex').reason, 'trust_prompt');
+    assert.notEqual(
+      evaluateStartupDirectTriggerSafetyCapture('Do you trust the contents of this directory?\n1. Something unrelated', 'codex').reason,
+      'trust_prompt',
+    );
+    assert.notEqual(
+      evaluateStartupDirectTriggerSafetyCapture('Quick safety check: unrelated banner\n1. Yes, I trust this folder\n2. No, exit', 'claude').reason,
+      'trust_prompt',
+    );
+  });
+
+  it('blocks the Claude 2.1.x bypass-permissions warning with numbered choices', () => {
+    assert.equal(
+      evaluateStartupDirectTriggerSafetyCapture(CLAUDE_BYPASS_PROMPT_2_1_CAPTURE, 'claude').reason,
+      'claude_bypass_prompt',
+    );
+    assert.equal(classifyWorkerStartupInjectSafety(CLAUDE_BYPASS_PROMPT_2_1_CAPTURE), 'claude_bypass_prompt');
+  });
+});
+
 describe('sendToWorker validation', () => {
   it('rejects text over 200 chars', async () => {
     await assert.rejects(
@@ -876,7 +991,7 @@ esac
       async ({ logPath }) => {
         await sendToWorker('omx-team-x', 1, 'check inbox');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 Enter/g) || []).length;
         assert.equal(
           enterCount,
           2,
@@ -884,6 +999,49 @@ esac
         );
         assert.match(log, /capture-pane -t omx-team-x:1 -p/);
         assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+      },
+    );
+  });
+
+  it('submits claude worker triggers with the tmux named key Enter, never C-m', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-claude-submit-named-enter-',
+      (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+text_sent_file="$state_dir/text-sent"
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if [ -f "$text_sent_file" ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+✻ Welcome to Claude Code
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
+      : > "$text_sent_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+      async ({ logPath }) => {
+        await sendToWorker('omx-team-x', 1, 'check inbox', undefined, 'claude');
+        const log = await readFile(logPath, 'utf-8');
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 Enter/g) || []).length;
+        assert.ok(enterCount >= 1, `expected named Enter submits for a claude worker:\n${log}`);
+        assert.doesNotMatch(log, /send-keys -t omx-team-x:1 C-m/, `claude submit must not use C-m:\n${log}`);
+        assert.doesNotMatch(log, /send-keys -t omx-team-x:1 Tab/, `claude submit must not queue via Tab:\n${log}`);
       },
     );
   });
@@ -930,7 +1088,7 @@ EOF
     if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "check inbox" ]; then
       : > "$text_sent_file"
     fi
-    if [ "\${4:-}" = "C-m" ]; then
+    if [ "\${4:-}" = "Enter" ]; then
       enter_count=0
       if [ -f "$enter_count_file" ]; then
         enter_count=$(cat "$enter_count_file")
@@ -948,7 +1106,7 @@ esac
       async ({ logPath }) => {
         await sendToWorker('omx-team-x', 1, 'check inbox');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 Enter/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected extra submit nudges when Codex queues the trigger:\n${log}`,
@@ -1001,7 +1159,7 @@ esac
           /submit_queued_after_tool_call/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 Enter/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing closed on stuck queued banner:\n${log}`,
@@ -1052,7 +1210,7 @@ esac
           /submit_failed/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t omx-team-x:1 Enter/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing on the still-visible wrapped draft:\n${log}`,
@@ -1210,6 +1368,19 @@ describe('shouldAttemptAdaptiveRetry', () => {
 });
 
 describe('paneIsBootstrapping (#391)', () => {
+  it('blocks the Codex waiting-for-startup viewport before folder access appears', () => {
+    const capture = `OpenAI Codex (v0.163.0)
+directory: /tmp/team
+› Ask Codex to do anything
+Waiting for startup · esc cancel`;
+    assert.equal(paneIsBootstrapping(capture), true);
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(capture, 'codex'), {
+      safe: false,
+      reason: 'bootstrapping',
+    });
+    assert.equal(classifyWorkerStartupInjectSafety(capture), 'bootstrapping');
+  });
+
   it('detects "loading" keyword', () => {
     assert.equal(paneIsBootstrapping(['loading model weights…']), true);
   });
@@ -1224,6 +1395,16 @@ describe('paneIsBootstrapping (#391)', () => {
 
   it('detects "connecting to" keyword', () => {
     assert.equal(paneIsBootstrapping(['connecting to server']), true);
+  });
+
+  it('keeps completed loading output safe for startup injection', () => {
+    const capture = 'OpenAI Codex\nFinished loading dependencies.\n› Ask Codex to do anything';
+    assert.equal(paneIsBootstrapping(capture), false);
+    assert.deepEqual(evaluateStartupDirectTriggerSafetyCapture(capture, 'codex'), {
+      safe: true,
+      reason: 'ready_prompt',
+    });
+    assert.equal(classifyWorkerStartupInjectSafety(capture), 'safe');
   });
 
   it('returns false for normal ready prompt', () => {
@@ -1379,6 +1560,37 @@ describe('buildWorkerStartupCommand', () => {
     } finally {
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('assigns fresh plugin-hook routing context to each Codex worker launch', () => {
+    const previousEntryPath = process.env.OMX_ENTRY_PATH;
+    const previousLaunchId = process.env.OMX_CODEX_LAUNCH_ID;
+    delete process.env.OMX_ENTRY_PATH;
+    delete process.env.OMX_CODEX_LAUNCH_ID;
+    try {
+      const inheritedLeaderContext = {
+        OMX_CODEX_LAUNCH_ID: 'leader-inherited-launch-id',
+        OMX_ENTRY_PATH: '/leader/omx.js',
+      };
+      const first = buildWorkerProcessLaunchSpec(
+        'routing-team', 1, [], '/tmp/workspace', inheritedLeaderContext, 'codex',
+      );
+      const second = buildWorkerProcessLaunchSpec(
+        'routing-team', 2, [], '/tmp/workspace', inheritedLeaderContext, 'codex',
+      );
+
+      assert.ok(first.env.OMX_CODEX_LAUNCH_ID);
+      assert.notEqual(first.env.OMX_CODEX_LAUNCH_ID, inheritedLeaderContext.OMX_CODEX_LAUNCH_ID);
+      assert.notEqual(first.env.OMX_CODEX_LAUNCH_ID, second.env.OMX_CODEX_LAUNCH_ID);
+      assert.ok(first.env.OMX_ENTRY_PATH && fs.existsSync(first.env.OMX_ENTRY_PATH));
+      assert.notEqual(first.env.OMX_ENTRY_PATH, inheritedLeaderContext.OMX_ENTRY_PATH);
+      assert.ok(second.env.OMX_ENTRY_PATH && fs.existsSync(second.env.OMX_ENTRY_PATH));
+    } finally {
+      if (typeof previousEntryPath === 'string') process.env.OMX_ENTRY_PATH = previousEntryPath;
+      else delete process.env.OMX_ENTRY_PATH;
+      if (typeof previousLaunchId === 'string') process.env.OMX_CODEX_LAUNCH_ID = previousLaunchId;
+      else delete process.env.OMX_CODEX_LAUNCH_ID;
     }
   });
 
@@ -2431,6 +2643,7 @@ describe('buildWorkerStartupCommand', () => {
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
     process.env.PATH = fakeBin;
     process.env.PATHEXT = '.PS1';
     process.env.SHELL = '/bin/zsh';
@@ -2457,6 +2670,7 @@ describe('buildWorkerStartupCommand', () => {
       assert.match(decoded, /'--model' 'gpt-5'/);
       assert.match(decoded, /'--dangerously-bypass-approvals-and-sandbox'/);
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -2491,6 +2705,7 @@ describe('buildWorkerStartupCommand', () => {
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
     process.env.PATH = fakeBin;
     process.env.PATHEXT = '.EXE;.PS1';
     process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
@@ -2510,6 +2725,7 @@ describe('buildWorkerStartupCommand', () => {
       const prefix = `${powershellExePath} -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand `;
       assert.ok(cmd.startsWith(prefix), cmd);
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -2546,6 +2762,7 @@ describe('buildWorkerStartupCommand', () => {
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
     process.env.PATH = fakeBin;
     process.env.PATHEXT = '.EXE;.PS1';
     process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
@@ -2575,6 +2792,7 @@ describe('buildWorkerStartupCommand', () => {
       assert.ok(cmd.startsWith(prefix), cmd);
       assert.ok(!cmd.startsWith(`${pathPowerShellExe} `), cmd);
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -2617,6 +2835,7 @@ describe('buildWorkerStartupCommand', () => {
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
     process.env.PATH = fakeBin;
     process.env.PATHEXT = '.CMD;.PS1';
     process.env.SHELL = '/bin/zsh';
@@ -2649,6 +2868,7 @@ describe('buildWorkerStartupCommand', () => {
       );
       assert.doesNotMatch(decoded, new RegExp(escapeRegExp(codexCmdPath)));
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
       else delete process.env.PATH;
@@ -2701,14 +2921,84 @@ describe('buildWorkerStartupCommand', () => {
       const cmd = withMockedExistsSync((candidate) => candidate === '/opt/custom/fish', () =>
         buildWorkerStartupCommand('alpha', 1, [], process.cwd()),
       );
-      assert.match(cmd, /'\/bin\/sh' -c\b/, 'must launch workers through /bin/sh when no supported shells exist');
-      assert.doesNotMatch(cmd, /'\/bin\/sh' -lc\b/);
+      assert.match(cmd, /\/bin\/sh\b/, 'must launch workers through /bin/sh when no supported shells exist');
+      assert.doesNotMatch(cmd, /\/bin\/sh -lc\b/);
       assert.doesNotMatch(cmd, /\.zshrc|\.bashrc/, 'must not source zsh/bash rc files for /bin/sh fallback');
     } finally {
       if (typeof prevShell === 'string') process.env.SHELL = prevShell;
       else delete process.env.SHELL;
       if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
       else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('embeds receipt in PowerShell script before encoding (when on native Windows) or appends to POSIX', () => {
+    const receipt = 'omx_source_test_receipt';
+    const prevShell = process.env.SHELL;
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+
+    try {
+      // buildWorkerStartupCommand should either:
+      // - On Windows: embed receipt in the PowerShell script before encoding
+      // - On POSIX: append receipt as shell comment
+      const cmdWithReceipt: string = buildWorkerStartupCommand('alpha', 1, [], process.cwd(), {}, undefined, undefined, undefined, receipt);
+
+      if (cmdWithReceipt.includes('-EncodedCommand')) {
+        // Windows PowerShell case: Verify receipt is in the encoded command
+        const match = cmdWithReceipt.match(/-EncodedCommand\s+([A-Za-z0-9+/=]+)/);
+        assert(match, 'Should have encoded command with receipt');
+        const decoded = Buffer.from(match[1], 'base64').toString('utf16le');
+        assert(decoded.includes(`# ${receipt}`), 'Decoded script should contain receipt');
+        // Verify the invocation line (exec ...) is not inside the comment
+        const lines = decoded.split(';');
+        const commentLineIndex = lines.findIndex((line) => line.includes(`# ${receipt}`));
+        assert(commentLineIndex >= 0, 'Should find receipt comment line');
+        const invocationLineIndex = lines.findIndex((line) => line.includes('&'));
+        assert(invocationLineIndex >= 0, 'Should find invocation line with &');
+        assert(invocationLineIndex < commentLineIndex || lines[commentLineIndex]?.includes('&') === false, 'Invocation must not be inside comment');
+      } else {
+        // POSIX case: Verify receipt is appended
+        assert(cmdWithReceipt.includes(`# ${receipt}`), 'Receipt should be appended as comment in POSIX command');
+      }
+    } finally {
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    }
+  });
+
+  it('appends receipt to POSIX worker startup commands without modifying the inner command', () => {
+    const receipt = 'omx_source_posix_receipt';
+    const prevBypass = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+    const prevShell = process.env.SHELL;
+    process.env.SHELL = '/bin/bash';
+    process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = '0';
+
+    try {
+      const cmdNoReceipt: string = buildWorkerStartupCommand('alpha', 1, [], process.cwd());
+      const cmdWithReceipt: string = buildWorkerStartupCommand('alpha', 1, [], process.cwd(), {}, undefined, undefined, undefined, receipt);
+
+      // If it's a PowerShell command (Windows), receipt should be embedded in the script
+      // If it's a POSIX command (Unix/macOS), receipt should be appended
+      assert(cmdWithReceipt.includes(receipt), 'Receipt must be present in command');
+      
+      if (cmdWithReceipt.includes('-EncodedCommand')) {
+        // PowerShell case
+        const match = cmdWithReceipt.match(/-EncodedCommand\s+([A-Za-z0-9+/=]+)/);
+        assert(match, 'Should extract encoded command');
+        const decoded = Buffer.from(match[1], 'base64').toString('utf16le');
+        assert(decoded.includes(receipt), 'Decoded script should contain receipt');
+      } else {
+        // POSIX case: verify receipt is appended as comment
+        assert(cmdWithReceipt.includes(`# ${receipt}`), 'Receipt should be appended as comment to POSIX command');
+      }
+    } finally {
+      if (typeof prevBypass === 'string') process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = prevBypass;
+      else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+      if (typeof prevShell === 'string') process.env.SHELL = prevShell;
+      else delete process.env.SHELL;
     }
   });
 });
@@ -2790,6 +3080,67 @@ describe('team worker CLI helpers', () => {
       () => assertTeamWorkerCliBinaryAvailable('claude', () => false),
       /not available on PATH/i,
     );
+  });
+
+  it('assertTeamWorkerCliBinaryAvailable does not execute a CLI wrapper during discovery', { skip: process.platform === 'win32' }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omx-cli-probe-'));
+    const marker = join(dir, 'executed');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(join(dir, 'codex'), `#!/bin/sh\nprintf invoked > '${marker}'\n`);
+      await chmod(join(dir, 'codex'), 0o755);
+      process.env.PATH = dir;
+      assertTeamWorkerCliBinaryAvailable('codex');
+      assert.equal(fs.existsSync(marker), false, 'availability checks must not launch CLI wrappers');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('assertTeamWorkerCliBinaryAvailable detects a missing CLI without an injected probe', () => {
+    withEmptyPath(() => assert.throws(
+      () => assertTeamWorkerCliBinaryAvailable('codex'),
+      /not available on PATH/,
+    ));
+  });
+
+  it('assertTeamWorkerCliBinaryAvailable treats empty PATH components as the current directory without executing', { skip: process.platform === 'win32' }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'omx-cli-cwd-probe-'));
+    const marker = join(dir, 'executed');
+    const previousPath = process.env.PATH;
+    const previousCwd = process.cwd();
+    try {
+      await writeFile(join(dir, 'codex'), `#!/bin/sh\nprintf invoked > '${marker}'\n`);
+      await chmod(join(dir, 'codex'), 0o755);
+      process.chdir(dir);
+      for (const pathValue of ['', ':', `:${join(dir, 'no-such-segment')}`, `${join(dir, 'no-such-segment')}:`]) {
+        process.env.PATH = pathValue;
+        assertTeamWorkerCliBinaryAvailable('codex');
+        assert.equal(fs.existsSync(marker), false, 'discovery must not execute cwd-resolved wrappers');
+      }
+    } finally {
+      process.chdir(previousCwd);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('CreateTeamSessionPartialError exposes the original startup failure and cleanup debt', () => {
+    const original = new Error('tmux_test_startup_failure');
+    const partial = {
+      name: 'isolated:1', workerCount: 1, cwd: '/tmp', workerPaneIds: ['%2'],
+      leaderPaneId: '%1', hudPaneId: null, resizeHookName: null, resizeHookTarget: null,
+      teamPaneOwnerId: 'team:test',
+    };
+    const error = new CreateTeamSessionPartialError(partial, [], original, ['worker_cleanup_failed:%2']);
+    assert.match(error.message, /^create_team_session_cleanup_incomplete/);
+    assert.match(error.message, /tmux_test_startup_failure/);
+    assert.match(error.message, /worker_cleanup_failed:%2/);
+    assert.equal(error.cause, original);
+    assert.equal(error.partialSession, partial);
   });
 
   it('resolveTeamWorkerCliPlan supports mixed per-worker CLI map', () => {
@@ -4173,7 +4524,7 @@ esac
         assert.equal(waitForWorkerReady('omx-team-x', 1, 5_000), true);
         const log = await readFile(logPath, 'utf-8');
         assert.match(log, /send-keys -t omx-team-x:1 -l -- 2/);
-        assert.match(log, /send-keys -t omx-team-x:1 C-m/);
+        assert.match(log, /send-keys -t omx-team-x:1 Enter/);
       },
     );
   });
@@ -4215,6 +4566,51 @@ esac
     withEmptyPath(() => {
       assert.equal(waitForWorkerReady('omx-team-x', 1, 1), false);
     });
+  });
+
+  it('does not run final check after timeout with zero timeout (Codex finding 4310223535)', () => {
+    // With timeoutMs=0, the while loop exits immediately (0 < 0 is false)
+    // The final check should not run, or at least not report success after deadline
+    withEmptyPath(() => {
+      const result = waitForWorkerReady('omx-team-x', 1, 0);
+      // With timeout=0, we should get false (not a successful check after deadline)
+      assert.equal(result, false, "waitForWorkerReady with timeout=0 should return false, not run checks after deadline");
+    });
+  });
+
+  it('enforces deadline on every poll including when ready (Codex finding 4310966027)', async () => {
+    // Test that even if a poll returns true (ready), we recheck the deadline.
+    // Mock tmux to return ready after a delay that causes us to exceed the timeout.
+    const delaySeconds = 0.15;
+    const timeoutMs = 100;
+    // With a timeout shorter than the delay, the poll will complete after deadline
+    // and should return false despite the ready output.
+    await withMockTmuxFixture(
+      'omx-worker-ready-deadline-enforce-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    # Simulate slow capture-pane that takes longer than the remaining timeout
+    sleep ${delaySeconds}
+    cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac`,
+      async () => {
+        // Poll with a very short timeout that will be exceeded during the capture
+        const result = waitForWorkerReady('omx-team-x', 1, timeoutMs);
+        // Even though capture-pane returns ready, the deadline was exceeded
+        // so we should return false
+        assert.equal(result, false, "waitForWorkerReady should return false when poll completes after deadline");
+      },
+    );
   });
 });
 
@@ -4303,12 +4699,64 @@ esac
     );
   });
 
-  it('auto-accepts trust prompts and then observes readiness', async () => {
+  for (const [label, capture] of [
+    ['legacy', 'Do you trust the contents of this directory?\nPress enter to continue'],
+    ['folder access', CODEX_FOLDER_ACCESS_CAPTURE],
+  ]) {
+    it(`auto-accepts ${label} trust prompts and then observes readiness`, async () => {
+      const previousAutoTrust = process.env.OMX_TEAM_AUTO_TRUST;
+      delete process.env.OMX_TEAM_AUTO_TRUST;
+      try {
+        await withMockTmuxFixture(
+          'omx-tmux-worker-ready-async-trust-',
+          (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+accepted_file="$state_dir/accepted"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if [ -f "$accepted_file" ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${capture}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "Enter" ]; then
+      : > "$accepted_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+  `,
+          async ({ logPath }) => {
+            assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 5_000), true);
+            const log = await readFile(logPath, 'utf-8');
+            assert.match(log, /send-keys -t omx-team-x:1 Enter/);
+          },
+        );
+      } finally {
+        if (typeof previousAutoTrust === 'string') process.env.OMX_TEAM_AUTO_TRUST = previousAutoTrust;
+        else delete process.env.OMX_TEAM_AUTO_TRUST;
+      }
+    });
+  }
+
+  it('auto-dismisses the Claude 2.1.x quick-safety-check trust prompt with named Enter', async () => {
     const previousAutoTrust = process.env.OMX_TEAM_AUTO_TRUST;
     delete process.env.OMX_TEAM_AUTO_TRUST;
     try {
       await withMockTmuxFixture(
-        'omx-tmux-worker-ready-async-trust-',
+        'omx-tmux-worker-ready-async-claude-trust-2-1-',
         (logPath) => `#!/bin/sh
 set -eu
 state_dir="$(dirname "${logPath}")"
@@ -4322,14 +4770,13 @@ ${READY_HELPER_CAPTURE}
 EOF
     else
       cat <<'EOF'
-Do you trust the contents of this directory?
-Press enter to continue
+${CLAUDE_TRUST_PROMPT_2_1_CAPTURE}
 EOF
     fi
     exit 0
     ;;
   send-keys)
-    if [ "\${4:-}" = "C-m" ]; then
+    if [ "\${4:-}" = "Enter" ]; then
       : > "$accepted_file"
     fi
     exit 0
@@ -4342,12 +4789,62 @@ esac
         async ({ logPath }) => {
           assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 5_000), true);
           const log = await readFile(logPath, 'utf-8');
-          assert.match(log, /send-keys -t omx-team-x:1 C-m/);
+          assert.match(log, /send-keys -t omx-team-x:1 Enter/);
+          assert.doesNotMatch(log, /send-keys -t omx-team-x:1 C-m/);
         },
       );
     } finally {
       if (typeof previousAutoTrust === 'string') process.env.OMX_TEAM_AUTO_TRUST = previousAutoTrust;
       else delete process.env.OMX_TEAM_AUTO_TRUST;
+    }
+  });
+
+  it('auto-accepts the Claude 2.1.x bypass-permissions warning and then observes readiness', async () => {
+    const previousAutoAccept = process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS;
+    delete process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-worker-ready-async-claude-bypass-2-1-',
+        (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")"
+accepted_file="$state_dir/accepted"
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    if [ -f "$accepted_file" ]; then
+      cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    else
+      cat <<'EOF'
+${CLAUDE_BYPASS_PROMPT_2_1_CAPTURE}
+EOF
+    fi
+    exit 0
+    ;;
+  send-keys)
+    if [ "\${4:-}" = "-l" ] && [ "\${6:-}" = "2" ]; then
+      : > "$accepted_file"
+    fi
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 5_000), true);
+          const log = await readFile(logPath, 'utf-8');
+          assert.match(log, /send-keys -t omx-team-x:1 -l -- 2/);
+          assert.match(log, /send-keys -t omx-team-x:1 Enter/);
+          assert.doesNotMatch(log, /send-keys -t omx-team-x:1 C-m/);
+        },
+      );
+    } finally {
+      if (typeof previousAutoAccept === 'string') process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS = previousAutoAccept;
+      else delete process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS;
     }
   });
 
@@ -4422,6 +4919,51 @@ esac
       assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1), false);
     });
   });
+
+  it('does not run final check after timeout with zero timeout (Codex finding 4310223535)', async () => {
+    // With timeoutMs=0, the while loop exits immediately (0 < 0 is false)
+    // The final check should not run, or at least not report success after deadline
+    await withEmptyPath(async () => {
+      const result = await waitForWorkerReadyAsync('omx-team-x', 1, 0);
+      // With timeout=0, we should get false (not a successful check after deadline)
+      assert.equal(result, false, "waitForWorkerReadyAsync with timeout=0 should return false, not run checks after deadline");
+    });
+  });
+
+  it('enforces deadline on every poll including when ready (Codex finding 4310966027)', async () => {
+    // Test that even if a poll returns true (ready), we recheck the deadline.
+    // Mock tmux to return ready after a delay that causes us to exceed the timeout.
+    const delaySeconds = 0.15;
+    const timeoutMs = 100;
+    // With a timeout shorter than the delay, the poll will complete after deadline
+    // and should return false despite the ready output.
+    await withMockTmuxFixture(
+      'omx-worker-ready-deadline-enforce-async-',
+      (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  capture-pane)
+    # Simulate slow capture-pane that takes longer than the remaining timeout
+    sleep ${delaySeconds}
+    cat <<'EOF'
+${READY_HELPER_CAPTURE}
+EOF
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac`,
+      async () => {
+        // Poll with a very short timeout that will be exceeded during the capture
+        const result = await waitForWorkerReadyAsync('omx-team-x', 1, timeoutMs);
+        // Even though capture-pane returns ready, the deadline was exceeded
+        // so we should return false
+        assert.equal(result, false, "waitForWorkerReadyAsync should return false when poll completes after deadline");
+      },
+    );
+  });
 });
 
 describe('createTeamSession tmux instance tagging', () => {
@@ -4430,6 +4972,9 @@ describe('createTeamSession tmux instance tagging', () => {
       ['%2', undefined, '%2'],
       ['%2\n', undefined, '%2'],
       ['%2\r\n', undefined, '%2'],
+      ['%2:omx_source_receipt', 'omx_source_receipt', '%2'],
+      ['%2:omx_source_receipt\n', 'omx_source_receipt', '%2'],
+      ['%2:omx_source_receipt\r\n', 'omx_source_receipt', '%2'],
       ['%2\tomx_source_receipt', 'omx_source_receipt', '%2'],
       ['%2\tomx_source_receipt\n', 'omx_source_receipt', '%2'],
       ['notice\n%2\n', undefined, null],
@@ -4439,11 +4984,117 @@ describe('createTeamSession tmux instance tagging', () => {
       ['%2\n\n', undefined, null],
       ['%2 warning\n', undefined, null],
       [' %2\n', undefined, null],
-      ['%2\tomx_source_other\n', 'omx_source_receipt', null],
-      ['%2\tomx_source_receipt\n%3\tomx_source_receipt\n', 'omx_source_receipt', null],
+      ['%2', 'omx_source_receipt', null],
+      ['%2\\tomx_source_receipt\n', 'omx_source_receipt', null],
+      ['%2:omx_source_other\n', 'omx_source_receipt', null],
+      ['%2:omx_source_receipt:trailing\n', 'omx_source_receipt', null],
+      ['%2:omx_source_receipt trailing\n', 'omx_source_receipt', null],
+      ['%2:omx_source_receipt\n%3:omx_source_receipt\n', 'omx_source_receipt', null],
+      ['%2:omx_source_receipt\nnotice\n', 'omx_source_receipt', null],
       ['notice only\n', undefined, null],
     ] as const) {
       assert.equal(parseSplitWindowPaneId(stdout, receipt), expected);
+    }
+  });
+
+  it('binds one exact tmux-safe split receipt format and rejects malformed construction inputs', () => {
+    const receipt = 'omx_source_123_456_deadbeef';
+    const effect = "split-window -h -P -F '#{pane_id}' -t %1 'worker command'";
+    assert.equal(
+      bindSplitWindowReceiptFormat(effect, receipt),
+      "split-window -h -P -F '#{pane_id}:omx_source_123_456_deadbeef' -t %1 'worker command'",
+    );
+    assert.throws(
+      () => bindSplitWindowReceiptFormat("split-window -h -P -t %1 'worker command'", receipt),
+      /tmux_split_window_format_contract_invalid/,
+    );
+    assert.throws(
+      () => bindSplitWindowReceiptFormat(`${effect} ${effect}`, receipt),
+      /tmux_split_window_format_contract_invalid/,
+    );
+    for (const invalidReceipt of [
+      'omx_source_bad:field',
+      'omx_source_#{pane_id}',
+      'omx_source_bad;kill-pane',
+      "omx_source_bad'quote",
+      'omx_source_bad receipt',
+      'wrong_prefix_receipt',
+    ]) {
+      assert.throws(
+        () => bindSplitWindowReceiptFormat(effect, invalidReceipt),
+        /tmux_source_transaction_receipt_invalid/,
+      );
+    }
+  });
+
+  it('embeds receipt in PowerShell script before encoding and appends to POSIX commands', () => {
+    const receipt = 'omx_source_receipt_example';
+
+    // PowerShell commands from buildWorkerStartupCommand have receipt embedded in the script,
+    // but bindSplitReceiptToPaneCommand will append " # receipt" as plaintext (for fallback detection).
+    const scriptWithReceipt = `$ErrorActionPreference = 'Stop'; # ${receipt}`;
+    const encodedReceipt = Buffer.from(scriptWithReceipt, 'utf16le').toString('base64');
+    const powershellCommand = `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedReceipt}`;
+    // PowerShell commands don't have plaintext receipt, so it gets appended
+    const result = bindSplitReceiptToPaneCommand(powershellCommand, receipt);
+    assert.equal(result, `${powershellCommand} # ${receipt}`, 'PowerShell command should have receipt appended as plaintext for detection');
+
+    // POSIX shell commands should have receipt appended as a comment
+    const bashCommand = '/bin/bash -c "worker_command"';
+    assert.equal(
+      bindSplitReceiptToPaneCommand(bashCommand, receipt),
+      `${bashCommand} # ${receipt}`,
+      'Bash command should have receipt appended as comment',
+    );
+
+    // Plain command should have receipt appended
+    const plainCommand = 'worker_process';
+    assert.equal(
+      bindSplitReceiptToPaneCommand(plainCommand, receipt),
+      `${plainCommand} # ${receipt}`,
+      'Plain command should have receipt appended as comment',
+    );
+
+    // Test POSIX command containing the literal text '-EncodedCommand' in its content
+    // This should NOT be misparsed; receipt should just be appended
+    const posixWithEncodedCommandText = 'echo "Usage: -EncodedCommand option for PowerShell"';
+    const resultWithEncodedText = bindSplitReceiptToPaneCommand(posixWithEncodedCommandText, receipt);
+    assert.equal(
+      resultWithEncodedText,
+      `${posixWithEncodedCommandText} # ${receipt}`,
+      'POSIX command with -EncodedCommand text should get receipt appended like any other POSIX command',
+    );
+  });
+
+  it('detects receipt in both POSIX shell comments and PowerShell encoded commands for fallback reconciliation', () => {
+    const receipt = 'omx_source_test_fallback';
+
+    // Test POSIX shell case: receipt in command as comment
+    const posixCommand = `/bin/bash -c "worker" # ${receipt}`;
+    assert(posixCommand.includes(receipt), 'POSIX command should contain receipt');
+
+    // Test PowerShell case: receipt should be detectable inside the decoded script
+    const scriptWithReceipt = `# ${receipt}\n$ErrorActionPreference = 'Stop'`;
+    const encodedWithReceipt = Buffer.from(scriptWithReceipt, 'utf16le').toString('base64');
+    const powerShellCommand = `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedWithReceipt}`;
+    // Extract and verify the receipt is in the decoded script
+    const psMatch = powerShellCommand.match(/EncodedCommand\s+([A-Za-z0-9+/=]+)/);
+    assert(psMatch, 'Should extract encoded command');
+    const psDecoded = Buffer.from(psMatch[1], 'base64').toString('utf16le');
+    assert(psDecoded.includes(receipt), 'Decoded PS command should contain receipt');
+
+    // Verify that panes WITHOUT receipts would not match (prevents false reconciliation)
+    const noReceiptCommand = '/bin/bash -c "worker"';
+    assert(!noReceiptCommand.includes(receipt), 'Pane without receipt should not match');
+
+    // PowerShell command without receipt
+    const scriptNoReceipt = '$ErrorActionPreference = "Stop"';
+    const encodedNoReceipt = Buffer.from(scriptNoReceipt, 'utf16le').toString('base64');
+    const psNoReceiptCommand = `powershell.exe -EncodedCommand ${encodedNoReceipt}`;
+    const psNoReceiptMatch = psNoReceiptCommand.match(/EncodedCommand\s+([A-Za-z0-9+/=]+)/);
+    if (psNoReceiptMatch) {
+      const psNoReceiptDecoded = Buffer.from(psNoReceiptMatch[1], 'base64').toString('utf16le');
+      assert(!psNoReceiptDecoded.includes(receipt), 'PS pane without receipt should not match');
     }
   });
 
@@ -5412,6 +6063,112 @@ esac
     }
   });
 
+  it('recognizes existing legacy HUDs by session or leader ownership during Team startup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-existing-detached-hud-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const previousEntryPath = process.env[OMX_ENTRY_PATH_ENV];
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-existing-detached-hud-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V) echo 'tmux 3.4' ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo 120 ;;
+      *) echo 'shared:0 %1' ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*)
+        printf '%%1\\t0\\t2000000001\\n'
+        [ -f "${logPath}.existing-hud-killed" ] || printf '%%2\\t0\\t2000000002\\n'
+        [ -f "${logPath}.leader-hud-killed" ] || printf '%%5\\t0\\t2000000005\\n'
+        [ -f "${logPath}.worker" ] && printf '%%3\\t0\\t2000000003\\n'
+        [ -f "${logPath}.team-hud" ] && printf '%%4\\t0\\t2000000004\\n'
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        [ -f "${logPath}.existing-hud-killed" ] || printf "%%2\\tnode\\texec env OMX_SESSION_ID='omx-existing-hud' node /node/omx.js hud --watch\\n"
+        [ -f "${logPath}.leader-hud-killed" ] || printf "%%5\\tnode\\texec env OMX_TMUX_HUD_LEADER_PANE='%%1' node /node/omx.js hud --watch\\n"
+        [ -f "${logPath}.worker" ] && printf "%%3\\tgemini\\t'gemini'\\n"
+        [ -f "${logPath}.team-hud" ] && printf "%%4\\tnode\\texec env OMX_SESSION_ID='omx-existing-hud' OMX_TMUX_HUD_LEADER_PANE='%1' node /node/omx.js hud --watch\\n"
+        ;;
+      *)
+        printf '%%1\\n'
+        [ -f "${logPath}.existing-hud-killed" ] || printf '%%2\\n'
+        [ -f "${logPath}.leader-hud-killed" ] || printf '%%5\\n'
+        [ -f "${logPath}.worker" ] && printf '%%3\\n'
+        [ -f "${logPath}.team-hud" ] && printf '%%4\\n'
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*) : > "${logPath}.worker"; echo '%3' ;;
+      *) : > "${logPath}.team-hud"; echo '%4' ;;
+    esac
+    ;;
+  kill-pane)
+    case "$*" in
+      *'%2'*) : > "${logPath}.existing-hud-killed" ;;
+      *'%5'*) : > "${logPath}.leader-hud-killed" ;;
+      *'%3'*) : > "${logPath}.worker-killed" ;;
+      *'%4'*) : > "${logPath}.team-hud-killed" ;;
+    esac
+    ;;
+  set-option|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|send-keys) ;;
+  *) ;;
+esac
+exit 0
+`,
+        async ({ logPath }) => {
+          const fakeBinDir = dirname(logPath);
+          const geminiPath = join(fakeBinDir, 'gemini');
+          const entryPath = join(fakeBinDir, 'omx.js');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          await writeFile(entryPath, '');
+
+          process.env.TMUX = '1';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_SESSION_ID = 'omx-existing-hud';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          process.env[OMX_ENTRY_PATH_ENV] = entryPath;
+
+          const session = createTeamSession('Existing Detached HUD', 1, cwd);
+          assert.equal(session.leaderPaneId, '%1');
+          assert.deepEqual(session.workerPaneIds, ['%3']);
+          assert.equal(session.hudPaneId, '%4');
+
+          const tmuxLog = await readFile(logPath, 'utf-8');
+          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.match(tmuxLog, /kill-pane -t %5/);
+          assert.match(tmuxLog, /split-window -h -t %1/);
+          assert.doesNotMatch(tmuxLog, /window topology changed before layout mutation/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof previousEntryPath === 'string') process.env[OMX_ENTRY_PATH_ENV] = previousEntryPath;
+      else delete process.env[OMX_ENTRY_PATH_ENV];
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when a tagged worker keeps its PID but loses Team owner continuity before a later split', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-owner-change-'));
     const prevTmux = process.env.TMUX;
@@ -5674,6 +6431,7 @@ esac
               assert.match(error.message, /unexpected=\[%7,%8\]/);
               assert.match(error.message, /missing=\[\]/);
               assert.match(error.message, /isolated tmux window with no host-owned foreign panes/);
+              assert.match(error.message, /open a new tmux window.*retry `omx team`/i);
               return true;
             },
           );
@@ -6383,6 +7141,11 @@ esac
   it('rejects standalone HUD PID reuse before native resize', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-hud-pid-reuse-'));
     const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
+    const prevWsl = process.env.WSL_DISTRO_NAME;
+    const prevInterop = process.env.WSL_INTEROP;
+    delete process.env.WSL_DISTRO_NAME;
+    delete process.env.WSL_INTEROP;
     try {
       await withMockTmuxFixture(
         'omx-tmux-standalone-hud-pid-reuse-',
@@ -6418,6 +7181,11 @@ esac
         },
       );
     } finally {
+      restoreProcVersion();
+      if (typeof prevWsl === 'string') process.env.WSL_DISTRO_NAME = prevWsl;
+      else delete process.env.WSL_DISTRO_NAME;
+      if (typeof prevInterop === 'string') process.env.WSL_INTEROP = prevInterop;
+      else delete process.env.WSL_INTEROP;
       if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6790,6 +7558,7 @@ describe('native Windows HUD reconciliation', () => {
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
 
     try {
       await withMockTmuxFixture(
@@ -6875,6 +7644,7 @@ esac
         },
       );
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
       else delete process.env.TMUX;
@@ -6904,6 +7674,7 @@ esac
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
 
     try {
       await withMockTmuxFixture(
@@ -6994,6 +7765,7 @@ esac
         },
       );
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
       else delete process.env.TMUX;
@@ -7023,6 +7795,7 @@ esac
     const prevWsl = process.env.WSL_DISTRO_NAME;
     const prevWslInterop = process.env.WSL_INTEROP;
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
 
     try {
       await withMockTmuxFixture(
@@ -7113,6 +7886,7 @@ esac
         },
       );
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
       else delete process.env.TMUX;
@@ -7362,6 +8136,69 @@ esac
         },
       );
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps restored HUD debt durable on Windows when fsync reports EPERM (issue #3656)', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-restored-hud-debt-win-eperm-'));
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const previousMsystem = process.env.MSYSTEM;
+    const previousWsl = process.env.WSL_DISTRO_NAME;
+    const previousWslInterop = process.env.WSL_INTEROP;
+    try {
+      // MSYS keeps isNativeWindows() false so this exercises the same startup
+      // persistence path as the reported `omx team` abort.
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      process.env.MSYSTEM = 'MINGW64';
+      delete process.env.WSL_DISTRO_NAME;
+      delete process.env.WSL_INTEROP;
+      await withMockTmuxFixture(
+        'omx-restored-hud-debt-win-eperm-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ "$2" = "-a" ]; then
+      printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n'
+    else
+      printf '%%11\\tzsh\\tzsh\\n'
+    fi
+    ;;
+  split-window) printf '%%44\\n' ;;
+  *) exit 0 ;;
+esac
+`,
+        async () => {
+          let fsyncCalls = 0;
+          const paneId = withMockedFsyncSync(() => {
+            fsyncCalls += 1;
+            const error = new Error('EPERM: operation not permitted, fsync') as NodeJS.ErrnoException;
+            error.code = 'EPERM';
+            throw error;
+          }, () => restoreStandaloneHudPane('%11', cwd));
+          assert.equal(paneId, '%44');
+          assert.ok(fsyncCalls > 0, 'the durable write must still attempt fsync');
+          const debtPath = join(cwd, '.omx', 'state', '.restored-hud-cleanup-debt.json');
+          assert.deepEqual(JSON.parse(await readFile(debtPath, 'utf-8')), {
+            schema_version: 1,
+            operation: 'restored_hud_cleanup',
+            pane_id: '%44',
+            pane_pid: 2000000044,
+            leader_pane_id: '%11',
+            leader_pane_pid: 2000000011,
+            leader_pane_owner_id: null,
+            hud_owner_leader_pane_id: '%11',
+          });
+        },
+      );
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (typeof previousMsystem === 'string') process.env.MSYSTEM = previousMsystem;
+      else delete process.env.MSYSTEM;
+      if (typeof previousWsl === 'string') process.env.WSL_DISTRO_NAME = previousWsl;
+      if (typeof previousWslInterop === 'string') process.env.WSL_INTEROP = previousWslInterop;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -8548,7 +9385,7 @@ esac
           assert.match(commands[index - 1] ?? '', exactGlobalPaneProof, `fresh proof must immediately precede ${command}`);
         }
         assert.match(commands.join('\n'), /send-keys -t %9 -l -- check inbox/);
-        assert.doesNotMatch(commands.join('\n'), /send-keys -t %9 C-m/);
+        assert.doesNotMatch(commands.join('\n'), /send-keys -t %9 (?:C-m|Enter)/);
       },
     );
   });
@@ -8875,6 +9712,7 @@ describe('translatePathForMsys', () => {
 describe('isNativeWindows', () => {
   it('returns true when process.platform is win32 and not WSL2', () => {
     const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const restoreProcVersion = neutralizeWslProcVersionForNativeWindowsTest();
     const prevDistro = process.env.WSL_DISTRO_NAME;
     const prevInterop = process.env.WSL_INTEROP;
     delete process.env.WSL_DISTRO_NAME;
@@ -8883,6 +9721,7 @@ describe('isNativeWindows', () => {
     try {
       assert.equal(isNativeWindows(), true);
     } finally {
+      restoreProcVersion();
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevDistro === 'string') process.env.WSL_DISTRO_NAME = prevDistro;
       else delete process.env.WSL_DISTRO_NAME;

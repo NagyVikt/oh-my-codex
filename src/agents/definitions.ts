@@ -8,8 +8,6 @@ export interface AgentDefinition {
   name: string;
   description: string;
   reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh';
-  /** Optional exact model pin for roles that should bypass tier defaults. */
-  exactModel?: 'gpt-5.6-terra' | 'gpt-5.6-sol';
   posture: 'frontier-orchestrator' | 'deep-worker' | 'fast-lane';
   modelClass: 'frontier' | 'standard' | 'fast';
   routingRole: 'leader' | 'specialist' | 'executor';
@@ -43,7 +41,7 @@ const TEAM_EXECUTOR_AGENT: AgentDefinition = {
   description: 'Supervised team execution for conservative delivery lanes',
   reasoningEffort: 'medium',
   posture: 'deep-worker',
-  modelClass: 'frontier',
+  modelClass: 'standard',
   routingRole: 'executor',
   tools: 'execution',
   category: 'build',
@@ -54,7 +52,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'explore': {
     name: 'explore',
     description: 'Fast codebase search and file/symbol mapping',
-    reasoningEffort: 'low',
+    reasoningEffort: 'medium',
     posture: 'fast-lane',
     modelClass: 'fast',
     routingRole: 'specialist',
@@ -66,7 +64,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     description: 'Requirements clarity, acceptance criteria, hidden constraints',
     reasoningEffort: 'medium',
     posture: 'frontier-orchestrator',
-    modelClass: 'frontier',
+    modelClass: 'standard',
     routingRole: 'leader',
     tools: 'analysis',
     category: 'build',
@@ -75,7 +73,6 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'planner',
     description: 'Task sequencing, execution plans, risk flags',
     reasoningEffort: 'medium',
-    exactModel: 'gpt-5.6-sol',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -86,7 +83,6 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'architect',
     description: 'System design, boundaries, interfaces, long-horizon tradeoffs',
     reasoningEffort: 'xhigh',
-    exactModel: 'gpt-5.6-sol',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -152,7 +148,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     description: 'Vulnerabilities, trust boundaries, authn/authz',
     reasoningEffort: 'medium',
     posture: 'frontier-orchestrator',
-    modelClass: 'frontier',
+    modelClass: 'standard',
     routingRole: 'leader',
     tools: 'read-only',
     category: 'review',
@@ -172,7 +168,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     description: 'Comprehensive review across all concerns',
     reasoningEffort: 'high',
     posture: 'frontier-orchestrator',
-    modelClass: 'frontier',
+    modelClass: 'standard',
     routingRole: 'leader',
     tools: 'read-only',
     category: 'review',
@@ -194,7 +190,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     description: 'Test strategy, coverage, flaky-test hardening',
     reasoningEffort: 'medium',
     posture: 'deep-worker',
-    modelClass: 'frontier',
+    modelClass: 'standard',
     routingRole: 'executor',
     tools: 'execution',
     category: 'domain',
@@ -264,7 +260,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     description: 'Simplifies recently modified code for clarity and consistency without changing behavior',
     reasoningEffort: 'high',
     posture: 'deep-worker',
-    modelClass: 'frontier',
+    modelClass: 'standard',
     routingRole: 'executor',
     tools: 'execution',
     category: 'domain',
@@ -273,7 +269,6 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     name: 'researcher',
     description: 'External documentation and reference research',
     reasoningEffort: 'high',
-    exactModel: 'gpt-5.6-terra',
     posture: 'fast-lane',
     modelClass: 'standard',
     routingRole: 'specialist',
@@ -325,51 +320,9 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
 
   // Coordination
 
-  'prometheus-strict-metis': {
-    name: 'prometheus-strict-metis',
-    description: 'Prometheus Strict requirements interviewer and ambiguity mapper',
-    reasoningEffort: 'high',
-    posture: 'frontier-orchestrator',
-    modelClass: 'frontier',
-    routingRole: 'leader',
-    tools: 'analysis',
-    nativeSubagentDelegation: 'allowed',
-    category: 'coordination',
-  },
-  'prometheus-strict-momus': {
-    name: 'prometheus-strict-momus',
-    description: 'Prometheus Strict adversarial plan critic and risk challenger',
-    reasoningEffort: 'high',
-    posture: 'frontier-orchestrator',
-    modelClass: 'frontier',
-    routingRole: 'leader',
-    tools: 'analysis',
-    category: 'coordination',
-  },
-  'prometheus-strict-oracle': {
-    name: 'prometheus-strict-oracle',
-    description: 'Prometheus Strict implementation readiness verifier and handoff judge',
-    reasoningEffort: 'high',
-    posture: 'frontier-orchestrator',
-    modelClass: 'standard',
-    routingRole: 'leader',
-    tools: 'analysis',
-    category: 'coordination',
-  },
-
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',
-    reasoningEffort: 'high',
-    posture: 'frontier-orchestrator',
-    modelClass: 'frontier',
-    routingRole: 'leader',
-    tools: 'read-only',
-    category: 'coordination',
-  },
-  'scholastic': {
-    name: 'scholastic',
-    description: 'Ontology-first reasoning reviewer: category mistakes, hidden assumptions, modality separation, scholastic critique, and minimal-repair proposals',
     reasoningEffort: 'high',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
@@ -382,7 +335,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
     description: 'Image/screenshot/diagram analysis',
     reasoningEffort: 'low',
     posture: 'fast-lane',
-    modelClass: 'frontier',
+    modelClass: 'fast',
     routingRole: 'specialist',
     tools: 'read-only',
     category: 'coordination',

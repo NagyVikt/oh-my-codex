@@ -107,10 +107,10 @@ function writeJson(file, value) {
   fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\\n');
 }
 if (argv[0] === 'schema') {
-  process.stdout.write(JSON.stringify({ schema_version: 1, commands: [], events: [], transport: 'tmux' }) + '\\n');
+  process.stdout.write(JSON.stringify({ schema_version: 1, capabilities: ['team-mailbox-scope-v1'], commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','remove-dispatch-records','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\\n');
   process.exit(0);
 }
-if (argv[0] !== 'exec') process.exit(1);
+if (argv[0] !== 'exec' && argv[0] !== 'exec-scoped') process.exit(1);
 const command = JSON.parse(argv[1] || '{}');
 const dir = stateDir();
 if (command.command === 'CaptureSnapshot') {
@@ -219,7 +219,7 @@ describe('resolveTeamApiOperation', () => {
     assert.equal(resolveTeamApiOperation('  SEND_MESSAGE  '), 'send-message');
   });
 
-  it('resolves all 33 operations from the operation list', () => {
+  it('resolves all 34 operations from the operation list', () => {
     for (const op of TEAM_API_OPERATIONS) {
       assert.equal(resolveTeamApiOperation(op), op);
     }
@@ -261,8 +261,8 @@ describe('LEGACY_TEAM_MCP_TOOLS', () => {
 });
 
 describe('TEAM_API_OPERATIONS', () => {
-  it('contains 33 operations', () => {
-    assert.equal(TEAM_API_OPERATIONS.length, 33);
+  it('contains 34 operations', () => {
+    assert.equal(TEAM_API_OPERATIONS.length, 34);
   });
 
   it('all use kebab-case', () => {
@@ -666,6 +666,7 @@ describe('executeTeamApiOperation: mailbox-mark-delivered', () => {
       if (!firstAck.ok) throw new Error('expected first acknowledgement to succeed');
       assert.equal(firstAck.data.dispatch_updated, false);
       assert.equal((await readDispatchRequest('mark-dlv-coalesced', wake.request.request_id, cwd))?.status, 'pending');
+      assert.equal((await readDispatchRequest('mark-dlv-coalesced', alternateWake.request.request_id, cwd))?.status, 'pending');
 
       const finalAck = await executeTeamApiOperation('mailbox-mark-delivered', {
         team_name: 'mark-dlv-coalesced', worker: 'worker-2', message_id: secondId,

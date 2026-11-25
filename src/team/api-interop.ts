@@ -28,11 +28,13 @@ import {
   teamListDispatchRequests,
   teamMarkDispatchRequestNotified,
   teamMarkDispatchRequestDelivered,
+  teamWithTaskMembershipBarrier,
   teamCreateTask,
   teamReadTask,
   teamListTasks,
   teamUpdateTask,
   teamClaimTask,
+  teamRenewTaskClaim,
   teamTransitionTaskStatus,
   teamReleaseTaskClaim,
   teamCleanup,
@@ -107,6 +109,7 @@ export const TEAM_API_OPERATIONS = [
   'list-tasks',
   'update-task',
   'claim-task',
+  'renew-task-claim',
   'transition-task-status',
   'release-task-claim',
   'read-config',
@@ -147,26 +150,37 @@ async function markLatestMailboxDispatchDelivered(
   cwd: string,
 ): Promise<{ matched_request_id: string | null; dispatch_updated: boolean }> {
   const active = (await teamListDispatchRequests(teamName, cwd, { kind: 'mailbox', to_worker: worker }))
-    .filter((request) => request.status === 'pending' || request.status === 'notified')
-    .sort((left, right) => Date.parse(right.updated_at) - Date.parse(left.updated_at));
-  const latest = active[0];
-  if (!latest) return { matched_request_id: null, dispatch_updated: false };
+    .filter((request) => request.status === 'pending' || request.status === 'notified');
+  // Dispatch persistence is append-only. Keep the newest exact-message receipt
+  // when concurrent paths queued more than one wake in the same clock tick.
+  const matching = active.filter((request) => request.message_id === messageId).at(-1);
+  if (active.length === 0) return { matched_request_id: null, dispatch_updated: false };
 
   const mailbox = await listMailboxMessages(teamName, worker, cwd);
+  if (!mailbox.some((message) => message.message_id === messageId && message.delivered_at)) {
+    return { matched_request_id: matching?.request_id ?? null, dispatch_updated: false };
+  }
   if (mailbox.some((message) => !message.delivered_at)) {
-    return { matched_request_id: latest.request_id, dispatch_updated: false };
+    return { matched_request_id: matching?.request_id ?? null, dispatch_updated: false };
   }
 
+  const deliveredMessageIds = new Set(
+    mailbox.filter((message) => message.delivered_at).map((message) => message.message_id),
+  );
   let allDelivered = true;
   for (const request of active) {
-    if (request.status === 'pending') {
-      await teamMarkDispatchRequestNotified(teamName, request.request_id, { message_id: messageId }, cwd);
+    if (!request.message_id || !deliveredMessageIds.has(request.message_id)) {
+      allDelivered = false;
+      continue;
     }
-    const delivered = await teamMarkDispatchRequestDelivered(teamName, request.request_id, { message_id: messageId }, cwd);
+    if (request.status === 'pending') {
+      await teamMarkDispatchRequestNotified(teamName, request.request_id, { message_id: request.message_id }, cwd);
+    }
+    const delivered = await teamMarkDispatchRequestDelivered(teamName, request.request_id, { message_id: request.message_id }, cwd);
     allDelivered &&= delivered?.status === 'delivered';
   }
   return {
-    matched_request_id: latest.request_id,
+    matched_request_id: matching?.request_id ?? null,
     dispatch_updated: allDelivered,
   };
 }
@@ -720,8 +734,11 @@ export async function executeTeamApiOperation(
         if (!teamName || !worker || !messageId) {
           return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, worker, message_id are required' } };
         }
-        const updated = await markMessageDelivered(teamName, worker, messageId, cwd);
-        const dispatch = await markLatestMailboxDispatchDelivered(teamName, worker, messageId, cwd);
+        const { updated, dispatch } = await teamWithTaskMembershipBarrier(teamName, cwd, async () => {
+          const updated = await markMessageDelivered(teamName, worker, messageId, cwd);
+          const dispatch = await markLatestMailboxDispatchDelivered(teamName, worker, messageId, cwd);
+          return { updated, dispatch };
+        });
         await appendTeamDeliveryLogForCwd(cwd, {
           event: 'mark_delivered',
           source: 'team.api-interop',
@@ -760,6 +777,9 @@ export async function executeTeamApiOperation(
         const description = String(opArgs.description || '').trim();
         if (!teamName || !subject || !description) {
           return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, subject, description are required' } };
+        }
+        if (opArgs.requires_code_change !== undefined && typeof opArgs.requires_code_change !== 'boolean') {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'requires_code_change must be a boolean when provided' } };
         }
         const owner = opArgs.owner as string | undefined;
         const blockedBy = opArgs.blocked_by as string[] | undefined;
@@ -880,7 +900,19 @@ export async function executeTeamApiOperation(
             result: typeof transitionResult === 'string' ? transitionResult : undefined,
             error: typeof transitionError === 'string' ? transitionError : undefined,
           },
+          fallbackCwd,
         );
+        return { ok: true, operation, data: result as unknown as Record<string, unknown> };
+      }
+      case 'renew-task-claim': {
+        const teamName = String(opArgs.team_name || '').trim();
+        const taskId = String(opArgs.task_id || '').trim();
+        const claimToken = String(opArgs.claim_token || '').trim();
+        const worker = String(opArgs.worker || '').trim();
+        if (!teamName || !taskId || !claimToken || !worker) {
+          return { ok: false, operation, error: { code: 'invalid_input', message: 'team_name, task_id, claim_token, worker are required' } };
+        }
+        const result = await teamRenewTaskClaim(teamName, taskId, worker, claimToken, cwd);
         return { ok: true, operation, data: result as unknown as Record<string, unknown> };
       }
       case 'release-task-claim': {

@@ -69,6 +69,16 @@ describe('formatSessionEnd', () => {
     assert.ok(result.includes('2m 5s'));
   });
 
+  it('should format a zero duration instead of reporting it as unknown', () => {
+    const result = formatSessionEnd({ ...basePayload, event: 'session-end', durationMs: 0 });
+    assert.ok(result.includes('**Duration:** 0s'));
+  });
+
+  it('should report invalid durations as unknown', () => {
+    const result = formatSessionEnd({ ...basePayload, event: 'session-end', durationMs: -1 });
+    assert.ok(result.includes('**Duration:** unknown'));
+  });
+
   it('should include agents count', () => {
     const result = formatSessionEnd({ ...basePayload, event: 'session-end', agentsSpawned: 5, agentsCompleted: 3 });
     assert.ok(result.includes('3/5 completed'));
@@ -129,6 +139,17 @@ describe('parseTmuxTail', () => {
     const raw = '\x1b[32mHello\x1b[0m world';
     assert.strictEqual(parseTmuxTail(raw), 'Hello world');
   });
+
+  for (const [name, raw] of [
+    ['private mode parameters', '\x1b[?25lHello world\x1b[?25h'],
+    ['colon-separated color parameters', '\x1b[38:2::255:0:0mHello world\x1b[0m'],
+    ['intermediate bytes', '\x1b[2 qHello world'],
+    ['non-alphabetic final bytes', '\x1b[200~Hello world\x1b[201~'],
+  ]) {
+    it(`strips ANSI CSI sequences with ${name}`, () => {
+      assert.strictEqual(parseTmuxTail(raw), 'Hello world');
+    });
+  }
 
   it('removes lines starting with spinner characters ●⎿✻·◼', () => {
     const raw = [
@@ -224,6 +245,16 @@ describe('parseTmuxTail', () => {
     assert.ok(!result.includes('Thinking'));
     assert.ok(result.includes('Real output'));
     assert.ok(result.includes('Done'));
+  });
+
+  it('strips OSC terminal-control sequences terminated by BEL or ST', () => {
+    const raw = [
+      'plain \x1b]133;A\x07text',
+      'keep \x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\ visible',
+      'c1 \x9d133;C\x9ctext',
+    ].join('\n');
+    const result = parseTmuxTail(raw);
+    assert.equal(result, 'plain text\nkeep link visible\nc1 text');
   });
 
   it('removes lines composed entirely of box-drawing characters', () => {

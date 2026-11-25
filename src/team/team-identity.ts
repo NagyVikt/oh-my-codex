@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'crypto';
 import { existsSync, readdirSync, readFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { join } from 'path';
 import { TEAM_NAME_SAFE_PATTERN } from './contracts.js';
+import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
 export interface TeamIdentityScope {
   sessionId: string;
@@ -123,18 +124,12 @@ function candidateFromDir(root: string, teamName: string): TeamLookupCandidate |
 }
 
 function teamLookupRoots(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
-  const roots: string[] = [];
-  const addStateRoot = (stateRoot: string): void => {
-    const trimmed = stateRoot.trim();
-    if (!trimmed) return;
-    const root = join(resolve(cwd, trimmed), 'team');
-    if (!roots.includes(root)) roots.push(root);
-  };
-
-  const explicit = typeof env.OMX_TEAM_STATE_ROOT === 'string' ? env.OMX_TEAM_STATE_ROOT : '';
-  addStateRoot(explicit);
-  addStateRoot(join(resolve(cwd), '.omx', 'state'));
-  return roots;
+  // Identity lookup follows the canonical state root only. Enumerating
+  // cwd/.omx/state alongside an explicitly selected root lets an alias in the
+  // unselected root rename or mask teams addressed through the selected root
+  // and makes the reported state path unreliable.
+  const canonical = resolveCanonicalTeamStateRoot(cwd, env);
+  return [join(canonical, 'team')];
 }
 
 export function listTeamLookupCandidates(cwd: string, env: NodeJS.ProcessEnv = process.env): TeamLookupCandidate[] {
@@ -153,8 +148,10 @@ export function listTeamLookupCandidates(cwd: string, env: NodeJS.ProcessEnv = p
 }
 
 function matchingCurrentLeader(candidate: TeamLookupCandidate, scope: TeamIdentityScope): boolean {
-  return (Boolean(scope.sessionId) && candidate.leaderSessionId === scope.sessionId)
-    || (Boolean(scope.paneId) && candidate.leaderPaneId === scope.paneId);
+  if (scope.sessionId) {
+    return candidate.leaderSessionId === scope.sessionId;
+  }
+  return Boolean(scope.paneId) && candidate.leaderPaneId === scope.paneId;
 }
 
 function selectLatestTerminalCandidate(candidates: TeamLookupCandidate[]): TeamLookupCandidate | null {
@@ -193,4 +190,14 @@ export function resolveTeamNameForCurrentContext(inputName: string, cwd: string,
   }
 
   throw new TeamLookupAmbiguityError(input, current.length > 1 ? current : lookupCandidates);
+}
+
+export function resolveCurrentTeamName(cwd: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const scope = resolveTeamIdentityScope(env);
+  // Match the current leader first: another session's active team must not hide this leader's terminal one.
+  const current = listTeamLookupCandidates(cwd, env).filter((candidate) => matchingCurrentLeader(candidate, scope));
+  const active = current.filter((candidate) => !candidate.terminal);
+  const pool = active.length > 0 ? active : current;
+  if (pool.length === 1) return pool[0].teamName;
+  return null;
 }

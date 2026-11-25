@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { questionCommand } from '../question.js';
@@ -65,6 +65,200 @@ describe('omx question CLI', () => {
     originalProcessExitCode = process.exitCode;
     process.exitCode = undefined;
   });
+
+  for (const phase of ['poll', 'error-commit'] as const) {
+    it(`returns the accepted answer when timeout races at ${phase}`, async () => {
+      const cwd = await makeRepo();
+      const stateModule = new URL('../../question/state.js', import.meta.url).href;
+      const cliModule = new URL('../question.js', import.meta.url).href;
+      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import fs from 'node:fs/promises';
+        import { syncBuiltinESMExports } from 'node:module';
+        const read = fs.readFile, remove = fs.rm;
+        let state, reads = 0, injected = false, record;
+        const answer = async () => {
+          injected = true;
+          await state.submitQuestionAnswerById(process.cwd(), record.question_id, {
+            answer: { kind: 'option', value: 'a', selected_labels: ['A'], selected_values: ['a'] },
+          }, { sessionId: 'sess-q', closeQuestionRenderer: () => true });
+        };
+        fs.readFile = async (...args) => {
+          const contents = await read(...args);
+          if (String(args[0]).includes(${JSON.stringify(`${sep}questions${sep}`)}) && String(args[0]).endsWith('.json')) {
+            const current = JSON.parse(contents);
+            if (current.status === 'prompting') {
+              record = current; reads += 1;
+              if (!injected && ${JSON.stringify(phase)} === 'poll' && reads === 1) await answer();
+              await new Promise(r => setTimeout(r, 2));
+            }
+          }
+          return contents;
+        };
+        fs.rm = async (...args) => {
+          const result = await remove(...args);
+          if (!injected && ${JSON.stringify(phase)} === 'error-commit' && reads >= 2
+            && String(args[0]).endsWith('.submit.lock')) await answer();
+          return result;
+        };
+        syncBuiltinESMExports();
+        state = await import(${JSON.stringify(stateModule)});
+        const { questionCommand } = await import(${JSON.stringify(cliModule)});
+        await questionCommand(['--input', JSON.stringify({
+          session_id: 'sess-q', question: 'Pick one', options: [{label:'A',value:'a'}], allow_other: false,
+        }), '--json']);
+        if (!injected) throw new Error('Race was not exercised');
+      `], {
+        cwd, encoding: 'utf8',
+        env: makeQuestionCliEnv(cwd, { OMX_QUESTION_TEST_RENDERER: 'noop', OMX_QUESTION_WAIT_TIMEOUT_MS: '0' }),
+      });
+      const payload = JSON.parse(output);
+      assert.equal(payload.ok, true);
+      assert.equal(payload.answer.value, 'a');
+      const events = (await readFile(join(cwd, '.omx/state/question-events.jsonl'), 'utf8'))
+        .trim().split('\n').map((line) => JSON.parse(line));
+      assert.equal(events.filter((event) => event.type === 'question-answered').length, 1);
+      assert.equal(events.some((event) => event.type === 'question-error'), false);
+    });
+  }
+
+  it('reports a structured failure and keeps an abandoned submit lock when the waiter times out', async () => {
+    const cwd = await makeRepo();
+    const cliModule = new URL('../question.js', import.meta.url).href;
+    const run = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs/promises';
+      import { syncBuiltinESMExports } from 'node:module';
+      const read = fs.readFile;
+      let locked = false;
+      fs.readFile = async (...args) => {
+        const contents = await read(...args);
+        const path = String(args[0]);
+        if (!locked && path.includes(${JSON.stringify(`${sep}questions${sep}`)}) && path.endsWith('.json')
+          && JSON.parse(contents).status === 'prompting') {
+          locked = true;
+          await fs.mkdir(path + '.submit.lock');
+          await fs.writeFile(path + '.submit.lock/owner', '99999999.0.dead');
+          process.env.LOCK_PATH = path + '.submit.lock';
+        }
+        return contents;
+      };
+      syncBuiltinESMExports();
+      const { questionCommand } = await import(${JSON.stringify(cliModule)});
+      await questionCommand(['--input', JSON.stringify({
+        session_id: 'sess-q', question: 'Pick one', options: [{label:'A',value:'a'}], allow_other: false,
+      }), '--json']);
+      process.stderr.write('LOCK=' + process.env.LOCK_PATH + '\\n');
+    `], {
+      cwd, encoding: 'utf8', timeout: 30_000,
+      env: makeQuestionCliEnv(cwd, { OMX_QUESTION_TEST_RENDERER: 'noop', OMX_QUESTION_WAIT_TIMEOUT_MS: '0' }),
+    });
+    assert.equal(run.status, 1, run.stderr);
+    const payload = JSON.parse(run.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, 'question_runtime_failed');
+    assert.match(payload.error.message, /question_submit_lock_recovery_required:/);
+    const lockPath = /LOCK=(.*)/.exec(run.stderr)?.[1];
+    assert.ok(lockPath, run.stderr);
+    assert.equal(await readFile(join(lockPath, 'owner'), 'utf8'), '99999999.0.dead');
+    const events = (await readFile(join(cwd, '.omx/state/question-events.jsonl'), 'utf8'))
+      .trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(events.filter((event) => event.type === 'question-error').length, 1);
+  });
+
+  for (const lockAfterExit of ['released', 'replaced'] as const) {
+    it(`returns the accepted answer after a normally exiting lock owner leaves its lock ${lockAfterExit}`, async () => {
+      const cwd = await makeRepo();
+      const stateModule = new URL('../../question/state.js', import.meta.url).href;
+      const cliModule = new URL('../question.js', import.meta.url).href;
+      const writerCode = `
+        import fs from 'node:fs/promises';
+        import { syncBuiltinESMExports } from 'node:module';
+        const read = fs.readFile;
+        fs.readFile = async (...args) => {
+          const contents = await read(...args);
+          if (String(args[0]) === process.argv[1]) {
+            const released = new Promise(resolve => process.once('message', resolve));
+            process.send('locked');
+            await released;
+          }
+          return contents;
+        };
+        syncBuiltinESMExports();
+        const { markQuestionAnswered } = await import(${JSON.stringify(stateModule)});
+        await markQuestionAnswered(process.argv[1], {
+          kind: 'option', value: 'a', selected_labels: ['A'], selected_values: ['a'],
+        }, { closeQuestionRenderer: () => true });
+        process.disconnect();
+      `;
+      const output = execFileSync(process.execPath, ['--input-type=module', '-e', `
+        import assert from 'node:assert/strict';
+        import fs from 'node:fs/promises';
+        import { spawn } from 'node:child_process';
+        import { once } from 'node:events';
+        import { syncBuiltinESMExports } from 'node:module';
+        import { join } from 'node:path';
+        const read = fs.readFile, remove = fs.rm;
+        let reads = 0, recordPath, writer, exercised = false;
+        fs.readFile = async (...args) => {
+          const contents = await read(...args);
+          const path = String(args[0]);
+          if (path.includes(${JSON.stringify(`${sep}questions${sep}`)}) && path.endsWith('.json')
+            && JSON.parse(contents).status === 'prompting') {
+            recordPath = path; reads += 1;
+            await new Promise(resolve => setTimeout(resolve, 2));
+          }
+          if (writer && !exercised && path === join(recordPath + '.submit.lock', 'owner')
+            && contents.startsWith(writer.pid + '.')) {
+            exercised = true;
+            const exited = once(writer, 'exit');
+            writer.send('release');
+            assert.deepEqual(await exited, [0, null]);
+            if (${JSON.stringify(lockAfterExit)} === 'replaced') {
+              const lock = recordPath + '.submit.lock';
+              await fs.mkdir(lock);
+              const token = process.pid + '.replacement';
+              await fs.writeFile(lock + '/owner', token);
+              setTimeout(async () => {
+                assert.equal(await read(lock + '/owner', 'utf8'), token);
+                await remove(lock, {recursive:true});
+              }, 75);
+            }
+          }
+          return contents;
+        };
+        fs.rm = async (...args) => {
+          const result = await remove(...args);
+          if (!writer && reads >= 2 && String(args[0]) === recordPath + '.submit.lock') {
+            writer = spawn(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(writerCode)}, recordPath], {
+              stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+            });
+            assert.deepEqual(await once(writer, 'message'), ['locked', undefined]);
+          }
+          return result;
+        };
+        syncBuiltinESMExports();
+        const { questionCommand } = await import(${JSON.stringify(cliModule)});
+        try {
+          await questionCommand(['--input', JSON.stringify({
+            session_id: 'sess-q', question: 'Pick one', options: [{label:'A',value:'a'}], allow_other:false,
+          }), '--json']);
+          assert.equal(exercised, true);
+          await assert.rejects(fs.stat(recordPath + '.submit.lock'), {code:'ENOENT'});
+        } finally {
+          if (writer && writer.exitCode === null) writer.kill('SIGKILL');
+        }
+      `], {
+        cwd, encoding: 'utf8', timeout: 30_000,
+        env: makeQuestionCliEnv(cwd, { OMX_QUESTION_TEST_RENDERER: 'noop', OMX_QUESTION_WAIT_TIMEOUT_MS: '0' }),
+      });
+      const payload = JSON.parse(output);
+      assert.equal(payload.ok, true);
+      assert.equal(payload.answer.value, 'a');
+      const events = (await readFile(join(cwd, '.omx/state/question-events.jsonl'), 'utf8'))
+        .trim().split('\n').map((line) => JSON.parse(line));
+      assert.equal(events.filter((event) => event.type === 'question-answered').length, 1);
+      assert.equal(events.some((event) => event.type === 'question-error'), false);
+    });
+  }
 
   it('hard-fails worker contexts before UI launch', async () => {
     const cwd = await makeRepo();
@@ -149,14 +343,16 @@ describe('omx question CLI', () => {
     const cwd = await makeRepo();
     const sessionDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q');
     const autopilotPath = join(sessionDir, 'autopilot-state.json');
-    await writeFile(autopilotPath, JSON.stringify({
+    const stateWrite = spawnSync(process.execPath, [omxBin, 'state', 'write', '--input', JSON.stringify({
       mode: 'autopilot',
       active: true,
       current_phase: 'deep-interview',
-      run_outcome: 'interviewing',
-      lifecycle_outcome: 'running',
+      run_outcome: 'continue',
       session_id: 'sess-q',
-    }, null, 2));
+    }), '--json'], { cwd, env: makeQuestionCliEnv(cwd), encoding: 'utf8' });
+    assert.equal(stateWrite.status, 0, stateWrite.stderr || stateWrite.stdout);
+    const initialAutopilot = JSON.parse(await readFile(autopilotPath, 'utf8'));
+    assert.equal(Object.hasOwn(initialAutopilot, 'mode'), false);
     await writeFile(join(sessionDir, 'deep-interview-state.json'), JSON.stringify({
       mode: 'deep-interview',
       active: true,
@@ -233,6 +429,7 @@ describe('omx question CLI', () => {
     const payload = JSON.parse(stdout);
     assert.equal(payload.ok, true);
     assert.equal(payload.answer.value, 'exact-page');
+    assert.equal(payload.answers[0].answer.value, 'exact-page');
 
     const finalAutopilot = JSON.parse(await readFile(autopilotPath, 'utf-8')) as {
       current_phase?: string;
@@ -241,11 +438,47 @@ describe('omx question CLI', () => {
       state?: { deep_interview_question?: { status?: string; question_id?: string; satisfied_at?: string } };
     };
     assert.equal(finalAutopilot.current_phase, 'deep-interview');
-    assert.equal(finalAutopilot.run_outcome, 'interviewing');
-    assert.equal(finalAutopilot.lifecycle_outcome, 'running');
+    assert.equal(finalAutopilot.run_outcome, 'continue');
+    assert.equal(finalAutopilot.lifecycle_outcome, undefined);
     assert.equal(finalAutopilot.state?.deep_interview_question?.status, 'satisfied');
     assert.equal(finalAutopilot.state?.deep_interview_question?.question_id, record?.question_id);
     assert.ok(finalAutopilot.state?.deep_interview_question?.satisfied_at);
+  });
+
+  it('infers a missing autopilot mode only for valid session-scoped state', async () => {
+    const cwd = await makeRepo();
+    const stateDir = join(cwd, '.omx', 'state');
+    const state = { active: true, current_phase: 'deep-interview' };
+    await writeFile(join(stateDir, 'autopilot-state.json'), JSON.stringify(state));
+    const sessionDir = join(stateDir, 'sessions', 'sess-q');
+    const sessionPath = join(sessionDir, 'autopilot-state.json');
+    const helperModule = new URL('../../question/autopilot-wait.js', import.meta.url).href;
+    const runCheck = (sessionId: string | null): boolean => JSON.parse(execFileSync(
+      process.execPath,
+      ['--input-type=module', '-e', `
+        import { canStartAutopilotDeepInterviewQuestion } from ${JSON.stringify(helperModule)};
+        console.log(JSON.stringify(await canStartAutopilotDeepInterviewQuestion(process.cwd(), ${JSON.stringify(sessionId)} ?? undefined)));
+      `],
+      { cwd, env: makeQuestionCliEnv(cwd), encoding: 'utf8' },
+    ));
+
+    assert.equal(runCheck(null), false, 'mode-less root state must not supply session identity');
+    assert.equal(runCheck('sess-other'), false, 'another session must not fall back to root state');
+    assert.equal(runCheck('../outside'), false, 'invalid session identifiers must fail closed');
+    await writeFile(sessionPath, JSON.stringify(state));
+    assert.equal(runCheck('sess-q'), true);
+    for (const mode of [null, '', 'ralph']) {
+      await writeFile(sessionPath, JSON.stringify({ ...state, mode }));
+      assert.equal(runCheck('sess-q'), false, `explicit mode ${JSON.stringify(mode)} must not be replaced`);
+    }
+    for (const invalidState of [null, [], 'not-an-object']) {
+      await writeFile(sessionPath, JSON.stringify(invalidState));
+      assert.equal(runCheck('sess-q'), false);
+    }
+    await writeFile(sessionPath, JSON.stringify({ ...state, active: false }));
+    assert.equal(runCheck('sess-q'), false);
+    await writeFile(sessionPath, JSON.stringify({ ...state, current_phase: 'ultragoal' }));
+    assert.equal(runCheck('sess-q'), false);
   });
 
   it('allows the owning spawned deep-interview question after Autopilot records the wait', async () => {
@@ -734,6 +967,64 @@ exit 0
     assert.doesNotMatch(tmuxLog, /new-session/);
   });
 
+  it('reports tmux access denial instead of misclassifying the session as detached', async () => {
+    const cwd = await makeRepo();
+    const fakeBinDir = join(cwd, 'fake-bin');
+    await mkdir(fakeBinDir, { recursive: true });
+    await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
+if [ "$1" = "display-message" ]; then
+  printf '%s\n' 'error connecting to /private/tmp/tmux-501/default (Operation not permitted)' >&2
+  exit 1
+fi
+exit 0
+`, { mode: 0o755 });
+
+    const input = JSON.stringify({
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: true,
+      session_id: 'sess-q',
+    });
+
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
+        cwd,
+        env: makeQuestionCliEnv(cwd, {
+          PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+          TMUX: '/private/tmp/tmux-501/default,3190,44',
+          TMUX_PANE: '%162',
+          OMX_QUESTION_RETURN_PANE: '',
+          OMX_LEADER_PANE_ID: '',
+          OMX_AUTO_UPDATE: '0',
+          OMX_NOTIFY_FALLBACK: '0',
+          OMX_HOOK_DERIVED_SIGNALS: '0',
+        }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+      child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+
+    assert.equal(result.code, 1);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.error.code, 'question_tmux_access_denied');
+    assert.match(payload.error.message, /tmux access was denied/i);
+    assert.match(payload.error.message, /Operation not permitted/i);
+    assert.doesNotMatch(payload.error.message, /no attached client/i);
+
+    const entries = await readdir(join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions'));
+    assert.equal(entries.length, 1);
+    const recordPath = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions', entries[0]!);
+    const record = JSON.parse(await readFile(recordPath, 'utf-8')) as { status: string; error?: { code?: string; message?: string } };
+    assert.equal(record.status, 'error');
+    assert.equal(record.error?.code, 'question_tmux_access_denied');
+    assert.doesNotMatch(record.error?.message || '', /no attached client/i);
+  });
+
   it('uses an explicit return pane to launch from a container-like shell without TMUX', async () => {
     const cwd = await makeRepo();
     const fakeBinDir = join(cwd, 'fake-bin');
@@ -924,6 +1215,42 @@ esac
       if (typeof originalOmxTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = originalOmxTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
     }
+  });
+
+  it('exits with exit code 1 and clear error when stdin is closed in --ui mode', async () => {
+    const cwd = await makeRepo();
+    const questionsDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions');
+    const recordPath = join(questionsDir, 'question-test.json');
+    const record = {
+      kind: 'omx.question/v1',
+      question_id: 'test-q',
+      session_id: 'sess-q',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      status: 'prompting',
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }, { label: 'B', value: 'b' }],
+      allow_other: false,
+      multi_select: false,
+      type: 'single-answerable',
+    };
+    await writeFile(recordPath, JSON.stringify(record, null, 2));
+
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [omxBin, 'question', '--ui', '--state-path', recordPath], {
+        cwd,
+        env: makeQuestionCliEnv(cwd, { OMX_AUTO_UPDATE: '0', OMX_QUESTION_RETURN_PANE: '%999' }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+      child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+
+    assert.equal(result.code, 1, `Expected exit code 1, got ${result.code}. stderr=${result.stderr}; stdout=${result.stdout}`);
+    assert.match(result.stderr, /Standard input closed/, `Expected error message about closed stdin. stderr=${result.stderr}`);
   });
 
 });

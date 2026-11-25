@@ -4,7 +4,7 @@ import { homedir } from "os";
 import { buildPlatformCommandSpec, classifySpawnError } from "../utils/platform-command.js";
 import { readAuthConfig } from "./config.js";
 import { isQuotaError } from "./quota-detector.js";
-import { redactAuthSecrets } from "./redact.js";
+import { createAuthStderrRedactor, redactAuthSecrets } from "./redact.js";
 import { buildRotationPlan, nextSlotAfter } from "./rotation.js";
 import { findLatestRolloutSession } from "./sessions.js";
 import { listSlots, markSlotQuota, readAuthMetadata, useSlot } from "./storage.js";
@@ -44,6 +44,7 @@ export interface HotswapLifecycle {
   cleanupRuntimeCodexHome: (runtimeCodexHome?: string, projectCodexHome?: string) => Promise<void>;
   normalizeCodexLaunchArgs: (args: string[]) => string[];
   injectModelInstructionsBypassArgs: (cwd: string, args: string[], env: NodeJS.ProcessEnv, defaultFilePath?: string) => string[];
+  buildStartupModelInstructionsEnv: (cwd: string, args: string[], sessionId: string, env: NodeJS.ProcessEnv) => Record<string, string>;
   sessionModelInstructionsPath: (cwd: string, sessionId: string) => string;
   resolveOmxRootForLaunch: (cwd: string, env: NodeJS.ProcessEnv) => string | undefined;
   resolveNotifyTempContract: (args: string[], env: NodeJS.ProcessEnv) => {
@@ -90,6 +91,48 @@ function isAuthInvalidationError(stderr: string | undefined): boolean {
   return /token_invalidated|refresh_token_invalidated|authentication token has been invalidated/i.test(stderr || "");
 }
 
+/**
+ * Detects JetBrains IDE terminals where trackpad scrolling may be translated
+ * to arrow keys, causing the alternate screen mode issue.
+ * Returns true if a diagnostic should be emitted.
+ */
+function shouldEmitJetBrainsScrollDiagnostic(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): boolean {
+  // Only emit if --no-alt-screen is not already specified
+  if (args.includes("--no-alt-screen")) return false;
+
+  // Check for JetBrains terminal indicators
+  const termProgram = env.TERM_PROGRAM || "";
+  return (
+    termProgram.includes("JetBrains") ||
+    termProgram === "JediTerm" ||
+    termProgram.includes("WebStorm") ||
+    termProgram.includes("IntelliJ") ||
+    termProgram.includes("PyCharm") ||
+    termProgram.includes("CLion") ||
+    termProgram.includes("GoLand") ||
+    termProgram.includes("Rider") ||
+    termProgram.includes("DataGrip") ||
+    termProgram.includes("RubyMine") ||
+    termProgram.includes("PhpStorm") ||
+    env.TERMINAL_EMULATOR === "JetBrains-JediTerm"
+  );
+}
+
+/**
+ * Emits a diagnostic warning about trackpad scrolling in JetBrains terminals.
+ */
+function emitJetBrainsScrollDiagnostic(): void {
+  process.stderr.write(
+    "[omx] warning: trackpad scrolling in this IDE's terminal may be translated to arrow keys, " +
+      "causing prompt history navigation instead of output scrolling.\n" +
+      "[omx] workaround: use 'omx --no-alt-screen' to disable alternate screen mode.\n" +
+      "[omx] for more info, see: https://github.com/Yeachan-Heo/oh-my-codex/issues/3872\n",
+  );
+}
+
 async function runCodexDirect(
   cwd: string,
   args: string[],
@@ -104,11 +147,11 @@ async function runCodexDirect(
       ...(process.platform === "win32" ? { windowsHide: true } : {}),
     });
     let stderr = "";
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const text = redactAuthSecrets(chunk.toString("utf-8"));
+    const redactor = createAuthStderrRedactor((text) => {
       stderr += text;
       process.stderr.write(text);
     });
+    child.stderr?.on("data", (chunk: Buffer) => redactor.write(chunk));
     child.on("error", (error: NodeJS.ErrnoException) => {
       const kind = classifySpawnError(error);
       if (kind === "missing") {
@@ -120,6 +163,7 @@ async function runCodexDirect(
       }
     });
     child.on("close", (status, signal) => {
+      redactor.end();
       resolve({ status: typeof status === "number" ? status : 1, signal, stderr });
     });
   });
@@ -280,8 +324,15 @@ export async function runAuthHotswap(options: HotswapOptions): Promise<number> {
         baseEnv,
         lifecycle.sessionModelInstructionsPath(cwd, sessionId),
       );
+      // Emit JetBrains scroll diagnostic only once at the first attempt
+      if (attempt === 0 && shouldEmitJetBrainsScrollDiagnostic(attemptArgs, baseEnv)) {
+        emitJetBrainsScrollDiagnostic();
+      }
       process.stderr.write(`[omx auth] using slot ${currentSlot}\n`);
-      const result = await runCodexDirect(cwd, attemptArgs, baseEnv);
+      const result = await runCodexDirect(cwd, attemptArgs, {
+        ...baseEnv,
+        ...lifecycle.buildStartupModelInstructionsEnv(cwd, resumeArgs ?? normalizedArgs, sessionId, baseEnv),
+      });
       if (result.status === 0) return 0;
       const authInvalid = isAuthInvalidationError(result.stderr);
       const quota = isQuotaError({ status: result.status, signal: result.signal, stderr: result.stderr }, config);

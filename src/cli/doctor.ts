@@ -1,3 +1,6 @@
+import { probeInstalledCodexFeatureList } from "./codex-feature-probe.js";
+import { resolveUserCredentialSource } from "./launch-credential-provenance.js";
+import { resolveCodexPluginHookFeatureFlag } from "../config/codex-feature-flags.js";
 /**
  * omx doctor - Validate oh-my-codex installation
  */
@@ -14,9 +17,9 @@ import {
 	type RegularFileDurabilityTracker,
 } from "../utils/file-durability.js";
 import { constants, existsSync, readFileSync, type Stats } from "fs";
-import { access, chown, lstat, mkdtemp, readdir, readFile, rmdir, rm } from "fs/promises";
+import { access, chown, lstat, mkdir, mkdtemp, readdir, readFile, rename, rmdir, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, dirname, join, relative } from "path";
+import { basename, dirname, join, relative, resolve } from "path";
 import { tmpdir } from "os";
 import {
 	codexHome,
@@ -30,7 +33,9 @@ import {
 } from "../utils/paths.js";
 import {
   readCanonicalSessionBindingSnapshot,
+  isModeStateFilename,
   normalizeSessionId,
+  verifiedSessionAliases,
   type CanonicalSessionBindingSnapshot,
   type StateRootSource,
 } from "../mcp/state-paths.js";
@@ -50,6 +55,7 @@ import {
 	analyzeLegacyMultiAgentConfig,
 	hasExactOmxSeededBehavioralDefaultsPair,
 	hasLegacyOmxTeamRunTable,
+	migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged,
 } from "../config/generator.js";
 import {
 	MANAGED_HOOK_EVENTS,
@@ -85,9 +91,13 @@ import {
 import {
 	OMX_LOCAL_MARKETPLACE_NAME,
 	OMX_LOCAL_PLUGIN_CONFIG_KEY,
+	PLUGIN_LAUNCHER_RECOVERY_HINT,
+	getUntrustedOmxPluginCacheRecoveryHint,
 	discoverOmxPluginCacheDirs,
 	expectedPackagedOmxSkillNames,
+	getPinnedLauncherIncompatibilityReason,
 	packagedOmxPluginVersion,
+	omxPluginCacheProvenanceReason,
 	pluginHookCacheMatchesPackaged,
 	readOmxPluginCacheState,
 	resolvePackagedOmxMarketplace,
@@ -100,7 +110,7 @@ import {
 	getCodexConfigRootModelProvider,
 	getConfiguredTeamLowComplexityModel,
 	getEnvConfiguredSparkDefaultModel,
-	getMainDefaultModel,
+	getFrontierDefaultModel,
 	getSparkDefaultModel,
 	getStandardDefaultModel,
 } from "../config/models.js";
@@ -110,8 +120,13 @@ import { readCatalogManifest } from "../catalog/reader.js";
 import {
 	defaultProcessInspectionProvider,
 	isValidProcessIdentity,
+	resolveSessionPointerContext,
 	type ProcessInspectionProvider,
 } from "../hooks/session.js";
+import {
+	resolveAuthoritativeTeamWorkerContext,
+	resolveConductorPolicyRoot,
+} from "../team/worker-provenance.js";
 
 let doctorClaimJournalDurabilityOverride: NativeHookClaimJournalDurability | undefined;
 
@@ -131,6 +146,13 @@ interface DoctorOptions {
 	force?: boolean;
 	dryRun?: boolean;
 	team?: boolean;
+	repairState?: boolean;
+}
+
+export interface StateProjectionRepairResult {
+	archived: string[];
+	preserved: string[];
+	skipped: string[];
 }
 
 interface Check {
@@ -232,8 +254,6 @@ async function inferPluginInstallModeFromConfigForScope(
 
 	try {
 		const configContent = await readFile(configPath, "utf-8");
-		if (!configEnablesPluginScopedHooks(configContent)) return null;
-
 		const { marketplace, plugin } = getParsedPluginMarketplaceConfig(configContent);
 		if (!marketplace || marketplace.source_type !== "local") return null;
 		if (!(await isTrustedOmxPluginMarketplaceSource(marketplace.source))) return null;
@@ -338,10 +358,18 @@ export function sanitizeBindingDiagnosticLine(value: string): string {
 function selectorEvaluation(
   snapshot: CanonicalSessionBindingSnapshot,
   env: NodeJS.ProcessEnv,
-): { nonblank: BindingSelectorName[]; bad: BindingSelectorName[] } {
+): { nonblank: BindingSelectorName[]; bad: BindingSelectorName[]; unverified: BindingSelectorName[] } {
   const nonblank: BindingSelectorName[] = [];
   const bad: BindingSelectorName[] = [];
+  const unverified: BindingSelectorName[] = [];
   const aliases = new Set(Object.values(snapshot.verifiedAliases ?? {}));
+  // identity-indeterminate and non-runtime-owner snapshots carry no OMX authority, but the
+  // recorded ids in session.json still let us tell a matching selector from a mismatch.
+  const recordedIds = new Set(
+    (snapshot.status === "identity-indeterminate" || snapshot.status === "non-runtime-owner") && snapshot.state
+      ? Object.values(verifiedSessionAliases(snapshot.state))
+      : [],
+  );
   for (const name of BINDING_SELECTOR_NAMES) {
     const raw = env[name];
     if (typeof raw !== "string" || raw.trim() === "") continue;
@@ -352,9 +380,11 @@ function selectorEvaluation(
       : snapshot.status === "usable"
         ? normalized !== undefined && aliases.has(normalized)
         : false;
-    if (!accepted) bad.push(name);
+    if (accepted) continue;
+    if (normalized !== undefined && recordedIds.has(normalized)) unverified.push(name);
+    else bad.push(name);
   }
-  return { nonblank, bad };
+  return { nonblank, bad, unverified };
 }
 
 
@@ -379,7 +409,10 @@ function bindingRecoveryAction(
     return `${selectorFix}${rootClear}inspect selected session.json path/access; relaunch`;
   }
   if (snapshot.status === "stale-dead") {
-    return `${selectorFix}${rootClear}inspect selected session.json; confirm owner state; terminate only verified owner if necessary (still-live owner only); relaunch`;
+    return `${selectorFix}${rootClear}inspect selected session.json owner identity; run omx session pointer recover only for a positively dead, non-reused owner; reused or uncertain identity requires investigation; relaunch after resolution`;
+  }
+  if (snapshot.status === "non-runtime-owner") {
+    return `${selectorFix}${rootClear}run omx session pointer recover to quarantine the live managed Codex daemon pointer; relaunch`;
   }
   return `${selectorFix}${rootClear}inspect selected session.json; verify owner; terminate only verified owner if necessary; relaunch`;
 }
@@ -397,6 +430,8 @@ function compactCappedBindingRecoveryAction(
     || snapshot.status === "identity-indeterminate"
     ? "terminate only verified owner if necessary;"
     : "";
+  if (snapshot.status === "stale-dead") return `${selectorFix}${rootClear}recover only verified-dead non-reused owner;investigate reused/uncertain identity;relaunch`;
+  if (snapshot.status === "non-runtime-owner") return `${selectorFix}${rootClear}run omx session pointer recover;relaunch`;
   if (ownerTermination) return `${selectorFix}${rootClear}${ownerTermination}relaunch`;
   if (snapshot.status === "read-error") return `${selectorFix}${rootClear}inspect;relaunch`;
   return `${selectorFix}${rootClear}relaunch`;
@@ -407,14 +442,29 @@ export function formatStateRootSessionBindingDiagnostic(
   env: NodeJS.ProcessEnv = process.env,
   badSelectors?: readonly BindingSelectorName[],
 ): string {
-  const failedSelectorSet = new Set(badSelectors ?? selectorEvaluation(snapshot, env).bad);
-  const failedSelectors = BINDING_SELECTOR_NAMES.filter((name) => failedSelectorSet.has(name));
+  const evaluation = selectorEvaluation(snapshot, env);
+  const failedSelectors =
+    badSelectors !== undefined
+      ? BINDING_SELECTOR_NAMES.filter((name) => badSelectors.includes(name))
+      : evaluation.bad;
+  const unverifiedSelectors = evaluation.unverified.filter((name) => !failedSelectors.includes(name));
   const reportBadSelectors = failedSelectors;
   const inferred = snapshot.rootSource ? undefined : bindingEnvironmentRootSelector(env);
   const source = snapshot.rootSource ?? inferred?.source ?? "cwd-default";
   const rootSelector = ROOT_SELECTOR_BY_SOURCE[source] ?? inferred?.selector;
   const pointer = snapshot.status;
-  const unsafe = (pointer !== "usable" && pointer !== "absent") || failedSelectors.length > 0;
+  const unsafe = (pointer !== "usable" && pointer !== "absent") || failedSelectors.length > 0 || unverifiedSelectors.length > 0;
+  const hasUnverifiedSelectors = unverifiedSelectors.length > 0;
+  const identityProbeReason =
+    snapshot.liveness === "identity-indeterminate"
+      ? "process-identity-indeterminate"
+      : snapshot.liveness === "stale-dead"
+        ? "stale-dead"
+        : snapshot.liveness === "usable"
+          ? "usable"
+          : snapshot.liveness === "non-runtime-owner"
+            ? "managed-daemon-not-runtime-owner"
+          : undefined;
   const fields = [
     `src=${source}`,
     ...(rootSelector && unsafe ? [`root_selector=${rootSelector}`] : []),
@@ -425,6 +475,7 @@ export function formatStateRootSessionBindingDiagnostic(
       ? [`selected_session_json=${safeSelectedSessionJsonLabel(snapshot.selectedSessionJson)}`]
       : []),
     ...(reportBadSelectors.length > 0 ? [`bad_selectors=${reportBadSelectors.join(",")}`] : []),
+    ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
   ];
   const raw = fields.join(" ");
   if (raw.length <= 240 && !(rootSelector && unsafe)) return sanitizeBindingDiagnosticLine(raw);
@@ -468,10 +519,20 @@ export function formatStateRootSessionBindingDiagnostic(
       ...(compactRecovery.includes("terminate only verified owner if necessary")
         ? ["owner=terminate-verified-only-if-needed"]
         : []),
+      ...(snapshot.status === "stale-dead"
+        ? ["recover=dead-nonreused-only", "reused=investigate"]
+        : []),
+      ...(snapshot.status === "non-runtime-owner" ? ["recover=omx session pointer recover (managed Codex daemon)"] : []),
       ...(selectedSessionLabel ? ["selected=session.json"] : []),
       ...(badSelectorsField ? [badSelectorsField] : []),
+      ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
     ];
-    return canonicalFields.join(";");
+    const canonical = canonicalFields.join(";");
+    if (canonical.length <= 240) return canonical;
+    // Drop the owner advisory before any selector evidence so the line stays within the cap.
+    return sanitizeBindingDiagnosticLine(
+      canonicalFields.filter((field) => !field.startsWith("owner=")).join(";"),
+    );
   }
   const buildCompactFields = (
     selectedEvidence: string | undefined,
@@ -482,6 +543,7 @@ export function formatStateRootSessionBindingDiagnostic(
     ...(includeFixLabel ? [`fix=${recovery}`] : [recovery]),
     ...(selectedEvidence ? [selectedEvidence] : []),
     ...(badSelectorsField ? [badSelectorsField] : []),
+    ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
   ];
   const compactWithFullEvidence = buildCompactFields(
     selectedSessionLabel ? `selected_session_json=${selectedSessionLabel}` : undefined,
@@ -522,8 +584,13 @@ export function formatStateRootSessionBindingDiagnostic(
     ...(compactRecovery.includes("terminate only verified owner if necessary")
       ? ["owner=terminate-verified-only-if-needed"]
       : []),
+    ...(snapshot.status === "stale-dead"
+      ? ["recover=dead-nonreused-only", "reused=investigate"]
+      : []),
+    ...(snapshot.status === "non-runtime-owner" ? ["recover=omx session pointer recover (managed Codex daemon)"] : []),
     ...(selectedSessionLabel ? ["selected=session.json"] : []),
     ...(badSelectorsField ? [badSelectorsField] : []),
+    ...(hasUnverifiedSelectors && identityProbeReason ? [`unverified=${identityProbeReason}`] : []),
   ];
   return sanitizeBindingDiagnosticLine(fallbackFields.join(";"));
 }
@@ -533,12 +600,143 @@ export function checkStateRootSessionBinding(
   env: NodeJS.ProcessEnv = process.env,
 ): Check {
   const evaluation = selectorEvaluation(snapshot, env);
+  // Codex also supplies a session ID outside OMX-managed sessions. Its presence
+  // alone cannot establish a broken binding in an uninitialized workspace.
+  // Keep explicit runtime roots/selectors and existing pointers fail-closed.
+  if (
+    snapshot.status === "absent" && snapshot.rootSource === "cwd-default" &&
+    !bindingEnvironmentRootSelector(env) &&
+    evaluation.nonblank.length === 1 && evaluation.nonblank[0] === "CODEX_SESSION_ID" &&
+    normalizeSessionId(env.CODEX_SESSION_ID) !== undefined
+  ) {
+    return {
+      name: "State root/session binding",
+      status: "warn",
+      message: "src=cwd-default ptr=absent; Codex session detected but may not be OMX-managed — non-OMX workflows do not require OMX binding. No OMX runtime authority verified; this condition alone does not indicate installation damage. For OMX features: run 'omx' to start an OMX-managed session.",
+    };
+  }
   let status: Check["status"] = "fail";
-  if (snapshot.status === "absent" && evaluation.bad.length === 0) status = "pass";
-  else if (snapshot.status === "stale-dead" && evaluation.bad.length === 0) status = "warn";
-  else if (snapshot.status === "usable" && evaluation.bad.length === 0) status = "pass";
+  if (
+    snapshot.status === "absent" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "pass";
+  else if (
+    snapshot.status === "stale-dead" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "warn";
+  else if (
+    snapshot.status === "usable" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "pass";
+  else if (
+    snapshot.status === "non-runtime-owner" &&
+    evaluation.bad.length === 0 &&
+    evaluation.unverified.length === 0
+  )
+    status = "warn";
   const message = formatStateRootSessionBindingDiagnostic(snapshot, env, evaluation.bad);
   return { name: "State root/session binding", status, message };
+}
+
+function stateProjectionArchivePath(
+	baseStateDir: string,
+	sourcePath: string,
+	archiveRoot: string,
+): string {
+	const relativePath = relative(baseStateDir, sourcePath);
+	return join(archiveRoot, "state", relativePath);
+}
+
+async function collisionSafeArchivePath(path: string): Promise<string> {
+	if (!existsSync(path)) return path;
+	const suffix = path.endsWith(".json") ? ".json" : "";
+	const stem = suffix ? path.slice(0, -suffix.length) : path;
+	for (let index = 1; ; index += 1) {
+		const candidate = `${stem}.${index}${suffix}`;
+		if (!existsSync(candidate)) return candidate;
+	}
+}
+
+/**
+ * Archive non-authoritative mode-state projections without interpreting their
+ * workflow contents. The canonical session pointer selects the one current
+ * session scope; all other mode projection files are stale by ownership.
+ */
+export async function repairStateProjections(
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<StateProjectionRepairResult> {
+	const result: StateProjectionRepairResult = {
+		archived: [],
+		preserved: [],
+		skipped: [],
+	};
+	const snapshot = await readCanonicalSessionBindingSnapshot(cwd, env);
+	const baseStateDir = snapshot.baseStateDir;
+	if (!baseStateDir || ["resolution-error", "read-error", "malformed", "missing-recorded-cwd", "root-mismatch", "foreign-cwd"].includes(snapshot.status)) {
+		return result;
+	}
+
+	const currentSessionId = snapshot.state && ["usable", "identity-indeterminate"].includes(snapshot.status)
+		? normalizeSessionId(snapshot.state.session_id)
+		: undefined;
+	const stateDirs = [baseStateDir];
+	try {
+		const sessionsRoot = join(baseStateDir, "sessions");
+		const sessionEntries = await readdir(sessionsRoot, { withFileTypes: true });
+		for (const entry of sessionEntries) {
+			if (entry.isDirectory() && normalizeSessionId(entry.name) === entry.name) {
+				stateDirs.push(join(sessionsRoot, entry.name));
+			}
+		}
+	} catch {
+		// A missing sessions directory is normal; the canonical root is enough.
+	}
+	const archiveRoot = join(dirname(baseStateDir), "archive");
+	for (const stateDir of stateDirs) {
+		const isRoot = stateDir === baseStateDir;
+		const sessionId = isRoot ? undefined : basename(stateDir);
+		const preserveDir = isRoot
+			? currentSessionId === undefined
+			: sessionId === currentSessionId;
+		let entries: string[];
+		try {
+			entries = await readdir(stateDir);
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (!isModeStateFilename(entry)) continue;
+			const sourcePath = join(stateDir, entry);
+			if (preserveDir) {
+				result.preserved.push(sourcePath);
+				continue;
+			}
+			try {
+				const sourceStat = await lstat(sourcePath);
+				if (!sourceStat.isFile()) {
+					result.skipped.push(`${sourcePath}: not a regular projection file`);
+					continue;
+				}
+				const destination = await collisionSafeArchivePath(
+					stateProjectionArchivePath(baseStateDir, sourcePath, archiveRoot),
+				);
+				await mkdir(dirname(destination), { recursive: true });
+				await rename(sourcePath, destination);
+				result.archived.push(destination);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				result.skipped.push(`${sourcePath}: ${message}`);
+			}
+		}
+	}
+	return result;
 }
 
 export async function doctor(options: DoctorOptions = {}): Promise<void> {
@@ -551,6 +749,14 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   const bindingSnapshot = await readCanonicalSessionBindingSnapshot(cwd, process.env);
 	const scopeResolution = await resolveDoctorScope(cwd);
 	const paths = resolveDoctorPaths(cwd, scopeResolution.scope);
+	if (options.repairState) {
+		const repair = await repairStateProjections(cwd);
+		console.log(
+			`State projection repair: archived ${repair.archived.length}, preserved ${repair.preserved.length}, skipped ${repair.skipped.length}`,
+		);
+		for (const skipped of repair.skipped) console.log(`  skipped: ${skipped}`);
+		console.log();
+	}
 	const recoveryTracker: RegularFileDurabilityTracker = { degraded: false };
 	const recovery = await recoverNativeHookClaimJournal(
 		paths.codexHomeDir,
@@ -629,7 +835,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	checks.push(checkDirectory("Codex home", paths.codexHomeDir));
 
 	// Check 4: Config file
-	const configCheck = await checkConfig(paths.configPath);
+	const configCheck = await checkConfig(paths.configPath, scopeResolution.scope);
 	checks.push(configCheck);
 	const multiAgentCompatibilityCheck = await checkLegacyMultiAgentCompatibility(
 		paths.configPath,
@@ -721,6 +927,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
   }
   checks.push(checkStateRootSessionBinding(bindingSnapshot, process.env));
 	checks.push(await checkRepoArtifactOwnership(cwd));
+	checks.push(await checkCredentialProvenance(scopeResolution.scope, process.env));
 
 	// Check 9: MCP servers configured
 	checks.push(
@@ -775,7 +982,8 @@ interface TeamDoctorIssue {
 		| "orphan_tmux_session"
 		| "resume_blocker"
 		| "prompt_resume_unavailable"
-		| "stale_leader";
+		| "stale_leader"
+		| "worker_policy_root_unusable";
 	message: string;
 	severity: "warn" | "fail";
 }
@@ -980,6 +1188,54 @@ async function collectTeamDoctorIssues(
 					}
 				} catch {
 					// ignore malformed files
+				}
+			}
+
+			// #3536: run the same runtime preflight the native hook applies. A
+			// worker whose metadata cannot establish an authoritative context, or
+			// whose verified state root still yields an unusable Conductor policy
+			// root, would be denied at runtime while doctor reports all-pass.
+			const identityPath = join(workerDir, "identity.json");
+			if (existsSync(identityPath)) {
+				try {
+					const identity = JSON.parse(await readFile(identityPath, "utf-8")) as Record<string, unknown>;
+					const manifestForWorker = existsSync(manifestPath)
+						? JSON.parse(await readFile(manifestPath, "utf-8")) as Record<string, unknown>
+						: {};
+					const workerCwd = typeof identity.worktree_path === "string" && identity.worktree_path.trim() !== ""
+						? identity.worktree_path.trim()
+						: typeof identity.working_dir === "string" ? identity.working_dir.trim() : "";
+					const identityStateRoot = typeof identity.team_state_root === "string" && identity.team_state_root.trim() !== ""
+						? identity.team_state_root.trim()
+						: stateDir;
+					const leaderCwd = typeof manifestForWorker.leader_cwd === "string" ? manifestForWorker.leader_cwd.trim() : "";
+					if (workerCwd) {
+						const workerEnv = {
+							OMX_TEAM_INTERNAL_WORKER: `${teamName}/${worker.name}`,
+							OMX_TEAM_STATE_ROOT: identityStateRoot,
+							OMX_TEAM_LEADER_CWD: leaderCwd,
+						} as NodeJS.ProcessEnv;
+						const evidence = await resolveAuthoritativeTeamWorkerContext(workerCwd, { env: workerEnv });
+						if (!evidence) {
+							issues.push({
+								code: "worker_policy_root_unusable",
+								message: `${teamName}/${worker.name} identity/config/manifest metadata does not establish an authoritative worker context; runtime authorization would deny this worker`,
+								severity: "fail",
+							});
+						} else {
+							const selectedStateDir = resolveSessionPointerContext(workerCwd, workerEnv).baseStateDir;
+							const policyRoot = resolveConductorPolicyRoot(selectedStateDir, workerCwd, evidence);
+							if (!policyRoot.valid) {
+								issues.push({
+									code: "worker_policy_root_unusable",
+									message: `${teamName}/${worker.name} selected state root ${selectedStateDir} has no usable canonical session cwd and no verified Team-root binding; runtime authorization would deny this worker`,
+									severity: "fail",
+								});
+							}
+						}
+					}
+				} catch {
+					// ignore malformed worker metadata
 				}
 			}
 		}
@@ -1190,10 +1446,16 @@ export function checkProcessIdentityReadiness(
 					: observation.kind === "unsupported"
 						? "provider unavailable"
 						: "provider response unverifiable";
+		// The native runtime is hydrated to the version-keyed cache, not shipped
+		// in the npm tarball. The foreground repair command retries hydration and
+		// surfaces its failure instead of looping through an opaque update.
+		const remedy = observation.kind === "unsupported"
+			? "run `omx native-runtime hydrate` in the foreground to retry native runtime hydration and report errors, then rerun doctor; session pointer recovery works without the native runtime"
+			: "reinstall or update OMX and rerun doctor";
 		return {
 			name: "Process identity",
 			status: "fail",
-			message: `native process identity is unavailable (${reason}); reinstall or update OMX and rerun doctor`,
+			message: `native process identity is unavailable (${reason}); ${remedy}`,
 		};
 	} catch {
 		return {
@@ -1309,6 +1571,49 @@ function checkDirectory(name: string, path: string): Check {
 		return { name, status: "pass", message: path };
 	}
 	return { name, status: "warn", message: `${path} (not created yet)` };
+}
+/**
+ * Issue #3629: under project scope the launch resolves CODEX_HOME to the
+ * per-session runtime mirror of <project>/.codex; Codex resolves credentials
+ * from that CODEX_HOME only. Report whether credential provenance is available
+ * (the caller's own auth.json, which launch seeds into the ephemeral mirror).
+ * Stat-only: the credential file is never read, parsed, or logged.
+ */
+async function checkCredentialProvenance(scope: DoctorSetupScope, env: NodeJS.ProcessEnv): Promise<Check> {
+	if (scope !== "project") {
+		return {
+			name: "Credential provenance",
+			status: "pass",
+			message: "user scope launches read credentials from the default Codex home",
+		};
+	}
+	const explicit = typeof env.CODEX_HOME === "string" && env.CODEX_HOME.trim() !== "";
+	const source = await resolveUserCredentialSource(env);
+	if (source.status === "found") {
+		return {
+			name: "Credential provenance",
+			status: "pass",
+			message: explicit
+				? "CODEX_HOME is explicit; its auth.json will be used as-is"
+				: "user auth.json will be seeded into the project launch home (no copy into the project)",
+		};
+	}
+	if (source.status === "unsafe") {
+		return {
+			name: "Credential provenance",
+			status: explicit ? "pass" : "fail",
+			message: explicit
+				? "CODEX_HOME is explicit but its auth.json is not a regular readable file; log in with `codex login` or `omx auth`"
+				: "auth.json in the default Codex home is not a regular readable file; project-scope launches will run unauthenticated — log in with `codex login` or `omx auth`",
+		};
+	}
+	return {
+		name: "Credential provenance",
+		status: explicit ? "pass" : "fail",
+		message: explicit
+			? "CODEX_HOME is explicit but has no auth.json; log in with `codex login` or `omx auth`"
+			: "no readable auth.json in the default Codex home; project-scope launches will run unauthenticated — log in with `codex login` or `omx auth`",
+	};
 }
 
 function currentProcessUid(): number | undefined {
@@ -1532,9 +1837,21 @@ export async function checkLegacyMultiAgentCompatibility(
 	}
 }
 
-async function checkConfig(configPath: string): Promise<Check> {
+async function checkConfig(configPath: string, scope: DoctorSetupScope): Promise<Check> {
 	if (!existsSync(configPath)) {
-		return { name: "Config", status: "warn", message: "config.toml not found" };
+		const resolvedConfigPath = resolve(configPath);
+		const codexHomeHint = scope === "user" && process.env.CODEX_HOME
+			&& resolvedConfigPath === resolve(codexConfigPath())
+			? ` CODEX_HOME is set, so this is the active Codex config path.`
+			: "";
+		const setupTarget = scope === "project" ? "this project scope" : "this Codex home";
+		return {
+			name: "Config",
+			status: "warn",
+			message:
+				`config.toml not found at ${resolvedConfigPath}.${codexHomeHint} ` +
+				`This check did not create it; run "omx setup" for ${setupTarget} to repair.`,
+		};
 	}
 
 	try {
@@ -1937,6 +2254,7 @@ export async function checkExternalCodexProcessGuards(
 }
 
 export interface NativeHookCheckContext {
+	codexFeaturesListOutput?: string;
 	codexHomeDir: string;
 	installMode?: SetupInstallMode;
 	platform?: NodeJS.Platform;
@@ -1951,15 +2269,68 @@ function configHasOmxEntries(configContent: string): boolean {
 	return configContent.includes("omx_") || configContent.includes("oh-my-codex");
 }
 
-function configEnablesPluginScopedHooks(configContent: string): boolean {
-	try {
-		const parsed = parseToml(configContent) as {
+export function configEnablesPluginScopedHooks(
+	configContent: string,
+	featuresListOutput = probeInstalledCodexFeatureList(),
+	featuresProbeUnavailable = featuresListOutput === null,
+): boolean {
+	const featureFlag = featuresProbeUnavailable
+		? null
+		: resolveCodexPluginHookFeatureFlag({ featuresListOutput });
+	// A completed probe is authoritative: when it selected a capability the
+	// capability-specific checks below decide; when the listing resolved no
+	// usable plugin hook capability (featureFlag null with a listing present),
+	// stale config must not override that negative evidence. Config-only
+	// inference is allowed only when the probe is genuinely unavailable
+	// (no binary, spawn failure, timeout); it never claims verified runtime
+	// capability on its own.
+	const parse = (content: string) => {
+		const parsed = parseToml(content) as {
 			plugin_hooks?: unknown;
 			features?: Record<string, unknown>;
 		};
-		return isEnabledTomlValue(parsed.plugin_hooks) || isEnabledTomlValue(parsed.features?.plugin_hooks);
+		const { plugin } = getParsedPluginMarketplaceConfig(content);
+		return { parsed, pluginEnabled: plugin?.enabled === true };
+	};
+	const legacyPluginHooksEnabled = (content: string) => {
+		const { parsed } = parse(content);
+		return (
+			isEnabledTomlValue(parsed.plugin_hooks) ||
+			isEnabledTomlValue(parsed.features?.plugin_hooks)
+		);
+	};
+	try {
+		if (featureFlag === "plugin_hooks") {
+			return legacyPluginHooksEnabled(configContent);
+		}
+		const { parsed, pluginEnabled } = parse(configContent);
+		const nativeHooks = parsed.features?.hooks ?? parsed.features?.codex_hooks;
+		if (featureFlag === "hooks") {
+			return pluginEnabled && (nativeHooks === undefined || isEnabledTomlValue(nativeHooks));
+		}
+		if (!featuresProbeUnavailable) return false;
+		// Probe unavailable: config-only inference from a trusted setup-written
+		// configuration. Requires the enabled trusted plugin registration for
+		// canonical hooks enablement; the retired spelling is accepted as the
+		// legacy supported row.
+		return (
+			legacyPluginHooksEnabled(configContent) ||
+			(pluginEnabled &&
+				(nativeHooks === undefined || isEnabledTomlValue(nativeHooks)))
+		);
 	} catch {
-		return /^\s*plugin_hooks\s*=\s*(?:true|1|"true"|"1"|"yes"|"on")\s*$/m.test(configContent);
+		// Config is not parseable TOML: capability-aware last-resort regex using
+		// the same spelling each known capability would accept, with the same
+		// enabled-plugin proof requirement for the canonical spelling when the
+		// probe is unavailable. Never a second trust-validation path.
+		if (featureFlag === "plugin_hooks") {
+			return /^\s*plugin_hooks\s*=\s*(?:true|1|"true"|"1"|"yes"|"on")\s*$/m.test(configContent);
+		}
+		if (featureFlag === "hooks") {
+			return /^\s*hooks\s*=\s*(?:true|1|"true"|"1"|"yes"|"on")\s*$/m.test(configContent);
+		}
+		if (!featuresProbeUnavailable) return false;
+		return /^\s*(?:plugin_hooks|hooks)\s*=\s*(?:true|1|"true"|"1"|"yes"|"on")\s*$/m.test(configContent);
 	}
 }
 
@@ -2169,6 +2540,8 @@ const MANAGED_HOOK_TRUST_KEY_LABELS: Record<
 	UserPromptSubmit: "user_prompt_submit",
 	PreCompact: "pre_compact",
 	PostCompact: "post_compact",
+	SubagentStart: "subagent_start",
+	SubagentStop: "subagent_stop",
 	Stop: "stop",
 };
 
@@ -2207,6 +2580,21 @@ function pluginHooksJsonHasNativeCoverage(content: string): boolean | null {
 	}
 }
 
+async function getUntrustedOmxPluginCacheEntryKind(cacheDir: string): Promise<"a symlink" | "a non-directory entry" | null> {
+	try {
+		const stats = await lstat(cacheDir);
+		if (stats.isSymbolicLink()) return "a symlink";
+		if (!stats.isDirectory()) return "a non-directory entry";
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+	}
+	return null;
+}
+
+function untrustedOmxPluginCacheRecoveryMessage(cacheDir: string, entryKind: "a symlink" | "a non-directory entry"): string {
+	return `expected plugin cache path ${cacheDir} is ${entryKind}; automatic repair preserves unverified content; ${getUntrustedOmxPluginCacheRecoveryHint(cacheDir)}`;
+}
+
 async function checkPluginScopedNativeHooks(
 	codexHomeDir: string,
 	setupHooksPath: string,
@@ -2231,14 +2619,33 @@ async function checkPluginScopedNativeHooks(
 	const expectedHooksPath = join(expectedCacheDir, "hooks", "hooks.json");
 	const expectedHookLauncherPath = join(expectedCacheDir, "hooks", "codex-native-hook.mjs");
 	const expectedPinnedLauncherPath = join(expectedCacheDir, "hooks", "omx-command.json");
+	const untrustedCacheEntryKind = await getUntrustedOmxPluginCacheEntryKind(expectedCacheDir);
+	if (untrustedCacheEntryKind) {
+		return {
+			name: "Native hooks",
+			status: "warn",
+			message: `plugin-scoped hooks are enabled, but ${untrustedOmxPluginCacheRecoveryMessage(expectedCacheDir, untrustedCacheEntryKind)}`,
+		};
+	}
 	const state = await readOmxPluginCacheState(expectedCacheDir);
 
 	if (!state) {
+		if (existsSync(join(expectedCacheDir, ".codex-plugin", "plugin.json"))) {
+			const launcherIncompat = await getPinnedLauncherIncompatibilityReason(expectedCacheDir, packagedMarketplace);
+			if (launcherIncompat) {
+				return {
+					name: "Native hooks",
+					status: "warn",
+					message:
+						`plugin-scoped hooks are enabled, but cached launcher in ${expectedCacheDir} is incompatible (${launcherIncompat.reason}); ${setupHooksPathDescription}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\``,
+				};
+			}
+		}
 		return {
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing at ${join(expectedCacheDir, ".codex-plugin", "plugin.json")}; ${setupHooksPathDescription}; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing at ${join(expectedCacheDir, ".codex-plugin", "plugin.json")}; ${setupHooksPathDescription}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to refresh the plugin cache`,
 		};
 	}
 
@@ -2247,27 +2654,47 @@ async function checkPluginScopedNativeHooks(
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks are enabled, but the Codex plugin cache manifest points hooks to ${String(state.hooksPointer)} instead of ./hooks/hooks.json at ${expectedHooksPath}; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks are enabled, but the Codex plugin cache manifest points hooks to ${String(state.hooksPointer)} instead of ./hooks/hooks.json at ${expectedHooksPath}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to refresh the plugin cache`,
 		};
 	}
 
 	for (const expectedPath of [expectedHooksPath, expectedHookLauncherPath, expectedPinnedLauncherPath]) {
 		if (!existsSync(expectedPath)) {
+			if (expectedPath === expectedPinnedLauncherPath) {
+				const launcherIncompat = await getPinnedLauncherIncompatibilityReason(expectedCacheDir, packagedMarketplace);
+				if (launcherIncompat) {
+					return {
+						name: "Native hooks",
+						status: "warn",
+						message:
+							`plugin-scoped hooks are enabled, but cached launcher in ${expectedCacheDir} is incompatible (${launcherIncompat.reason}); ${setupHooksPathDescription}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\``,
+					};
+				}
+			}
 			return {
 				name: "Native hooks",
 				status: "warn",
 				message:
-					`plugin-scoped hooks are enabled, but expected plugin hook file is missing at ${expectedPath}; ${setupHooksPathDescription}; run "omx setup --plugin" to refresh the plugin cache`,
+					`plugin-scoped hooks are enabled, but expected plugin hook file is missing at ${expectedPath}; ${setupHooksPathDescription}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to refresh the plugin cache`,
 			};
 		}
 	}
 
 	if (!(await pluginHookCacheMatchesPackaged(expectedCacheDir, packagedMarketplace))) {
+		const launcherIncompat = await getPinnedLauncherIncompatibilityReason(expectedCacheDir, packagedMarketplace);
+		if (launcherIncompat) {
+			return {
+				name: "Native hooks",
+				status: "warn",
+				message:
+					`plugin-scoped hooks are enabled, but cached launcher in ${expectedCacheDir} is incompatible (${launcherIncompat.reason}); ${setupHooksPathDescription}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\``,
+			};
+		}
 		return {
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks are enabled, but cached plugin hook files or pinned hook launcher in ${expectedCacheDir} do not match the packaged plugin; ${setupHooksPathDescription}; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks are enabled, but cached plugin hook files or pinned hook launcher in ${expectedCacheDir} do not match the packaged plugin; ${setupHooksPathDescription}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to refresh the plugin cache`,
 		};
 	}
 
@@ -2295,7 +2722,7 @@ async function checkPluginScopedNativeHooks(
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks.json at ${expectedHooksPath} is missing OMX native coverage for one or more events; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks.json at ${expectedHooksPath} is missing OMX native coverage for one or more events; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to refresh the plugin cache`,
 		};
 	}
 
@@ -2391,6 +2818,7 @@ function combineNativeHookIntegrityAndRemovalChecks(
 async function checkExistingNativeHooks(
 	hooksPath: string,
 	context: NativeHookCheckContext,
+	configPath?: string,
 ): Promise<Check> {
 	const platform = context.platform ?? process.platform;
 	try {
@@ -2439,10 +2867,48 @@ async function checkExistingNativeHooks(
 				name: "Native hooks",
 				status: removalIsCoordinateOnly ? "warn" : "fail",
 				message: removalIsCoordinateOnly
-					? `hooks.json has OMX entries that cannot be safely removed (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; manual cleanup is required because doctor will not overwrite or remove it`
+					? `hooks.json has OMX entries that cannot be safely removed (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}. Remediation: reconcile the exact hook order and [hooks.state] keys shown above, then rerun "omx setup --plugin" or "omx uninstall"; doctor will not overwrite or remove the files`
 					: `hooks.json has ambiguous or untrusted OMX ownership (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; inspect the file manually because doctor will not overwrite or remove it`,
 			};
 			return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, removalCheck);
+		}
+		if (removalPlan.coordinateMoves.length > 0) {
+			let configContent = "";
+			if (configPath && existsSync(configPath)) {
+				try {
+					const decoded = decodeStrictUtf8(await readFile(configPath));
+					if (decoded === null) throw new Error("config.toml is not valid UTF-8");
+					configContent = decoded;
+				} catch (error) {
+					const detail = error instanceof Error ? error.message : String(error);
+					return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, {
+						name: "Native hooks",
+						status: "warn",
+						message: `hooks.json removal shifts foreign hook coordinates, but doctor could not verify [hooks.state] in ${configPath}: ${detail}. Remediation: inspect config.toml and reconcile the exact keys before running "omx setup --plugin" or "omx uninstall"`,
+					});
+				}
+			}
+			try {
+				migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+					configContent,
+					removalPlan.coordinateMoves,
+					{
+						priorManagedHookTrustState: removalPlan.priorTrustState,
+						managedTrustState: removalPlan.finalTrustState,
+					},
+				);
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				const errorCode = typeof error === "object" && error !== null &&
+					"code" in error && typeof error.code === "string"
+					? ` (${error.code})`
+					: "";
+				return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, {
+					name: "Native hooks",
+					status: "warn",
+					message: `Foreign hook trust migration is unsafe${errorCode}: ${detail} Remediation: restore the current hook definition and matching trusted_hash or manually reconcile the listed [hooks.state] keys, then rerun "omx setup --plugin" or "omx uninstall"`,
+				});
+			}
 		}
 		if (windowsShimCheck) return windowsShimCheck;
 		const legacyTrustStateEntries = Object.keys(removalPlan.legacyTrustState).length;
@@ -2505,9 +2971,9 @@ export async function checkNativeHooks(
 	if (existsSync(configPath) && context.installMode === "plugin") {
 		try {
 			const configContent = await readFile(configPath, "utf-8");
-			if (configEnablesPluginScopedHooks(configContent)) {
+			if (configEnablesPluginScopedHooks(configContent, context.codexFeaturesListOutput)) {
 				const globalCheck = existsSync(hooksPath)
-					? await checkExistingNativeHooks(hooksPath, context)
+					? await checkExistingNativeHooks(hooksPath, context, configPath)
 					: null;
 				return combinePluginAndGlobalNativeHookChecks(
 					await checkPluginScopedNativeHooks(context.codexHomeDir, hooksPath),
@@ -2529,7 +2995,7 @@ export async function checkNativeHooks(
 						name: "Native hooks",
 						status: "warn",
 						message:
-							`plugin mode is using legacy native hook fallback, but expected setup-owned hooks.json is missing at ${hooksPath}; run "omx setup --plugin" to restore the fallback hook file, or upgrade Codex to plugin_hooks support so setup can use plugin-scoped hooks`,
+							`plugin mode is using legacy native hook fallback, but expected setup-owned hooks.json is missing at ${hooksPath}; run "omx setup --plugin" to restore the fallback hook file, or rerun setup on a Codex build with plugin-scoped hooks support`,
 					};
 				}
 
@@ -2554,7 +3020,7 @@ export async function checkNativeHooks(
 		};
 	}
 
-	return checkExistingNativeHooks(hooksPath, context);
+	return checkExistingNativeHooks(hooksPath, context, configPath);
 }
 
 export async function checkNativeHookDistSmoke(
@@ -3214,6 +3680,36 @@ async function checkPluginMarketplaceRegistration(
 				message: `packaged ${OMX_LOCAL_MARKETPLACE_NAME} plugin has no skills mirror; reinstall oh-my-codex`,
 			};
 		}
+		const expectedCacheDir = join(
+			codexHomeDir,
+			"plugins",
+			"cache",
+			OMX_LOCAL_MARKETPLACE_NAME,
+			"oh-my-codex",
+			packagedManifestVersion,
+		);
+		const untrustedCacheEntryKind = await getUntrustedOmxPluginCacheEntryKind(expectedCacheDir);
+		if (untrustedCacheEntryKind) {
+			return {
+				name: "Skills",
+				status: "warn",
+				message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} has ${untrustedOmxPluginCacheRecoveryMessage(expectedCacheDir, untrustedCacheEntryKind)} so /skills can discover OMX plugin skills`,
+			};
+		}
+		if (existsSync(expectedCacheDir)) {
+			const provenanceReason = await omxPluginCacheProvenanceReason(
+				expectedCacheDir,
+				packagedMarketplace,
+				packagedManifestVersion,
+			);
+			if (provenanceReason && !provenanceReason.startsWith("plugin manifest version is not ")) {
+				return {
+					name: "Skills",
+					status: "warn",
+					message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} cache provenance is invalid: ${provenanceReason}; run ${PLUGIN_LAUNCHER_RECOVERY_HINT} so /skills can discover OMX plugin skills`,
+				};
+			}
+		}
 		const cacheStates = (
 			await Promise.all(cacheDirs.map((dir) => readOmxPluginCacheState(dir)))
 		).filter((state) => state !== null);
@@ -3244,7 +3740,7 @@ async function checkPluginMarketplaceRegistration(
 			return {
 				name: "Skills",
 				status: "warn",
-				message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} is registered, but ${detail}; run "omx setup --plugin --force" so /skills can discover OMX plugin skills`,
+				message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} is registered, but ${detail}; run ${PLUGIN_LAUNCHER_RECOVERY_HINT} so /skills can discover OMX plugin skills`,
 			};
 		}
 
@@ -3318,15 +3814,36 @@ async function checkPluginVersionDiagnostics(
 		"oh-my-codex",
 		manifestVersion,
 	);
+	const untrustedCacheEntryKind = await getUntrustedOmxPluginCacheEntryKind(cacheDir);
+	if (untrustedCacheEntryKind) {
+		return {
+			name: "Plugin versions",
+			status: "warn",
+			message: untrustedOmxPluginCacheRecoveryMessage(cacheDir, untrustedCacheEntryKind),
+		};
+	}
+	if (existsSync(cacheDir)) {
+		const provenanceReason = await omxPluginCacheProvenanceReason(
+			cacheDir,
+			packagedMarketplace,
+			manifestVersion,
+		);
+		if (provenanceReason && !provenanceReason.startsWith("plugin manifest version is not ")) {
+			return {
+				name: "Plugin versions",
+				status: "warn",
+				message: `expected cache directory ${cacheDir} has invalid plugin cache provenance: ${provenanceReason}; run ${PLUGIN_LAUNCHER_RECOVERY_HINT} to refresh the plugin cache`,
+			};
+		}
+	}
 	const cacheState = await readOmxPluginCacheState(cacheDir);
 	if (cacheState?.manifestVersion !== manifestVersion) {
 		return {
 			name: "Plugin versions",
 			status: "warn",
-			message: `expected cache directory ${cacheDir} is not materialized with packaged plugin manifest version ${manifestVersion}; run "omx setup --plugin --force" to refresh the plugin cache`,
+			message: `expected cache directory ${cacheDir} is not materialized with packaged plugin manifest version ${manifestVersion}; run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to refresh the plugin cache`,
 		};
 	}
-
 	if (stamp?.install_channel === "dev") {
 		const devDisplay = stamp.dev_base_version && stamp.install_revision
 			? `v${stamp.dev_base_version}-dev-${stamp.install_revision}`
@@ -3352,11 +3869,7 @@ async function checkPluginVersionDiagnostics(
 }
 
 const REQUIRED_NATIVE_REVIEWER_ROLES = ["architect", "critic"] as const;
-const ADVISORY_NATIVE_REVIEWER_ROLES = ["scholastic"] as const;
-
-type NativeReviewerRole =
-	| typeof REQUIRED_NATIVE_REVIEWER_ROLES[number]
-	| typeof ADVISORY_NATIVE_REVIEWER_ROLES[number];
+type NativeReviewerRole = typeof REQUIRED_NATIVE_REVIEWER_ROLES[number];
 
 function getParsedAgentTables(
 	configPath: string,
@@ -3422,31 +3935,14 @@ function checkNativeReviewerRoles(
 	const missingRequired = REQUIRED_NATIVE_REVIEWER_ROLES.filter(
 		(role) => !nativeReviewerRoleAvailable(paths, role),
 	);
-	const missingAdvisory = ADVISORY_NATIVE_REVIEWER_ROLES.filter(
-		(role) => !nativeReviewerRoleAvailable(paths, role),
-	);
-
 	if (missingRequired.length > 0) {
-		const advisorySuffix = missingAdvisory.length > 0
-			? `; advisory role missing: ${missingAdvisory.join(", ")}`
-			: "";
 		return {
 			name: "Native reviewer roles",
 			status: "fail",
 			message:
 				`plugin mode supplies skills/hooks, but required RALPLAN/Autopilot native reviewer role(s) are unavailable: ${missingRequired.join(", ")}. ` +
 				`Install ${formatNativeRoleFileList(missingRequired)} under ${paths.agentsDir} or define equivalent [agents.<role>] entries in ${paths.configPath}; ` +
-				`otherwise role-specific subagent calls may degrade to prompt-only/default subagents${advisorySuffix}`,
-		};
-	}
-
-	if (missingAdvisory.length > 0) {
-		return {
-			name: "Native reviewer roles",
-			status: "warn",
-			message:
-				`required RALPLAN/Autopilot native reviewer roles are available (${REQUIRED_NATIVE_REVIEWER_ROLES.join(", ")}); ` +
-				`advisory ontology reviewer role(s) missing: ${missingAdvisory.join(", ")} (optional unless explicitly used)`,
+				`otherwise role-specific subagent calls may degrade to prompt-only/default subagents`,
 		};
 	}
 
@@ -3454,7 +3950,7 @@ function checkNativeReviewerRoles(
 		name: "Native reviewer roles",
 		status: "pass",
 		message:
-			`required RALPLAN/Autopilot native reviewer roles are available (${REQUIRED_NATIVE_REVIEWER_ROLES.join(", ")}); advisory ${ADVISORY_NATIVE_REVIEWER_ROLES.join(", ")} role is also available`,
+			`required RALPLAN/Autopilot native reviewer roles are available (${REQUIRED_NATIVE_REVIEWER_ROLES.join(", ")})`,
 	};
 }
 
@@ -3536,7 +4032,7 @@ export function checkSparkRouting(paths: DoctorPaths): Check {
 	const name = "Spark routing";
 	const codexHomeOverride = paths.codexHomeDir;
 	const sparkModel = getSparkDefaultModel(codexHomeOverride);
-	const frontierModel = getMainDefaultModel(codexHomeOverride);
+	const frontierModel = getFrontierDefaultModel(codexHomeOverride);
 	const standardModel = getStandardDefaultModel(codexHomeOverride);
 	const sparkSource = resolveSparkModelSource(codexHomeOverride);
 	const rootProvider = getCodexConfigRootModelProvider(codexHomeOverride);
@@ -3573,13 +4069,22 @@ export function checkSparkRouting(paths: DoctorPaths): Check {
 			);
 			continue;
 		}
+		const explicitOverride = explicitSparkAgentOverrides.get(agentName);
 		if (!info.model) {
+			// No model field in TOML: check if it's intentional runtime inheritance or stale
+			if (!explicitOverride) {
+				// No override configured -> agent will inherit from config.toml at runtime (intended behavior since 0.21.18)
+				wired.push(
+					`${agentName} -> \`${sparkModel}\` (runtime inheritance)${info.modelProvider ? ` (provider: ${info.modelProvider})` : ""}`,
+				);
+				continue;
+			}
+			// Explicit override configured but TOML has no model field -> stale
 			problems.push(
-				`${agentName}.toml has no model field (stale install; run \`omx setup --force\`)`,
+				`${agentName}.toml has no model field but agentModels.${agentName} explicitly resolves to \`${explicitOverride}\` (stale install; run \`omx setup --force\`)`,
 			);
 			continue;
 		}
-		const explicitOverride = explicitSparkAgentOverrides.get(agentName);
 		if (explicitOverride) {
 			if (info.model !== explicitOverride) {
 				problems.push(

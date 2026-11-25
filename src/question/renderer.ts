@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
-import { existsSync, readdirSync, renameSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { stdin as processStdin, stdout as processStdout } from 'node:process';
 import { parsePaneIdFromTmuxOutput, shellEscapeSingle } from '../hud/tmux.js';
@@ -12,6 +12,7 @@ import { TRACKED_WORKFLOW_MODES } from '../state/workflow-transition.js';
 import { isRunningUnderCmux, resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 import { createInitialInteractiveSelectionState, createInitialQuestionWizardState, renderInteractiveQuestionFrame, renderQuestionWizardFrame } from './ui.js';
+import { markQuestionSuperseded } from './state.js';
 import type { NormalizedQuestionItem, QuestionAnswer, QuestionRecord, QuestionRendererState } from './types.js';
 
 export type QuestionRendererStrategy = 'inside-tmux' | 'detached-tmux' | 'inline-tty' | 'windows-console' | 'windows-psmux-shell-pane' | 'test-noop' | 'unsupported';
@@ -32,6 +33,20 @@ export type ExecTmuxSync = (args: string[]) => string;
 export type SleepSync = (ms: number) => void;
 export type SpawnDetachedRenderer = (command: string, args: string[], options: SpawnOptions) => Pick<ChildProcess, 'pid' | 'unref'>;
 
+export type QuestionRendererLaunchErrorCode =
+  | 'question_tmux_access_denied'
+  | 'question_tmux_probe_failed';
+
+export class QuestionRendererLaunchError extends Error {
+  readonly code: QuestionRendererLaunchErrorCode;
+
+  constructor(code: QuestionRendererLaunchErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'QuestionRendererLaunchError';
+    this.code = code;
+  }
+}
+
 const QUESTION_TEXT_SETTLE_MS = 120;
 const QUESTION_SUBMIT_REPEAT_DELAY_MS = 100;
 const QUESTION_RENDERER_PANE_SETTLE_MS = 120;
@@ -39,6 +54,23 @@ const QUESTION_RENDERER_SESSION_SETTLE_MS = 120;
 
 function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
+}
+
+function describeTmuxProbeError(error: unknown): string {
+  if (!(error && typeof error === 'object')) return safeString(error) || 'unknown error';
+  const candidate = error as NodeJS.ErrnoException & { stderr?: unknown };
+  const code = safeString(candidate.code).trim();
+  const message = error instanceof Error ? error.message.trim() : '';
+  const stderr = Buffer.isBuffer(candidate.stderr)
+    ? candidate.stderr.toString('utf8').trim()
+    : safeString(candidate.stderr).trim();
+  return [...new Set([code, message, stderr].filter(Boolean))].join(': ') || 'unknown error';
+}
+
+function isTmuxAccessDeniedError(error: unknown): boolean {
+  return /\b(?:EPERM|EACCES)\b|operation not permitted|permission denied/i.test(
+    describeTmuxProbeError(error),
+  );
 }
 
 function isPaneId(value: string | null | undefined): value is string {
@@ -583,8 +615,20 @@ function isCurrentTmuxSessionAttached(
   try {
     const attached = execTmux(['display-message', '-p', ...targetArgs, '#{session_attached}']).trim();
     return Number.parseInt(attached, 10) > 0;
-  } catch {
-    return false;
+  } catch (error) {
+    const detail = describeTmuxProbeError(error);
+    if (isTmuxAccessDeniedError(error)) {
+      throw new QuestionRendererLaunchError(
+        'question_tmux_access_denied',
+        `omx question cannot determine whether the tmux session is attached because tmux access was denied during the attachment probe. The current sandbox or OS policy may not allow access to the tmux socket. ${detail}`,
+        { cause: error },
+      );
+    }
+    throw new QuestionRendererLaunchError(
+      'question_tmux_probe_failed',
+      `omx question cannot determine whether the tmux session is attached because the tmux attachment probe failed. ${detail}`,
+      { cause: error },
+    );
   }
 }
 
@@ -751,12 +795,6 @@ function isQuestionRecord(value: unknown): value is QuestionRecord {
   );
 }
 
-function writeQuestionRecordSync(recordPath: string, record: QuestionRecord): void {
-  const tempPath = `${recordPath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tempPath, `${JSON.stringify(record, null, 2)}\n`, 'utf-8');
-  renameSync(tempPath, recordPath);
-}
-
 export function findLiveQuestionsForSession(
   cwd: string,
   sessionId: string | undefined,
@@ -780,31 +818,26 @@ export function findLiveQuestionsForSession(
   return live.sort((left, right) => left.record.created_at.localeCompare(right.record.created_at));
 }
 
-export function supersedeLiveQuestionsForSession(
+export async function supersedeLiveQuestionsForSession(
   cwd: string,
   sessionId: string | undefined,
   execTmux: ExecTmuxSync = defaultExecTmux,
   options: { excludeRecordPath?: string; nowIso?: string } = {},
-): LiveQuestionRecord[] {
+): Promise<LiveQuestionRecord[]> {
   const live = findLiveQuestionsForSession(cwd, sessionId, execTmux, options);
   const nowIso = options.nowIso ?? new Date().toISOString();
+  const superseded: LiveQuestionRecord[] = [];
   for (const item of live) {
-    writeQuestionRecordSync(item.recordPath, {
-      ...item.record,
-      status: 'superseded',
-      updated_at: nowIso,
-      error: {
-        code: 'question_superseded',
-        message: 'Question was superseded by a newer omx question launch for the same session.',
-        at: nowIso,
-      },
+    const record = await markQuestionSuperseded(item.recordPath, {
+      nowIso,
+      closeQuestionRenderer: (renderer) => closeQuestionRenderer(renderer, execTmux),
     });
-    closeQuestionRenderer(item.record.renderer, execTmux);
+    if (record) superseded.push({ recordPath: item.recordPath, record });
   }
-  return live;
+  return superseded;
 }
 
-export function launchQuestionRenderer(
+export async function launchQuestionRenderer(
   options: LaunchQuestionRendererOptions,
   deps: {
     strategy?: QuestionRendererStrategy;
@@ -812,7 +845,7 @@ export function launchQuestionRenderer(
     sleepSync?: SleepSync;
     spawnDetachedRenderer?: SpawnDetachedRenderer;
   } = {},
-): QuestionRendererState {
+): Promise<QuestionRendererState> {
   const strategy = deps.strategy ?? resolveQuestionRendererStrategy(options.env ?? process.env, undefined, {
     cwd: options.cwd,
     sessionId: options.sessionId,
@@ -846,7 +879,7 @@ export function launchQuestionRenderer(
   });
 
   if (strategy === 'windows-psmux-shell-pane') {
-    supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
+    await supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
       excludeRecordPath: options.recordPath,
       nowIso: launchedAt,
     });
@@ -870,7 +903,7 @@ export function launchQuestionRenderer(
       );
     }
 
-    supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
+    await supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
       excludeRecordPath: options.recordPath,
       nowIso: launchedAt,
     });
@@ -980,7 +1013,7 @@ export function launchQuestionRenderer(
   }
 
   if (strategy === 'detached-tmux') {
-    supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
+    await supersedeLiveQuestionsForSession(options.cwd, options.sessionId, execTmux, {
       excludeRecordPath: options.recordPath,
       nowIso: launchedAt,
     });

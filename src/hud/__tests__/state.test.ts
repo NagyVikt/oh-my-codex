@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 import { renderHud } from '../render.js';
@@ -12,6 +12,8 @@ import {
   buildGitBranchLabel,
   readGitBranch,
   readAllState,
+  readHudLayoutProjection,
+  readTeamState,
   readHudNotifyState,
   readRalphState,
   readRalplanState,
@@ -19,6 +21,9 @@ import {
   readDeepInterviewState,
   readAutoresearchState,
   readUltraqaState,
+  readGuardexFinishState,
+  readHudConfig,
+  normalizeHudConfig,
 } from '../state.js';
 
 function gitRunnerFromMap(map: Record<string, string | Error>) {
@@ -61,6 +66,112 @@ async function writeModeState(cwd: string, mode: string, state: unknown): Promis
   await mkdir(stateDir, { recursive: true });
   await writeFile(join(stateDir, mode + '-state.json'), JSON.stringify(state));
 }
+
+async function writeGuardexFinishEvents(cwd: string, runId: string, events: unknown[]): Promise<void> {
+  const runDir = join(cwd, '.omx', 'state', 'finish-runs');
+  await mkdir(runDir, { recursive: true });
+  await writeFile(join(runDir, `${runId}.jsonl`), `${events.map(event => JSON.stringify(event)).join('\n')}\n`);
+}
+
+describe('readGuardexFinishState', () => {
+  it('reads the latest non-pending phase from a live finish process', async () => {
+    await withTempRepo('omx-hud-guardex-finish-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      const timestamp = new Date().toISOString();
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp, stage: 'cleanup', state: 'pending', index: 8, total: 8, label: 'Cleanup' },
+        { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+      ]);
+
+      assert.deepEqual(await readGuardexFinishState(cwd), {
+        active: true,
+        stage: 'review',
+        state: 'running',
+        index: 4,
+        total: 8,
+        label: 'AI review',
+        updatedAt: timestamp,
+      });
+      assert.equal((await readAllState(cwd)).guardexFinish, null);
+      const enabledConfig = normalizeHudConfig({ guardex: { enabled: true } });
+      assert.equal((await readAllState(cwd, enabledConfig)).guardexFinish?.stage, 'review');
+    });
+  });
+
+  it('hides a finish run after its terminal cleanup event', async () => {
+    await withTempRepo('omx-hud-guardex-finished-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'cleanup', state: 'finished', index: 8, total: 8, label: 'Cleanup' },
+      ]);
+
+      assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+
+  it('ignores malformed trailing JSON and keeps the last valid live phase', async () => {
+    await withTempRepo('omx-hud-guardex-partial-', async (cwd) => {
+      const runId = `finish-test-${process.pid}-12345678`;
+      const runDir = join(cwd, '.omx', 'state', 'finish-runs');
+      await mkdir(runDir, { recursive: true });
+      await writeFile(join(runDir, `${runId}.jsonl`), [
+        JSON.stringify({ schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'ci', state: 'running', index: 6, total: 8, label: 'CI checks' }),
+        '{"schemaVersion":1,"stage":',
+      ].join('\n'));
+
+      assert.equal((await readGuardexFinishState(cwd))?.stage, 'ci');
+    });
+  });
+
+  it('hides an abandoned run whose finish process is no longer alive', async () => {
+    await withTempRepo('omx-hud-guardex-abandoned-', async (cwd) => {
+      const runId = 'finish-test-2147483647-12345678';
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp: new Date().toISOString(), stage: 'merge', state: 'running', index: 7, total: 8, label: 'Merge' },
+      ]);
+
+      assert.equal(await readGuardexFinishState(cwd), null);
+    });
+  });
+
+  it('bounds metadata reads when historical finish streams accumulate', async () => {
+    await withTempRepo('omx-hud-guardex-bounded-', async (cwd) => {
+      const timestamp = new Date().toISOString();
+      for (let index = 0; index < 40; index += 1) {
+        const startedAt = (Date.now() - index).toString(36);
+        const runId = `finish-${startedAt}-${process.pid}-${String(index).padStart(8, '0')}`;
+        await writeGuardexFinishEvents(cwd, runId, [
+          { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+        ]);
+      }
+
+      let metadataReads = 0;
+      const state = await readGuardexFinishState(cwd, {
+        statFile: async path => {
+          metadataReads += 1;
+          return stat(path);
+        },
+      });
+
+      assert.equal(state?.stage, 'review');
+      assert.equal(metadataReads, 32);
+    });
+  });
+});
+
+describe('readHudConfig', () => {
+  it('loads the project-local config when invoked from a nested directory', async () => {
+    await withTempRepo('omx-hud-config-nested-', async (cwd) => {
+      initGitRepo(cwd);
+      const nested = join(cwd, 'packages', 'app');
+      await mkdir(join(cwd, '.omx'), { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(cwd, '.omx', 'hud-config.json'), JSON.stringify({ guardex: { enabled: true } }));
+
+      assert.equal((await readHudConfig(nested)).guardex?.enabled, true);
+    });
+  });
+});
 
 function initGitRepo(cwd: string): void {
   execFileSync('git', ['init'], { cwd, stdio: 'ignore' });
@@ -238,6 +349,241 @@ describe('buildGitBranchLabel', () => {
       await withWindowsPlatform(() => {
         assert.equal(buildGitBranchLabel(cwd), `${basename(cwd)}/worktree-branch`);
       });
+    });
+  });
+});
+
+
+type CountingGitState = { branch: string | null; remoteUrl: string };
+
+function countingGitRunner(state: CountingGitState) {
+  const calls: string[] = [];
+  const runner = (_cwd: string, args: string[]) => {
+    const command = args.join(' ');
+    calls.push(command);
+    if (command === 'rev-parse --abbrev-ref HEAD') return state.branch;
+    if (command === 'remote get-url origin') return state.remoteUrl;
+    throw new Error('Unexpected command: git ' + command);
+  };
+  return { runner, calls };
+}
+
+function remoteConfig(url: string): string {
+  return ['[remote "origin"]', `  url = ${url}`, ''].join('\n');
+}
+
+async function createPlainGitDirFixture(cwd: string, branch: string, url: string): Promise<void> {
+  const gitDir = join(cwd, '.git');
+  await mkdir(gitDir, { recursive: true });
+  await writeFile(join(gitDir, 'HEAD'), `ref: refs/heads/${branch}\n`);
+  await writeFile(join(gitDir, 'config'), remoteConfig(url));
+}
+
+// git replaces HEAD and config by renaming a freshly written <file>.lock over them.
+async function rewriteLikeGit(path: string, content: string): Promise<void> {
+  await writeFile(`${path}.lock`, content);
+  await rename(`${path}.lock`, path);
+}
+
+describe('buildGitBranchLabel caching', () => {
+  it('reuses the label while HEAD and config are unchanged', async () => {
+    await withTempRepo('omx-hud-label-cache-hit-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const { runner, calls } = countingGitRunner({ branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' });
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(calls.length, 2);
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(calls.length, 2);
+    });
+  });
+
+  it('recomputes an unchanged label once the cache entry is 30 seconds old', async (t) => {
+    await withTempRepo('omx-hud-label-cache-ttl-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const state = { branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' };
+      const { runner, calls } = countingGitRunner(state);
+      let now = 1_700_000_000_000;
+      t.mock.method(Date, 'now', () => now);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      // A change the fingerprint cannot see, such as an insteadOf rule in the global config.
+      state.remoteUrl = 'https://github.com/acme/rewritten-repo.git';
+      now += 29_999;
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(calls.length, 2);
+      now += 1;
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'rewritten-repo/main');
+      assert.equal(calls.length, 4);
+    });
+  });
+
+  it('recomputes after a backward clock adjustment', async (t) => {
+    await withTempRepo('omx-hud-label-cache-clock-back-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const state = { branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' };
+      const { runner, calls } = countingGitRunner(state);
+      let now = 1_700_000_000_000;
+      t.mock.method(Date, 'now', () => now);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(calls.length, 2);
+      // Simulate a backward clock adjustment (e.g., NTP correction)
+      now -= 5_000;
+      // A change the fingerprint cannot see. The cache should be invalidated
+      // even though the age is negative, preventing stale labels during time adjustments.
+      state.remoteUrl = 'https://github.com/acme/rewritten-repo.git';
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'rewritten-repo/main');
+      assert.equal(calls.length, 4);
+    });
+  });
+
+  it('recomputes after HEAD is replaced, even with the same size and mtime', async () => {
+    await withTempRepo('omx-hud-label-cache-head-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const headPath = join(cwd, '.git', 'HEAD');
+      const fixedSeconds = 1_700_000_000;
+      await utimes(headPath, fixedSeconds, fixedSeconds);
+      const state = { branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' };
+      const { runner, calls } = countingGitRunner(state);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      const before = await stat(headPath);
+
+      state.branch = 'next';
+      await writeFile(`${headPath}.lock`, 'ref: refs/heads/next\n');
+      await utimes(`${headPath}.lock`, fixedSeconds, fixedSeconds);
+      await rename(`${headPath}.lock`, headPath);
+      const after = await stat(headPath);
+      assert.equal(after.size, before.size);
+      assert.equal(after.mtimeMs, before.mtimeMs);
+      assert.notEqual(after.ino, before.ino);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/next');
+      assert.equal(calls.length, 4);
+    });
+  });
+
+  it('recomputes after the remote url in config changes', async () => {
+    await withTempRepo('omx-hud-label-cache-remote-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const state = { branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' };
+      const { runner, calls } = countingGitRunner(state);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+
+      state.remoteUrl = 'https://github.com/acme/renamed-repository.git';
+      await rewriteLikeGit(join(cwd, '.git', 'config'), remoteConfig(state.remoteUrl));
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'renamed-repository/main');
+      assert.equal(calls.length, 4);
+    });
+  });
+
+  it('recomputes after the common-dir config of a worktree changes', async () => {
+    await withTempRepo('omx-hud-label-cache-worktree-', async (cwd) => {
+      await createWorktreePointerFixture(cwd);
+      const state = { branch: 'worktree-branch', remoteUrl: 'git@github.com:acme/worktree-repo.git' };
+      const { runner, calls } = countingGitRunner(state);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'worktree-repo/worktree-branch');
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'worktree-repo/worktree-branch');
+      assert.equal(calls.length, 2);
+
+      state.remoteUrl = 'git@github.com:acme/moved-repository.git';
+      await rewriteLikeGit(join(cwd, '.git-admin', 'config'), remoteConfig(state.remoteUrl));
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'moved-repository/worktree-branch');
+      assert.equal(calls.length, 4);
+    });
+  });
+
+  it('keeps one cached label per git display config', async () => {
+    await withTempRepo('omx-hud-label-cache-config-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const { runner, calls } = countingGitRunner({ branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' });
+      const branchOnly = { preset: 'focused', git: { display: 'branch' }, statusLine: { preset: 'focused' } } as const;
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(buildGitBranchLabel(cwd, branchOnly, runner), 'main');
+      assert.equal(calls.length, 3);
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(buildGitBranchLabel(cwd, branchOnly, runner), 'main');
+      assert.equal(calls.length, 3);
+    });
+  });
+
+  it('does not cache when there is no git layout', async () => {
+    await withTempRepo('omx-hud-label-cache-nogit-', async (cwd) => {
+      const { runner, calls } = countingGitRunner({ branch: 'main', remoteUrl: 'https://github.com/acme/first-repo.git' });
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+      assert.equal(calls.length, 4);
+    });
+  });
+
+  it('does not cache a null label', async () => {
+    await withTempRepo('omx-hud-label-cache-null-', async (cwd) => {
+      await createPlainGitDirFixture(cwd, 'main', 'https://github.com/acme/first-repo.git');
+      const state: CountingGitState = { branch: null, remoteUrl: 'https://github.com/acme/first-repo.git' };
+      const { runner, calls } = countingGitRunner(state);
+
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), null);
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), null);
+      assert.equal(calls.length, 2);
+
+      // The first commit creates refs/heads/main without touching HEAD or config.
+      state.branch = 'main';
+      assert.equal(buildGitBranchLabel(cwd, undefined, runner), 'first-repo/main');
+    });
+  });
+
+  it('shows a branch switch and a remote change from real git on the next call', { skip: process.platform === 'win32' }, async () => {
+    await withTempRepo('omx-hud-label-cache-realgit-', async (cwd) => {
+      initGitRepo(cwd);
+
+      assert.equal(buildGitBranchLabel(cwd), 'origin-repo/safe-branch');
+      execFileSync('git', ['checkout', '-b', 'other-branch'], { cwd, stdio: 'ignore' });
+      assert.equal(buildGitBranchLabel(cwd), 'origin-repo/other-branch');
+      execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/acme/renamed-repo.git'], { cwd, stdio: 'ignore' });
+      assert.equal(buildGitBranchLabel(cwd), 'renamed-repo/other-branch');
+      execFileSync('git', ['checkout', '--detach'], { cwd, stdio: 'ignore' });
+      assert.equal(buildGitBranchLabel(cwd), 'renamed-repo/HEAD');
+    });
+  });
+
+  it('shows a branch switch in a reftable repository and its linked worktree', { skip: process.platform === 'win32' }, async (t) => {
+    await withTempRepo('omx-hud-label-cache-reftable-', async (cwd) => {
+      try {
+        execFileSync('git', ['init', '--ref-format=reftable'], { cwd, stdio: 'ignore' });
+      } catch {
+        t.skip('git does not support --ref-format=reftable');
+        return;
+      }
+      const git = (dir: string, ...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+      git(cwd, 'config', 'user.email', 'test@example.com');
+      git(cwd, 'config', 'user.name', 'Test User');
+      git(cwd, 'remote', 'add', 'origin', 'https://github.com/acme/reftable-repo.git');
+      git(cwd, 'checkout', '-b', 'first-branch');
+      git(cwd, 'commit', '--allow-empty', '-m', 'init');
+
+      const headPath = join(cwd, '.git', 'HEAD');
+      const headBefore = await stat(headPath);
+      assert.equal(buildGitBranchLabel(cwd), 'reftable-repo/first-branch');
+      git(cwd, 'checkout', '-b', 'second-branch');
+      const headAfter = await stat(headPath);
+      assert.equal(headAfter.ino, headBefore.ino);
+      assert.equal(headAfter.mtimeMs, headBefore.mtimeMs);
+      assert.equal(buildGitBranchLabel(cwd), 'reftable-repo/second-branch');
+
+      const worktree = join(cwd, 'linked');
+      git(cwd, 'worktree', 'add', '-b', 'linked-branch', worktree);
+      assert.equal(buildGitBranchLabel(worktree), 'reftable-repo/linked-branch');
+      git(worktree, 'checkout', '-b', 'linked-next');
+      assert.equal(buildGitBranchLabel(worktree), 'reftable-repo/linked-next');
+      assert.equal(buildGitBranchLabel(cwd), 'reftable-repo/second-branch');
     });
   });
 });
@@ -795,6 +1141,96 @@ describe('readAllState canonical skill precedence', () => {
     });
   });
 
+  it('reads and refreshes only the active session team roster without migrating team state', async () => {
+    await withTempRepo('omx-hud-team-roster-', async (cwd) => {
+      const root = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-roster';
+      const sessionDir = join(root, 'sessions', sessionId);
+      const teamDir = join(root, 'team', 'alpha');
+      const workerDir = join(teamDir, 'workers', 'worker-1');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(workerDir, { recursive: true });
+      await writeFile(join(root, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: root }));
+      const activation = { active: true, skill: 'team', phase: 'team-exec', session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true, session_id: sessionId }] };
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify(activation));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({ active: true, team_name: 'alpha' }));
+      await writeFile(join(root, 'team-state.json'), JSON.stringify({ active: true, team_name: 'other-session' }));
+      await writeFile(join(teamDir, 'config.json'), JSON.stringify({ name: 'alpha', workers: [
+        { name: 'worker-1', role: 'executor', pane_id: '%10' },
+        { name: 'worker-2', role: 'verifier' },
+        { name: '../../outside' },
+        null,
+      ] }));
+      const updatedAt = new Date().toISOString();
+      await writeFile(join(workerDir, 'status.json'), JSON.stringify({ state: 'working', current_task_id: '7', updated_at: updatedAt }));
+
+      const state = await readAllState(cwd);
+      assert.equal(state.team?.team_name, 'alpha');
+      assert.equal(state.team?.workers?.length, 2);
+      assert.deepEqual(state.team?.workers?.[0], { name: 'worker-1', role: 'executor', paneId: '%10', state: 'working', taskId: '7', updatedAt });
+      assert.equal(state.team?.workers?.[1].state, 'unknown');
+      assert.equal(existsSync(join(teamDir, 'manifest.v2.json')), false, 'HUD reads must not migrate team config');
+
+      await writeFile(join(workerDir, 'status.json'), JSON.stringify({ state: 'done', updated_at: updatedAt }));
+      assert.equal((await readAllState(cwd)).team?.workers?.[0].state, 'done');
+      await writeFile(join(workerDir, 'status.json'), 'malformed');
+      assert.equal((await readAllState(cwd)).team?.workers?.[0].state, 'unknown');
+      await writeFile(join(teamDir, 'manifest.v2.json'), JSON.stringify({ name: 'alpha', workers: [{ name: 'worker-3' }] }));
+      assert.deepEqual((await readAllState(cwd)).team?.workers?.map(worker => worker.name), ['worker-3'], 'canonical manifest membership wins over legacy config');
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({ ...activation, active: false, active_skills: [] }));
+      assert.equal((await readAllState(cwd)).team, null);
+    });
+  });
+
+  it('reads descendant HUD membership and statuses from the selected ancestor or explicit root', async () => {
+    await withTempRepo('omx-hud-descendant-roster-', async cwd => {
+      const descendant = join(cwd, 'packages', 'app');
+      const root = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-ancestor-roster';
+      const sessionDir = join(root, 'sessions', sessionId);
+      const teamDir = join(root, 'team', 'alpha');
+      const workerDir = join(teamDir, 'workers', 'worker-1');
+      const shadowTeam = join(descendant, '.omx', 'state', 'team', 'alpha');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(workerDir, { recursive: true });
+      await mkdir(join(shadowTeam, 'workers', 'worker-1'), { recursive: true });
+      await writeFile(join(root, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: root }));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({ active: true, team_name: 'alpha' }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({ active: true, skill: 'team', phase: 'team-exec', session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true, session_id: sessionId }] }));
+      const config = { name: 'alpha', workers: [{ name: 'worker-1', role: 'executor', pane_id: '%10' }] };
+      await writeFile(join(teamDir, 'config.json'), JSON.stringify(config));
+      await writeFile(join(shadowTeam, 'config.json'), JSON.stringify({ name: 'alpha', workers: [{ name: 'worker-1', role: 'wrong-root' }] }));
+      await writeFile(join(shadowTeam, 'workers', 'worker-1', 'status.json'), JSON.stringify({ state: 'done', updated_at: new Date().toISOString() }));
+      const keys = ['OMX_SESSION_ID', 'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT'] as const;
+      const saved = keys.map(key => process.env[key]);
+      try {
+        for (const selector of [undefined, 'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT'] as const) {
+          for (const key of keys) delete process.env[key];
+          process.env.OMX_SESSION_ID = sessionId;
+          if (selector) process.env[selector] = selector === 'OMX_TEAM_STATE_ROOT' ? root : cwd;
+          await writeFile(join(workerDir, 'status.json'), JSON.stringify({ state: 'working', current_task_id: '7', updated_at: new Date().toISOString() }));
+          for (const team of [await readTeamState(descendant), (await readAllState(descendant)).team]) {
+            assert.equal(team?.workers?.length, 1, selector ?? 'ancestor session');
+            assert.equal(team?.workers?.[0].role, 'executor', selector ?? 'ancestor session');
+            assert.equal(team?.workers?.[0].state, 'working', selector ?? 'ancestor session');
+            assert.equal(team?.workers?.[0].taskId, '7', selector ?? 'ancestor session');
+          }
+          await writeFile(join(workerDir, 'status.json'), JSON.stringify({ state: 'blocked', updated_at: new Date().toISOString() }));
+          assert.equal((await readAllState(descendant)).team?.workers?.[0].state, 'blocked');
+          assert.equal(existsSync(join(teamDir, 'manifest.v2.json')), false);
+        }
+      } finally {
+        keys.forEach((key, index) => {
+          const previous = saved[index];
+          if (previous === undefined) delete process.env[key];
+          else process.env[key] = previous;
+        });
+      }
+    });
+  });
+
   it('prefers canonical team phase over stale team detail current_phase', async () => {
     await withTempRepo('omx-hud-canonical-team-phase-', async (cwd) => {
       const rootStateDir = join(cwd, '.omx', 'state');
@@ -1016,6 +1452,39 @@ describe('readAllState canonical skill precedence', () => {
       assert.equal(state.codeReview, null);
       assert.equal(state.ultraqa, null);
       assert.deepEqual(state.autopilot, { active: true, mode: 'autopilot', current_phase: 'ralplan' });
+    });
+  });
+
+  it('reads only the current session’s recent, incomplete native agents for the stacked roster', async () => {
+    await withTempRepo('omx-hud-native-roster-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-native-roster';
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateDir }));
+      const timestamp = new Date().toISOString();
+      const longRunning = new Date(Date.parse(timestamp) - 10 * 60_000).toISOString();
+      const entries = [
+        { threadId: 'leader', kind: 'leader' as const },
+        { threadId: 'fresh-1', agentNickname: 'Banach', role: 'explore' },
+        { threadId: 'fresh-2', agentNickname: 'Euler', mode: 'executor', scope: 'HUD ownership' },
+        { threadId: 'completed', completed: true },
+        { threadId: 'closed', status: 'closed' as const },
+        { threadId: 'stale', timestamp: '2000-01-01T00:00:00.000Z' },
+        { threadId: 'long-running', agentNickname: 'Curie', nativeStarted: true, timestamp: longRunning },
+        { threadId: 'lost-stop', agentNickname: 'Lost stop', nativeStarted: true, timestamp: '2020-01-01T00:00:00.000Z' },
+        { threadId: 'other-session', sessionId: 'sess-other', agentNickname: 'Wrong pane' },
+      ];
+      const tracking = entries.reduce((state, entry) => recordSubagentTurn(state, {
+        sessionId, timestamp, kind: 'subagent', ...entry,
+      }), createSubagentTrackingState());
+      await writeSubagentTrackingState(cwd, tracking);
+      const state = await readAllState(cwd);
+      assert.deepEqual(state.nativeAgents, [
+        { name: 'Banach', role: 'explore', firstSeenAt: timestamp },
+        { name: 'Euler', role: 'executor', scope: 'HUD ownership', firstSeenAt: timestamp },
+        { name: 'Curie', firstSeenAt: longRunning },
+      ]);
+      assert.equal((await readHudLayoutProjection(cwd)).nativeAgentCount, 3);
     });
   });
 
@@ -1698,6 +2167,126 @@ describe('readAllState canonical skill precedence', () => {
       } finally {
         if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
       }
+    });
+  });
+});
+
+describe('readHudLayoutProjection', () => {
+  it('matches render-state precedence for Ultragoal artifacts and canonical Team membership', async () => {
+    await withTempRepo('omx-hud-layout-projection-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-layout-projection';
+      const sessionDir = join(stateRoot, 'sessions', sessionId);
+      const teamDir = join(stateRoot, 'team', 'alpha');
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(teamDir, { recursive: true });
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'team',
+        phase: 'team-exec',
+        session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({ active: false }));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({ active: true, team_name: 'alpha' }));
+      await writeFile(join(ultragoalDir, 'goals.json'), JSON.stringify({
+        activeGoalId: 'G001',
+        goals: [{ id: 'G001', title: 'Keep HUD visible', objective: 'exercise artifact precedence', status: 'in_progress' }],
+      }));
+      await writeFile(join(teamDir, 'config.json'), JSON.stringify({
+        name: 'alpha',
+        workers: [{ name: 'legacy-worker' }],
+      }));
+      await writeFile(join(teamDir, 'manifest.v2.json'), JSON.stringify({
+        name: 'alpha',
+        workers: [
+          { name: 'worker-1' },
+          { name: 'worker-2' },
+          { name: 'worker-1' },
+          { name: '../../outside' },
+          null,
+        ],
+      }));
+
+      const projection = await readHudLayoutProjection(cwd);
+      const state = await readAllState(cwd);
+
+      assert.deepEqual(projection, { ultragoalActive: true, teamWorkerCount: 2 });
+      assert.equal(projection.ultragoalActive, state.ultragoal?.active === true);
+      assert.equal(projection.teamWorkerCount, state.team?.workers?.length ?? 0);
+    });
+  });
+
+  it('falls through a malformed Ultragoal artifact to active canonical session state', async () => {
+    await withTempRepo('omx-hud-layout-projection-malformed-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-layout-malformed';
+      const sessionDir = join(stateRoot, 'sessions', sessionId);
+      const ultragoalDir = join(cwd, '.omx', 'ultragoal');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(ultragoalDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'ultragoal',
+        phase: 'executing',
+        session_id: sessionId,
+        active_skills: [{ skill: 'ultragoal', phase: 'executing', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({ active: true }));
+      await writeFile(join(ultragoalDir, 'goals.json'), '{malformed');
+
+      assert.deepEqual(await readHudLayoutProjection(cwd), {
+        ultragoalActive: true,
+        teamWorkerCount: 0,
+      });
+    });
+  });
+
+  it('suppresses inactive canonical state and uses legacy Team config when the manifest is malformed', async () => {
+    await withTempRepo('omx-hud-layout-projection-inactive-', async (cwd) => {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-layout-inactive';
+      const sessionDir = join(stateRoot, 'sessions', sessionId);
+      const teamDir = join(stateRoot, 'team', 'alpha');
+      await mkdir(sessionDir, { recursive: true });
+      await mkdir(teamDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: true,
+        skill: 'team',
+        phase: 'team-exec',
+        session_id: sessionId,
+        active_skills: [{ skill: 'team', phase: 'team-exec', active: true, session_id: sessionId }],
+      }));
+      await writeFile(join(sessionDir, 'ultragoal-state.json'), JSON.stringify({ active: true }));
+      await writeFile(join(sessionDir, 'team-state.json'), JSON.stringify({ active: true, team_name: 'alpha' }));
+      await writeFile(join(teamDir, 'manifest.v2.json'), '{malformed');
+      await writeFile(join(teamDir, 'config.json'), JSON.stringify({
+        name: 'alpha',
+        workers: [{ name: 'worker-1' }, { name: 'worker-2' }],
+      }));
+
+      assert.deepEqual(await readHudLayoutProjection(cwd), {
+        ultragoalActive: false,
+        teamWorkerCount: 2,
+      });
+
+      await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+        active: false,
+        skill: 'team',
+        phase: 'complete',
+        session_id: sessionId,
+        active_skills: [],
+      }));
+
+      assert.deepEqual(await readHudLayoutProjection(cwd), {
+        ultragoalActive: false,
+        teamWorkerCount: 0,
+      });
     });
   });
 });

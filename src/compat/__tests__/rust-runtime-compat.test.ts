@@ -67,10 +67,10 @@ function writeJson(file, value) {
 }
 function nowIso() { return new Date().toISOString(); }
 if (argv[0] === 'schema') {
-  process.stdout.write(JSON.stringify({ schema_version: 1, commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','remove-dispatch-records','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\\n');
+  process.stdout.write(JSON.stringify({ schema_version: 1, capabilities: ['team-mailbox-scope-v1'], commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','remove-dispatch-records','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\\n');
   process.exit(0);
 }
-if (argv[0] !== 'exec') process.exit(1);
+if (argv[0] !== 'exec' && argv[0] !== 'exec-scoped') process.exit(1);
 const command = JSON.parse(argv[1] || '{}');
 const dir = stateDir();
 const dispatchPath = path.join(dir, 'dispatch.json');
@@ -80,12 +80,14 @@ const mailbox = readJson(mailboxPath, { records: [] });
 const timestamp = nowIso();
 switch (command.command) {
   case 'QueueDispatch':
+    writeJson(path.join(dir, 'events.json'), [...readJson(path.join(dir, 'events.json'), []), { event: 'DispatchQueued', request_id: command.request_id, metadata: command.metadata }]);
+    writeJson(path.join(dir, 'dispatch-seen.json'), { schema_version: 2, ledger_epoch: 1, request_ids: [...readJson(path.join(dir, 'dispatch-seen.json'), { request_ids: [] }).request_ids, command.request_id] });
     dispatch.records.push({ request_id: command.request_id, target: command.target, status: 'pending', created_at: timestamp, notified_at: null, delivered_at: null, failed_at: null, reason: null, metadata: command.metadata ?? null });
     writeJson(dispatchPath, dispatch);
     process.stdout.write(JSON.stringify({ event: 'DispatchQueued', request_id: command.request_id, target: command.target }) + '\\n');
     process.exit(0);
   case 'CreateMailboxMessage':
-    mailbox.records.push({ message_id: command.message_id, from_worker: command.from_worker, to_worker: command.to_worker, body: command.body, created_at: timestamp, notified_at: null, delivered_at: null });
+    mailbox.records.push({ team_name: command.team_name, message_id: command.message_id, from_worker: command.from_worker, to_worker: command.to_worker, body: command.body, created_at: timestamp, notified_at: null, delivered_at: null });
     writeJson(mailboxPath, mailbox);
     process.stdout.write(JSON.stringify({ event: 'MailboxMessageCreated', message_id: command.message_id, from_worker: command.from_worker, to_worker: command.to_worker }) + '\\n');
     process.exit(0);

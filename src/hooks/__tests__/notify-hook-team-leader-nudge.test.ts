@@ -661,9 +661,9 @@ describe('notify-hook team leader nudge', () => {
       assert.match(tmuxLog, /\[OMX\] All 2 workers idle/, 'should emit all-workers-idle nudge');
       assert.doesNotMatch(tmuxLog, /\[OMX_INTENT:/, 'should keep orchestration intent out of injected display text');
       assert.match(tmuxLog, /\[OMX_TMUX_INJECT\]/, 'should include injection marker');
-      const submitMatches = tmuxLog.match(/send-keys -t %99 C-m/g) || [];
-      assert.equal(submitMatches.length, 2, 'leader nudge should submit with isolated double C-m');
-      assert.ok(!/send-keys[^\n]*-l[^\n]*C-m/.test(tmuxLog), 'must not mix literal payload with submit keypresses');
+      const submitMatches = tmuxLog.match(/send-keys -t %99 Enter/g) || [];
+      assert.equal(submitMatches.length, 2, 'leader nudge should submit with isolated double Enter');
+      assert.ok(!/send-keys[^\n]*-l[^\n]*Enter/.test(tmuxLog), 'must not mix literal payload with submit keypresses');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
       assert.ok(existsSync(eventsPath), 'events.ndjson should exist');
@@ -1625,13 +1625,13 @@ exit 0
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /display-message -p -t %93 #\{pane_in_mode\}/);
-      assert.match(tmuxLog, /capture-pane -t %93 -p -S -80/);
+      assert.match(tmuxLog, /capture-pane -t %93 -p\n/);
       assert.match(tmuxLog, /send-keys -t %93 -l \[omx:team-notice-ledger:[a-f0-9]{24}\] Review current Team notices\./);
       assert.match(tmuxLog, /send-keys -t %93 Tab/);
-      assert.match(tmuxLog, /send-keys -t %93 C-m/);
+      assert.match(tmuxLog, /send-keys -t %93 Enter/);
       assert.ok(
-        tmuxLog.indexOf('send-keys -t %93 Tab') < tmuxLog.indexOf('send-keys -t %93 C-m'),
-        'busy leader queue path should press Tab before C-m',
+        tmuxLog.indexOf('send-keys -t %93 Tab') < tmuxLog.indexOf('send-keys -t %93 Enter'),
+        'busy leader queue path should press Tab before Enter',
       );
       assert.match(tmuxLog, /\[OMX_TMUX_INJECT\]/, 'should keep the injection marker on busy-pane sends');
       assert.doesNotMatch(tmuxLog, /send-keys -t %93 -l .*busy-live-pane/, 'busy queued wake must not retain a Team reference in model-visible input');
@@ -2091,10 +2091,10 @@ exit 0
       assert.match(tmuxLog, /capture-pane/);
       assert.match(tmuxLog, /send-keys -t %73/, 'should inject into a busy leader pane so Codex can queue the message');
       assert.match(tmuxLog, /send-keys -t %73 Tab/);
-      assert.match(tmuxLog, /send-keys -t %73 C-m/);
+      assert.match(tmuxLog, /send-keys -t %73 Enter/);
       assert.ok(
-        tmuxLog.indexOf('send-keys -t %73 Tab') < tmuxLog.indexOf('send-keys -t %73 C-m'),
-        'busy leader queue path should press Tab before C-m',
+        tmuxLog.indexOf('send-keys -t %73 Tab') < tmuxLog.indexOf('send-keys -t %73 Enter'),
+        'busy leader queue path should press Tab before Enter',
       );
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
@@ -2220,7 +2220,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/, 'should retain authoritative exact-pane live proof');
       assert.match(tmuxLog, /display-message -p -t %74 #\{pane_current_command\}/, 'should query the exact pane command before capture readiness');
-      assert.match(tmuxLog, /capture-pane -t %74 -p -S -80/);
+      assert.match(tmuxLog, /capture-pane -t %74 -p\n/);
       assert.doesNotMatch(tmuxLog, /(?:set-buffer|paste-buffer|send-keys)/, 'capture readiness failure must suppress all input-effect tmux commands');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');
@@ -2355,7 +2355,7 @@ exit 0
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /capture-pane -t %75 -p -S -80/);
+      assert.match(tmuxLog, /capture-pane -t %75 -p\n/);
       assert.doesNotMatch(tmuxLog, /send-keys -t %75 -l Team same-classified-state: 1 msg\(s\) for leader\./, 'same visible classified state should not be reinjected');
 
       const eventsPath = join(teamDir, 'events', 'events.ndjson');

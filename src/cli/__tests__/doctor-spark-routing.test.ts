@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 
 import { checkSparkRouting } from '../doctor.js';
 
-const SPARK_DEFAULT = 'gpt-5.6-luna';
+const SPARK_DEFAULT = 'gpt-6-luna';
 
 const SPARK_ENV_KEYS = [
   'OMX_DEFAULT_SPARK_MODEL',
@@ -50,8 +50,15 @@ afterEach(() => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-function writeExploreToml(body: string): void {
+/** Writes explore.toml and the other Spark-lane agent (vision.toml); vision mirrors explore's model unless given. */
+function writeExploreToml(body: string, visionModel?: string): void {
   writeFileSync(join(workDir, 'agents', 'explore.toml'), body);
+  const exploreModel = body.match(/^model = "([^"]+)"$/m)?.[1];
+  const model = visionModel ?? exploreModel;
+  writeFileSync(
+    join(workDir, 'agents', 'vision.toml'),
+    model ? `name = "vision"\nmodel = "${model}"\n` : 'name = "vision"\n',
+  );
 }
 
 describe('checkSparkRouting', () => {
@@ -107,7 +114,7 @@ describe('checkSparkRouting', () => {
         explore: 'gpt-5.6-sol-explore',
       },
     }));
-    writeExploreToml('name = "explore"\nmodel = "gpt-5.6-sol-explore"\n');
+    writeExploreToml('name = "explore"\nmodel = "gpt-5.6-sol-explore"\n', SPARK_DEFAULT);
 
     const result = checkSparkRouting(makePaths(workDir));
 
@@ -125,5 +132,34 @@ describe('checkSparkRouting', () => {
     assert.equal(result.status, 'warn');
     assert.match(result.message, /non-default model_provider/);
     assert.match(result.message, /my-proxy/);
+  });
+
+  it('passes when the Spark-lane agent TOML has no model field and no agentModels override (runtime inheritance)', () => {
+    // This reproduces #3822: since 0.21.18, generator doesn't write model field
+    // for agents without explicit specs; they inherit from config.toml at runtime.
+    // Doctor should accept this as correct, not flag it as stale.
+    writeExploreToml(
+      `name = "explore"\ndescription = "Explore with lightweight synthesis"\n`,
+    );
+    const result = checkSparkRouting(makePaths(workDir));
+    assert.equal(result.status, 'pass', `expected pass but got ${result.status}: ${result.message}`);
+    assert.match(result.message, /wired/);
+    assert.doesNotMatch(result.message, /stale install/);
+  });
+
+  it('warns when the Spark-lane agent TOML has no model field but config has an explicit agentModels override', () => {
+    // Mismatch: override configured but not written to TOML -> stale
+    writeFileSync(join(workDir, '.omx-config.json'), JSON.stringify({
+      agentModels: {
+        explore: 'gpt-5.6-sol-explore',
+      },
+    }));
+    writeExploreToml(
+      `name = "explore"\ndescription = "Explore with lightweight synthesis"\n`,
+    );
+    const result = checkSparkRouting(makePaths(workDir));
+    assert.equal(result.status, 'warn');
+    assert.match(result.message, /stale install/);
+    assert.match(result.message, /gpt-5\.6-sol-explore/);
   });
 });

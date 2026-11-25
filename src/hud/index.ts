@@ -12,22 +12,39 @@
 
 import { execFileSync } from 'child_process';
 import { readlinkSync, realpathSync } from 'node:fs';
-import { readAllState, readHudConfig } from './state.js';
+import { readAllState, readHudConfig, readHudLayoutProjection } from './state.js';
 import { getHudRenderMaxLines, renderHud } from './render.js';
 import type { HudFlags, HudPreset, HudRenderContext, ResolvedHudConfig } from './types.js';
-import { HUD_TMUX_HEIGHT_LINES } from './constants.js';
+import {
+  HUD_TMUX_HEIGHT_LINES,
+  HUD_TMUX_ULTRAGOAL_HEIGHT_LINES,
+  HUD_WATCH_REPAIR_TIMEOUT_MS,
+} from './constants.js';
+import { spawnReconcileWithTimeout } from './spawn-reconcile-with-timeout.js';
 import { sleep } from '../utils/sleep.js';
 import { runHudAuthorityTick } from './authority.js';
+import { isHudWatchSessionAttached } from './session-attached.js';
+import { closeOwnedHudPane, createHudOwnerAliveProbe } from './watch-owner.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 import {
   killTmuxPane,
-  listCurrentWindowHudPaneIds,
+  boundHudHeight,
+  listCurrentWindowPanes,
+  findHudWatchPaneIds,
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   readActiveTmuxPaneId,
   registerHudResizeHook,
+  isHudOwnerCurrent,
+  clearTmuxPaneHistory,
+  clearTmuxPaneHistoryIfCurrent,
   resizeTmuxPane,
+  resizeTmuxPaneIfCurrent,
+  readHudHookHealth,
+  readHudLeaderOwnerIdentity,
+  type ReadHudHookHealthInput,
+  type HudHookHealth,
 } from './tmux.js';
-import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit } from './reconcile.js';
+import { OMX_TMUX_HUD_OWNER_ENV, assessOwnedHudLayout, needsHudTopologyRecreate, reconcileHudForPromptSubmit } from './reconcile.js';
 import { buildHudRuntimeEnv } from './tmux.js';
 
 export const HUD_USAGE = [
@@ -37,8 +54,19 @@ export const HUD_USAGE = [
   '  omx hud --json       Output raw state as JSON',
   '  omx hud --preset=X   Use preset: minimal, focused, full',
   '  omx hud --tmux       Open HUD in a tmux split pane (auto-detects orientation)',
-  '  omx hud --reconcile-tmux',
+  '  omx hud --reconcile-tmux [--reconcile-timeout-ms=N]',
 ].join('\n');
+
+function parseReconcileTimeoutMs(args: string[]): number | null | undefined {
+  const timeoutArgs = args.filter((arg) => arg.startsWith('--reconcile-timeout-ms='));
+  if (timeoutArgs.length === 0) return undefined;
+  if (timeoutArgs.length !== 1) return null;
+
+  const rawTimeout = timeoutArgs[0]!.slice('--reconcile-timeout-ms='.length);
+  if (!/^[1-9]\d*$/.test(rawTimeout)) return null;
+  const timeoutMs = Number(rawTimeout);
+  return Number.isSafeInteger(timeoutMs) && timeoutMs <= 2_147_483_647 ? timeoutMs : null;
+}
 
 type SleepFn = (ms: number, signal?: AbortSignal) => Promise<void>;
 
@@ -78,12 +106,23 @@ interface RunWatchModeDependencies {
   renderHudFn: (ctx: HudRenderContext, preset: HudPreset, options?: { maxWidth?: number; maxLines?: number }) => string;
   runAuthorityTickFn: (options: { cwd: string }) => Promise<void>;
   resizeTmuxPaneFn: (paneId: string, heightLines: number) => boolean;
+  listCurrentWindowPanesFn: (paneId?: string) => ReturnType<typeof listCurrentWindowPanes>;
+  clearTmuxPaneHistoryFn: (paneId: string) => boolean;
   registerHudResizeHookFn: (hudPaneId: string, leaderPaneId: string | undefined, heightLines: number) => boolean;
+  isHudOwnerCurrentFn: (leaderPaneId: string, ownerId: string) => boolean;
+  readHudLayoutProjectionFn: typeof readHudLayoutProjection;
+  readHudHookHealthFn: (input: ReadHudHookHealthInput) => HudHookHealth;
+  readHudLeaderOwnerFn: (leaderPaneId: string, ownerId: string) => 'current' | 'mismatch' | 'unknown';
+  reconcileTmuxHudFn: (cwd: string, leaderPanePid?: string) => Promise<void | boolean>;
+  repairTimeoutMs: number;
   writeStdout: (text: string) => void;
   writeStderr: (text: string) => void;
   registerSigint: (handler: () => void) => void | (() => void);
   setIntervalFn: (handler: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
   clearIntervalFn: (timer: ReturnType<typeof setInterval>) => void;
+  isSessionAttachedFn: () => boolean;
+  isOwnerAliveFn: (cwd: string) => Promise<boolean>;
+  closeOwnedPaneFn: () => void;
 }
 
 export interface ResolveHudWatchCwdDependencies {
@@ -149,15 +188,32 @@ export function resolveHudWatchCwd(
 
 function reconcileRunningHudPaneHeight(
   desiredHeight: number,
-  dependencies: Pick<RunWatchModeDependencies, 'env' | 'resizeTmuxPaneFn' | 'registerHudResizeHookFn'>,
-): void {
-  if (!dependencies.env.TMUX || dependencies.env[OMX_TMUX_HUD_OWNER_ENV] !== '1') return;
+  leaderPanePid: string | undefined,
+  hudPanePid: string | undefined,
+  cwd: string,
+  dependencies: Pick<RunWatchModeDependencies, 'env' | 'resizeTmuxPaneFn' | 'registerHudResizeHookFn' | 'isHudOwnerCurrentFn'>,
+  useInjectedMutationFns: boolean,
+): boolean {
+  if (!dependencies.env.TMUX || dependencies.env[OMX_TMUX_HUD_OWNER_ENV] !== '1') return false;
   const hudPaneId = dependencies.env.TMUX_PANE?.trim();
-  if (!hudPaneId?.startsWith('%')) return;
+  if (!hudPaneId?.startsWith('%')) return false;
   const leaderPaneId = dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]?.trim() || undefined;
-  if (dependencies.resizeTmuxPaneFn(hudPaneId, desiredHeight) && leaderPaneId) {
-    dependencies.registerHudResizeHookFn(hudPaneId, leaderPaneId, desiredHeight);
+  if (!leaderPaneId) return false;
+  if (!dependencies.env.OMX_SESSION_ID) {
+    return false;
   }
+  if (useInjectedMutationFns) {
+    if (!dependencies.isHudOwnerCurrentFn(leaderPaneId, dependencies.env.OMX_SESSION_ID)) return false;
+    if (!dependencies.resizeTmuxPaneFn(hudPaneId, desiredHeight)) return false;
+    return dependencies.registerHudResizeHookFn(hudPaneId, leaderPaneId, desiredHeight);
+  }
+  if (!leaderPanePid || !hudPanePid) return false;
+  const authority = { leaderPaneId, leaderPanePid, ownerId: dependencies.env.OMX_SESSION_ID };
+  if (!resizeTmuxPaneIfCurrent(hudPaneId, hudPanePid, desiredHeight, authority)) return false;
+  return registerHudResizeHook(hudPaneId, leaderPaneId, desiredHeight, {
+    cwd,
+    env: { ...dependencies.env, OMX_HUD_WATCH_REPAIR: '1', OMX_HUD_WATCH_LEADER_PID: leaderPanePid },
+  });
 }
 
 /**
@@ -181,7 +237,38 @@ export async function runWatchMode(
       await runHudAuthorityTick({ cwd: authorityCwd });
     }),
     resizeTmuxPaneFn: deps.resizeTmuxPaneFn ?? resizeTmuxPane,
+    listCurrentWindowPanesFn: deps.listCurrentWindowPanesFn ?? (paneId => listCurrentWindowPanes(undefined, paneId)),
+    clearTmuxPaneHistoryFn: deps.clearTmuxPaneHistoryFn ?? clearTmuxPaneHistory,
     registerHudResizeHookFn: deps.registerHudResizeHookFn ?? registerHudResizeHook,
+    isHudOwnerCurrentFn: deps.isHudOwnerCurrentFn
+      ?? (deps.registerHudResizeHookFn ? () => true : isHudOwnerCurrent),
+    readHudLayoutProjectionFn: deps.readHudLayoutProjectionFn ?? readHudLayoutProjection,
+    readHudHookHealthFn: deps.readHudHookHealthFn ?? readHudHookHealth,
+    readHudLeaderOwnerFn: deps.readHudLeaderOwnerFn ?? readHudLeaderOwnerIdentity,
+    repairTimeoutMs: deps.repairTimeoutMs ?? HUD_WATCH_REPAIR_TIMEOUT_MS,
+    reconcileTmuxHudFn: deps.reconcileTmuxHudFn ?? (async (reconcileCwd, leaderPanePid) => {
+      const leaderPaneId = dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]?.trim();
+      if (!leaderPaneId?.startsWith('%') || !leaderPanePid) return false;
+      const omxEntry = resolveOmxCliEntryPath({
+        cwd: reconcileCwd,
+        env: {
+          ...dependencies.env,
+          TMUX_PANE: leaderPaneId,
+        },
+      });
+      if (!omxEntry) return false;
+      // Spawn the reconcile process with timeout and process tree kill handling.
+      // The helper uses an unreferenced timer to avoid keeping the watcher alive,
+      // and kills the process group on POSIX / process tree on Windows.
+      return spawnReconcileWithTimeout({
+        omxBinary: omxEntry,
+        cwd: reconcileCwd,
+        env: dependencies.env,
+        timeoutMs: dependencies.repairTimeoutMs,
+        leaderPaneId,
+        leaderPanePid,
+      });
+    }),
     writeStdout: deps.writeStdout ?? ((text: string) => process.stdout.write(text)),
     writeStderr: deps.writeStderr ?? ((text: string) => process.stderr.write(text)),
     registerSigint: deps.registerSigint ?? ((handler: () => void) => {
@@ -190,7 +277,11 @@ export async function runWatchMode(
     }),
     setIntervalFn: deps.setIntervalFn ?? ((handler: () => void, intervalMs: number) => setInterval(handler, intervalMs)),
     clearIntervalFn: deps.clearIntervalFn ?? ((timer: ReturnType<typeof setInterval>) => clearInterval(timer)),
+    isSessionAttachedFn: deps.isSessionAttachedFn ?? (() => isHudWatchSessionAttached({ env: dependencies.env })),
+    isOwnerAliveFn: deps.isOwnerAliveFn ?? createHudOwnerAliveProbe(deps.env ?? process.env),
+    closeOwnedPaneFn: deps.closeOwnedPaneFn ?? (() => closeOwnedHudPane(dependencies.env)),
   };
+  const useInjectedMutationFns = Boolean(deps.resizeTmuxPaneFn || deps.registerHudResizeHookFn);
 
   if (!dependencies.isTTY && !dependencies.env.CI) {
     dependencies.writeStderr('HUD watch mode requires a TTY\n');
@@ -212,6 +303,12 @@ export async function runWatchMode(
   });
 
   let unregisterSigint: void | (() => void);
+  let repairInFlight = false;
+  let repairDirty = false;
+  let lastRepairFingerprint = '';
+  let retryAt = 0;
+  let retryIndex = 0;
+  const retryDelaysMs = [1000, 2000, 4000, 8000, 16000, 30000];
   const stop = () => {
     if (stopped) return;
     stopped = true;
@@ -229,27 +326,198 @@ export async function runWatchMode(
       return;
     }
     inFlight = true;
+    let renderedThisTick: 'rendered' | 'suppressed' | 'stopped' = 'suppressed';
     try {
-      if (firstRender) {
-        dependencies.writeStdout('\x1b[2J\x1b[H');
-        firstRender = false;
-      } else {
-        dependencies.writeStdout('\x1b[H');
-      }
       const frameCwd = dependencies.resolveWatchCwdFn(cwd);
-      const config = await dependencies.readHudConfigFn(frameCwd);
-      const ctx = await dependencies.readAllStateFn(frameCwd, config);
-      const preset = flags.preset ?? config.preset;
-      const maxLines = getHudRenderMaxLines(ctx);
-      if (maxLines !== lastDesiredHeight) {
-        reconcileRunningHudPaneHeight(maxLines, dependencies);
-        lastDesiredHeight = maxLines;
+      if (!await dependencies.isOwnerAliveFn(frameCwd)) {
+        renderedThisTick = 'stopped';
+        stop();
+        dependencies.closeOwnedPaneFn();
+        return;
       }
-      const line = dependencies.renderHudFn(ctx, preset, {
-        maxWidth: process.stdout.columns ?? undefined,
-        maxLines,
-      });
-      dependencies.writeStdout(line + '\x1b[K\x1b[J');
+      const leaderIdForOwner = dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]?.trim();
+      const ownerIdForProbe = dependencies.env.OMX_SESSION_ID?.trim();
+      const exactOwner = dependencies.env.TMUX && dependencies.env[OMX_TMUX_HUD_OWNER_ENV] === '1'
+        ? dependencies.readHudLeaderOwnerFn(leaderIdForOwner ?? '', ownerIdForProbe ?? '')
+        : 'current';
+      if (exactOwner === 'mismatch') {
+        renderedThisTick = 'stopped';
+        stop();
+        dependencies.closeOwnedPaneFn();
+        return;
+      }
+      // A detached session has no client to receive stdout, so skip the
+      // render-only work (state reads with git subprocess spawns, tmux height
+      // reconciliation, stdout writes) while still running the authority
+      // tick below. Fail-open: an unknown attachment answer renders.
+      // (closes #3577)
+      let attached = true;
+      try {
+        attached = dependencies.isSessionAttachedFn();
+      } catch {
+        // Fail-open: an unknown attachment answer renders.
+        attached = true;
+      }
+      const hudPaneId = dependencies.env.TMUX_PANE?.trim();
+      const leaderPaneId = dependencies.env[OMX_TMUX_HUD_LEADER_PANE_ENV]?.trim();
+      const ownerId = dependencies.env.OMX_SESSION_ID?.trim();
+      const ownedHudPane = Boolean(
+        dependencies.env.TMUX && dependencies.env[OMX_TMUX_HUD_OWNER_ENV] === '1'
+        && hudPaneId?.startsWith('%'),
+      );
+      let desiredHeight: number;
+      let ctx: HudRenderContext | undefined;
+      let preset: HudPreset | undefined;
+      if (firstRender || attached) {
+        const config = await dependencies.readHudConfigFn(frameCwd);
+        ctx = await dependencies.readAllStateFn(frameCwd, config);
+        preset = flags.preset ?? config.preset;
+        desiredHeight = getHudRenderMaxLines(ctx);
+      } else if (ownedHudPane) {
+        const layout = await dependencies.readHudLayoutProjectionFn(frameCwd);
+        desiredHeight = (layout.ultragoalActive ? HUD_TMUX_ULTRAGOAL_HEIGHT_LINES : HUD_TMUX_HEIGHT_LINES)
+          + layout.teamWorkerCount + (layout.nativeAgentCount ?? 0);
+      } else {
+        desiredHeight = HUD_TMUX_HEIGHT_LINES;
+      }
+      const panes = ownedHudPane && leaderPaneId
+        ? dependencies.listCurrentWindowPanesFn(leaderPaneId) : [];
+      const maxLines = ownedHudPane
+        ? boundHudHeight(desiredHeight, panes, leaderPaneId, hudPaneId)
+        : Math.min(desiredHeight, process.stdout.rows || desiredHeight);
+      const assessment = ownedHudPane
+        ? assessOwnedHudLayout(panes, leaderPaneId ?? '', hudPaneId ?? '', ownerId ?? '', maxLines)
+        : null;
+      const leaderPane = panes.find(pane => pane.paneId === leaderPaneId);
+      const currentHudPane = panes.find(pane => pane.paneId === hudPaneId);
+      const hookHealth = assessment && (assessment.status === 'healthy' || assessment.reason === 'height_mismatch')
+        && leaderPane?.panePid && currentHudPane?.panePid
+        && leaderPane.sessionId && leaderPane.windowId
+        ? dependencies.readHudHookHealthFn({
+          leaderPaneId: leaderPane.paneId,
+          leaderPanePid: leaderPane.panePid,
+          hudPaneId: currentHudPane.paneId,
+          hudPanePid: currentHudPane.panePid,
+          sessionId: leaderPane.sessionId,
+          windowId: leaderPane.windowId,
+          heightLines: currentHudPane.paneHeight ?? maxLines,
+          cwd: frameCwd,
+          env: dependencies.env,
+        })
+        : assessment ? 'unknown' : null;
+      if (hookHealth === 'owner_mismatch') {
+        renderedThisTick = 'stopped';
+        stop();
+        dependencies.closeOwnedPaneFn();
+        return;
+      }
+      if (exactOwner === 'current' && ownedHudPane && !currentHudPane && leaderPane && leaderPaneId && ownerId && hudPaneId) {
+        const ownWindowPane = dependencies.listCurrentWindowPanesFn(hudPaneId)
+          .find(pane => pane.paneId === hudPaneId);
+        const displacedToOtherWindow = ownWindowPane?.sessionId && ownWindowPane.windowId
+          && leaderPane.sessionId && leaderPane.windowId
+          && (ownWindowPane.sessionId !== leaderPane.sessionId || ownWindowPane.windowId !== leaderPane.windowId);
+        const replacements = findHudWatchPaneIds(panes, leaderPaneId, { sessionId: ownerId, leaderPaneId })
+          .filter(paneId => paneId !== hudPaneId);
+        if (displacedToOtherWindow && replacements.length === 1) {
+          const replacement = panes.find(pane => pane.paneId === replacements[0]);
+          const replacementAssessment = assessOwnedHudLayout(panes, leaderPaneId, replacements[0]!, ownerId, maxLines);
+          if (replacement && replacementAssessment.status === 'healthy'
+            && leaderPane.panePid && leaderPane.sessionId && leaderPane.windowId && replacement.panePid
+            && dependencies.readHudHookHealthFn({
+              leaderPaneId, leaderPanePid: leaderPane.panePid,
+              hudPaneId: replacement.paneId, hudPanePid: replacement.panePid,
+              sessionId: leaderPane.sessionId, windowId: leaderPane.windowId,
+              heightLines: maxLines, cwd: frameCwd, env: dependencies.env,
+            }) === 'healthy') {
+            renderedThisTick = 'stopped';
+            stop();
+            dependencies.closeOwnedPaneFn();
+            return;
+          }
+        }
+      }
+      let needsRepair = assessment?.status === 'repair_needed' && assessment.reason !== 'height_mismatch';
+      if (assessment?.reason === 'height_mismatch' && hookHealth === 'repair_needed') needsRepair = true;
+      if (assessment?.status === 'healthy' && hookHealth === 'repair_needed') needsRepair = true;
+      if (assessment?.status === 'healthy' && hookHealth === 'healthy') {
+        lastRepairFingerprint = '';
+        retryAt = 0;
+        retryIndex = 0;
+      }
+      if (exactOwner === 'current' && !ctx && assessment?.reason === 'height_mismatch' && hookHealth === 'healthy'
+        && !reconcileRunningHudPaneHeight(maxLines, leaderPane?.panePid, currentHudPane?.panePid,
+          frameCwd, dependencies, useInjectedMutationFns)) {
+        needsRepair = true;
+      }
+      if (ctx && preset) {
+        const line = dependencies.renderHudFn(ctx, preset, {
+          maxWidth: process.stdout.columns ?? undefined,
+          maxLines,
+        });
+        const currentHeight = currentHudPane?.paneHeight;
+        const changingHeight = maxLines !== lastDesiredHeight
+          || (typeof currentHeight === 'number' && currentHeight !== maxLines);
+        const clearFrame = ownedHudPane && changingHeight
+          ? '\x1b[3J\x1b[2J\x1b[H'
+          : '\x1b[2J\x1b[H';
+        if (changingHeight) {
+          // Clear before a pane resize so tmux cannot reflow stale HUD rows
+          // into visible output or scrollback while changing the pane height.
+          dependencies.writeStdout(clearFrame);
+          if (exactOwner === 'current' && assessment?.reason === 'height_mismatch' && hookHealth === 'healthy') {
+            if (reconcileRunningHudPaneHeight(maxLines, leaderPane?.panePid, currentHudPane?.panePid,
+              frameCwd, dependencies, useInjectedMutationFns)) {
+              if (hudPaneId) {
+                if (useInjectedMutationFns) dependencies.clearTmuxPaneHistoryFn(hudPaneId);
+                else if (leaderPane?.panePid && currentHudPane?.panePid && ownerId && leaderPaneId) {
+                  clearTmuxPaneHistoryIfCurrent(hudPaneId, currentHudPane.panePid,
+                    { leaderPaneId, leaderPanePid: leaderPane.panePid, ownerId });
+                }
+              }
+            } else {
+              needsRepair = true;
+            }
+          }
+          lastDesiredHeight = maxLines;
+          dependencies.writeStdout(`\x1b[H${line}\x1b[K\x1b[J`);
+        } else {
+          dependencies.writeStdout(`${clearFrame}${line}\x1b[K\x1b[J`);
+        }
+        firstRender = false;
+        renderedThisTick = 'rendered';
+      }
+      if (ownedHudPane && exactOwner === 'current' && needsRepair) {
+        const fingerprint = JSON.stringify({ reason: assessment?.reason, maxLines,
+          panes: panes.map(pane => [pane.paneId, pane.panePid, pane.paneLeft, pane.paneTop, pane.paneWidth, pane.paneHeight]),
+          hookHealth });
+        if (fingerprint !== lastRepairFingerprint) {
+          retryAt = 0;
+          retryIndex = 0;
+        }
+        if (repairInFlight) {
+          repairDirty = true;
+        } else if (Date.now() >= retryAt) {
+          repairInFlight = true;
+          lastRepairFingerprint = fingerprint;
+          void dependencies.reconcileTmuxHudFn(frameCwd, leaderPane?.panePid).then(
+            () => {
+              retryAt = Date.now() + retryDelaysMs[Math.min(retryIndex, retryDelaysMs.length - 1)]!;
+              retryIndex += 1;
+            },
+            () => {
+              retryAt = Date.now() + retryDelaysMs[Math.min(retryIndex, retryDelaysMs.length - 1)]!;
+              retryIndex += 1;
+            },
+          ).finally(() => {
+            repairInFlight = false;
+            if (!stopped && repairDirty) {
+              repairDirty = false;
+              void renderTick();
+            }
+          });
+        }
+      }
       try {
         await dependencies.runAuthorityTickFn({ cwd: frameCwd });
       } catch (authorityError) {
@@ -260,12 +528,13 @@ export async function runWatchMode(
       const message = error instanceof Error ? error.message : String(error);
       dependencies.writeStderr(`HUD watch render failed: ${message}\n`);
       process.exitCode = 1;
+      renderedThisTick = 'stopped';
       stop();
-      return;
     } finally {
-      inFlight = false;
+      if (renderedThisTick !== 'stopped') inFlight = false;
     }
 
+    if (renderedThisTick === 'stopped') return;
     if (queued) {
       queued = false;
       await renderTick();
@@ -332,7 +601,10 @@ export async function hudCommand(
   args: string[],
   deps: {
     cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    omxEntryPath?: string;
     reconcileHudForPromptSubmit?: typeof reconcileHudForPromptSubmit;
+    spawnReconcileWithTimeoutFn?: typeof spawnReconcileWithTimeout;
   } = {},
 ): Promise<void> {
   if (args[0] === '--help' || args[0] === '-h') {
@@ -344,6 +616,33 @@ export async function hudCommand(
   const cwd = deps.cwd ?? process.cwd();
 
   if (args.includes('--reconcile-tmux')) {
+    const timeoutMs = parseReconcileTimeoutMs(args);
+    if (timeoutMs !== undefined) {
+      if (timeoutMs === null) {
+        process.exitCode = 1;
+        return;
+      }
+
+      const env = deps.env ?? process.env;
+      const omxEntryPath = deps.omxEntryPath ?? resolveOmxCliEntryPath({ cwd, env });
+      if (!omxEntryPath) {
+        process.exitCode = 1;
+        return;
+      }
+
+      const completed = await (deps.spawnReconcileWithTimeoutFn ?? spawnReconcileWithTimeout)({
+        omxBinary: omxEntryPath,
+        cwd,
+        env,
+        timeoutMs,
+        leaderPaneId: env.TMUX_PANE,
+        leaderPanePid: env.OMX_HUD_WATCH_LEADER_PID,
+        keepAlive: true,
+      });
+      if (!completed) process.exitCode = 1;
+      return;
+    }
+
     const result = await (deps.reconcileHudForPromptSubmit ?? reconcileHudForPromptSubmit)(cwd);
     if (result.status === 'failed') {
       process.exitCode = 1;
@@ -428,17 +727,21 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
   const currentPaneId = envPaneId || readActiveTmuxPaneId() || undefined;
   const leaderPaneId = currentPaneId;
   const sessionId = process.env.OMX_SESSION_ID?.trim() || undefined;
+  const panes = listCurrentWindowPanes(undefined, leaderPaneId);
   const existingHudPaneIds = leaderPaneId || sessionId
-    ? listCurrentWindowHudPaneIds(leaderPaneId, undefined, leaderPaneId ? { leaderPaneId } : { sessionId })
+    ? findHudWatchPaneIds(panes, leaderPaneId, leaderPaneId ? { leaderPaneId } : { sessionId })
     : [];
-  if (existingHudPaneIds.length >= 1) {
-    const [keeperPaneId, ...duplicatePaneIds] = existingHudPaneIds;
-    for (const paneId of duplicatePaneIds) {
-      killTmuxPane(paneId);
-    }
+  const leaderPane = panes.find(pane => pane.paneId === leaderPaneId);
+  const keeperPaneId = panes.find(pane => existingHudPaneIds.includes(pane.paneId)
+    && !needsHudTopologyRecreate(pane, leaderPane))?.paneId;
+  const duplicatePaneIds = existingHudPaneIds.filter(paneId => paneId !== keeperPaneId);
+  for (const paneId of duplicatePaneIds) {
+    killTmuxPane(paneId);
+  }
+  if (keeperPaneId) {
     const config = await readHudConfig(cwd);
     const ctx = await readAllState(cwd, config);
-    const desiredHeight = getHudRenderMaxLines(ctx);
+    const desiredHeight = boundHudHeight(getHudRenderMaxLines(ctx), listCurrentWindowPanes(undefined, leaderPaneId), leaderPaneId, keeperPaneId);
     resizeTmuxPane(keeperPaneId, desiredHeight);
     if (leaderPaneId) registerHudResizeHook(keeperPaneId, leaderPaneId, desiredHeight);
     console.log(duplicatePaneIds.length > 0
@@ -456,7 +759,7 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
     process.env.OMX_SESSION_ID,
     process.env.OMX_ROOT,
     currentPaneId,
-    getHudRenderMaxLines(ctx),
+    boundHudHeight(getHudRenderMaxLines(ctx), listCurrentWindowPanes(undefined, leaderPaneId), leaderPaneId),
     {
       omxStateRoot: process.env.OMX_STATE_ROOT,
       omxTeamStateRoot: process.env.OMX_TEAM_STATE_ROOT,

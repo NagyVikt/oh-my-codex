@@ -4,10 +4,12 @@ import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { AsyncLocalStorage } from 'async_hooks';
 import { readUsableSessionState } from '../hooks/session.js';
+import { syncRegularFile } from '../utils/file-durability.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   computeTaskReadiness as computeTaskReadinessImpl,
   claimTask as claimTaskImpl,
+  renewTaskClaim as renewTaskClaimImpl,
   transitionTaskStatus as transitionTaskStatusImpl,
   releaseTaskClaim as releaseTaskClaimImpl,
   reclaimExpiredTaskClaim as reclaimExpiredTaskClaimImpl,
@@ -20,6 +22,12 @@ import {
   markMessageNotified as markMessageNotifiedImpl,
   listMailboxMessages as listMailboxMessagesImpl,
   normalizeBridgeMailboxMessage,
+  readLegacyMailboxMessageIds,
+  mailboxRecordBelongsToTeam,
+  mailboxMessageIdentity,
+  mailboxMessageContentMatches,
+  hasUniqueScopedMailboxMatch,
+  needsLegacyMailboxEvidence,
 } from './state/mailbox.js';
 import {
   enqueueDispatchRequest as enqueueDispatchRequestImpl,
@@ -28,6 +36,7 @@ import {
   transitionDispatchRequest as transitionDispatchRequestImpl,
   markDispatchRequestNotified as markDispatchRequestNotifiedImpl,
   markDispatchRequestDelivered as markDispatchRequestDeliveredImpl,
+  markDispatchRequestFailed as markDispatchRequestFailedImpl,
   normalizeBridgeDispatchRecord,
   normalizeDispatchRequest as normalizeDispatchRequestImpl,
 } from './state/dispatch.js';
@@ -52,7 +61,8 @@ import {
   withTaskClaimLock as withTaskClaimLockImpl,
   withMailboxLock as withMailboxLockImpl,
 } from './state/locks.js';
-import { getDefaultBridge, isBridgeEnabled, resolveBridgeStateDir, type DispatchRecord } from '../runtime/bridge.js';
+import { hasRuntimeAuthority, loadRuntimeDispatchIdentitySet, parseRuntimeFinalizationJournal } from './state/dispatch-recovery.js';
+import { getDefaultBridge, isBridgeEnabled, isStrictDispatchRecord, resolveBridgeStateDir, type DispatchRecord } from '../runtime/bridge.js';
 import {
   type TeamDispatchRequestStatus,
   TEAM_NAME_SAFE_PATTERN,
@@ -81,7 +91,7 @@ export interface TeamConfig {
   name: string;
   task: string;
   agent_type: string;
-  worker_launch_mode: 'interactive' | 'prompt';
+  worker_launch_mode: 'interactive' | 'prompt' | 'herdr';
   lifecycle_profile: 'default';
   worker_count: number;
   max_workers: number; // default 20, configurable up to 20
@@ -148,6 +158,7 @@ export interface WorkerHeartbeat {
 export interface WorkerStatus {
   state: 'idle' | 'working' | 'blocked' | 'done' | 'failed' | 'draining' | 'unknown';
   current_task_id?: string;
+  current_claim_token?: string;
   reason?: string;
   updated_at: string;
 }
@@ -204,6 +215,7 @@ export interface TeamTask {
   description: string;
   status: 'pending' | 'blocked' | 'in_progress' | 'completed' | 'failed';
   requires_code_change?: boolean;
+  verified_head?: string; // Set only by validated code completion.
   role?: string; // agent role for this task (e.g., 'executor', 'test-engineer', 'designer')
   owner?: string; // worker name
   result?: string; // completion summary
@@ -225,6 +237,7 @@ export interface TeamTask {
 }
 
 export interface TeamTaskClaim {
+  claimed_at?: string;
   owner: string;
   token: string;
   leased_until: string;
@@ -243,7 +256,7 @@ export interface TeamLeader {
 
 export interface TeamPolicy {
   display_mode: 'split_pane' | 'auto';
-  worker_launch_mode: 'interactive' | 'prompt';
+  worker_launch_mode: 'interactive' | 'prompt' | 'herdr';
   dispatch_mode: 'hook_preferred_with_fallback' | 'transport_direct';
   dispatch_ack_timeout_ms: number;
 }
@@ -276,6 +289,7 @@ export interface TeamDispatchRequest {
   inbox_correlation_key?: string;
   transport_preference: TeamDispatchTransportPreference;
   fallback_allowed: boolean;
+  creation_transport?: 'legacy-json';
   status: TeamDispatchRequestStatus;
   attempt_count: number;
   created_at: string;
@@ -432,9 +446,13 @@ export type ClaimTaskResult =
   | { ok: true; task: TeamTaskV2; claimToken: string }
   | { ok: false; error: 'claim_conflict' | 'blocked_dependency' | 'task_not_found' | 'already_terminal' | 'worker_not_found'; dependencies?: string[] };
 
+export type RenewTaskClaimResult =
+  | { ok: true; task: TeamTaskV2 }
+  | { ok: false; error: 'claim_conflict' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'worker_not_found' };
+
 export type TransitionTaskResult =
   | { ok: true; task: TeamTaskV2 }
-  | { ok: false; error: 'claim_conflict' | 'invalid_transition' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'missing_delegation_compliance_evidence' | 'missing_coordination_compliance_evidence' };
+  | { ok: false; error: 'claim_conflict' | 'invalid_transition' | 'task_not_found' | 'already_terminal' | 'lease_expired' | 'missing_delegation_compliance_evidence' | 'missing_coordination_compliance_evidence' | 'invalid_completion_evidence'; reason?: string };
 
 export type ReleaseTaskClaimResult =
   | { ok: true; task: TeamTaskV2 }
@@ -561,7 +579,9 @@ export function normalizeTeamPolicy(
     : 'hook_preferred_with_fallback';
 
   return {
-    worker_launch_mode: policy?.worker_launch_mode === 'prompt' ? 'prompt' : base.worker_launch_mode,
+    worker_launch_mode: policy?.worker_launch_mode === 'prompt' || policy?.worker_launch_mode === 'herdr'
+      ? policy.worker_launch_mode
+      : base.worker_launch_mode,
     display_mode: policy?.display_mode === 'split_pane' ? 'split_pane' : base.display_mode,
     dispatch_mode: dispatchMode,
     dispatch_ack_timeout_ms: clampDispatchAckTimeoutMs(policy?.dispatch_ack_timeout_ms),
@@ -619,7 +639,8 @@ function resolveWorkerLaunchModeFromEnv(env: NodeJS.ProcessEnv): TeamPolicy['wor
   const raw = readEnvValue(env, ['OMX_TEAM_WORKER_LAUNCH_MODE']);
   if (!raw || raw === 'interactive') return 'interactive';
   if (raw === 'prompt') return 'prompt';
-  throw new Error(`Invalid OMX_TEAM_WORKER_LAUNCH_MODE value "${raw}". Expected: interactive, prompt`);
+  if (raw === 'herdr') return 'herdr';
+  throw new Error(`Invalid OMX_TEAM_WORKER_LAUNCH_MODE value "${raw}". Expected: interactive, prompt, herdr`);
 }
 
 function resolvePermissionsSnapshot(env: NodeJS.ProcessEnv): PermissionsSnapshot {
@@ -713,8 +734,9 @@ function mailboxLockDir(teamName: string, workerName: string, cwd: string): stri
   return p;
 }
 
-function dispatchRequestsPath(teamName: string, cwd: string): string {
-  return join(teamDir(teamName, cwd), 'dispatch', 'requests.json');
+function dispatchRequestsPath(teamName: string, cwd: string, stateDir = resolveTeamStateRoot(cwd)): string {
+  assertSafeTeamName(teamName);
+  return join(stateDir, 'team', teamName, 'dispatch', 'requests.json');
 }
 
 function dispatchLockDir(teamName: string, cwd: string): string {
@@ -797,8 +819,13 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
 }
 
 // Atomic write: write to {path}.tmp.{pid}, fsync it, rename, then fsync parent.
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error && typeof (error as any).code === 'string';
+}
+
 function isUnsupportedParentDirectorySyncError(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException).code;
+  if (!isErrnoException(error)) return false;
+  const code = error.code;
   return (
     code === 'EINVAL'
     || code === 'ENOTSUP'
@@ -836,9 +863,9 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
 
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
   await writeFile(tmpPath, data, 'utf8');
-  const handle = await openForAtomicWrite(tmpPath, 'r');
+  const handle = await openForAtomicWrite(tmpPath, 'r+');
   try {
-    await handle.sync();
+    await syncRegularFile(handle, platformForAtomicWrite);
   } finally {
     await handle.close();
   }
@@ -847,8 +874,8 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
     await renameForAtomicWrite(tmpPath, filePath);
     await syncParentDirectory(filePath);
   } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code === 'ENOENT' && existsSync(filePath)) {
+    if (!isErrnoException(error)) throw error;
+    if (error.code === 'ENOENT' && existsSync(filePath)) {
       try {
         const existing = await readFile(filePath, 'utf8');
         if (existing === data) return;
@@ -971,7 +998,7 @@ export async function recoverTeamMembershipTaskTransaction(
   try {
     journal = JSON.parse(await readFile(journalPath, 'utf8')) as MembershipTransactionJournal;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    if (isErrnoException(error) && error.code === 'ENOENT') return;
     throw error;
   }
   if (journal.schemaVersion !== 1 || (journal.phase !== 'prepared' && journal.phase !== 'committed') || !Array.isArray(journal.files)) {
@@ -1306,7 +1333,9 @@ async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
 function teamConfigFromManifest(manifest: TeamManifestV2): TeamConfig {
   const normalizedPolicy = normalizeTeamPolicy(manifest.policy, {
     display_mode: manifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
-    worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive',
+    worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' || manifest.policy?.worker_launch_mode === 'herdr'
+      ? manifest.policy.worker_launch_mode
+      : 'interactive',
   });
   const workerLaunchMode = normalizedPolicy.worker_launch_mode;
   return {
@@ -1440,7 +1469,9 @@ export async function writeTeamManifestV2(manifest: TeamManifestV2, cwd: string)
   await withTeamTaskBarrier(manifest.name, cwd, async () => {
   const normalizedPolicy = normalizeTeamPolicy(manifest.policy, {
     display_mode: manifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
-    worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' ? 'prompt' : 'interactive',
+    worker_launch_mode: manifest.policy?.worker_launch_mode === 'prompt' || manifest.policy?.worker_launch_mode === 'herdr'
+      ? manifest.policy.worker_launch_mode
+      : 'interactive',
   });
   const normalizedGovernance = normalizeTeamGovernance(
     manifest.governance,
@@ -1556,8 +1587,8 @@ async function computeNextTaskIdFromDisk(teamName: string, cwd: string): Promise
       if (Number.isFinite(id) && id > maxId) maxId = id;
     }
   } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code === 'ENOENT') return 1;
+    if (!isErrnoException(error)) throw error;
+    if (error.code === 'ENOENT') return 1;
     throw error;
   }
 
@@ -1600,6 +1631,27 @@ async function readTeamConfigRaw(teamName: string, cwd: string): Promise<TeamCon
   }
 }
 
+/** Strictly observational config read for diagnostics. Never migrates, recovers, or acquires locks. */
+export async function readTeamConfigSnapshot(teamName: string, cwd: string): Promise<TeamConfig | null> {
+  const v2 = await readTeamManifestV2Raw(teamName, cwd);
+  if (v2) return { ...teamConfigFromManifest(v2), config_generation: (await readConfigGenerationRaw(teamName, cwd)) ?? 0 };
+  try {
+    const p = teamConfigPath(teamName, cwd);
+    if (!existsSync(p)) return null;
+    const raw = await readFile(p, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return normalizeTeamConfig(parsed as TeamConfig);
+  } catch {
+    return null;
+  }
+}
+
+/** Strictly observational manifest read for diagnostics. */
+export async function readTeamManifestV2Snapshot(teamName: string, cwd: string): Promise<TeamManifestV2 | null> {
+  return await readTeamManifestV2Raw(teamName, cwd);
+}
+
 export async function readTeamConfig(teamName: string, cwd: string): Promise<TeamConfig | null> {
   return await withTeamTaskBarrier(teamName, cwd, async () => {
     await recoverTeamMembershipTaskTransaction(teamName, cwd);
@@ -1630,7 +1682,7 @@ export async function readWorkerHeartbeat(
     const parsed = JSON.parse(raw) as unknown;
     return isWorkerHeartbeat(parsed) ? parsed : null;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    if (isErrnoException(error) && error.code === 'ENOENT') return null;
     return null;
   }
 }
@@ -1646,10 +1698,12 @@ export async function updateWorkerHeartbeat(
   await writeAtomic(p, JSON.stringify(heartbeat, null, 2));
 }
 
-// Read worker status (returns {state:'unknown'} on missing/malformed)
-export async function readWorkerStatus(teamName: string, workerName: string, cwd: string): Promise<WorkerStatus> {
+// Read worker status (returns {state:'unknown'} on missing/malformed).
+// Read-only consumers may reuse an already-selected runtime state root.
+export async function readWorkerStatus(teamName: string, workerName: string, cwd: string, stateRoot?: string): Promise<WorkerStatus> {
   const unknownStatus: WorkerStatus = { state: 'unknown', updated_at: '1970-01-01T00:00:00.000Z' };
-  const p = join(workerDir(teamName, workerName, cwd), 'status.json');
+  assertSafeTeamName(teamName);
+  const p = join(stateRoot ?? resolveTeamStateRoot(cwd), 'team', teamName, 'workers', workerName, 'status.json');
   try {
     const raw = await readFile(p, 'utf8');
     const parsed = JSON.parse(raw) as unknown;
@@ -1658,7 +1712,7 @@ export async function readWorkerStatus(teamName: string, workerName: string, cwd
     }
     return parsed;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return unknownStatus;
+    if (isErrnoException(error) && error.code === 'ENOENT') return unknownStatus;
     return unknownStatus;
   }
 }
@@ -1781,6 +1835,7 @@ export async function createTask(
       }),
       id: nextId,
       status: task.status ?? 'pending',
+      verified_head: undefined,
       depends_on: task.depends_on ?? task.blocked_by ?? [],
       version: 1,
     };
@@ -1831,6 +1886,20 @@ export async function updateTask(
         throw new Error(`Invalid task status: ${updates.status}`);
       }
 
+      if ('owner' in updates || 'claim' in updates) {
+        throw new Error('Task ownership and claims must use claim/release/reclaim APIs.');
+      }
+      if ('verified_head' in updates) throw new Error('Use transition-task-status to record a verified handoff.');
+      if (updates.requires_code_change === true && existing.requires_code_change !== true && isTerminalTaskStatus(existing.status)) {
+        throw new Error('Cannot enable completion evidence for a terminal task.');
+      }
+      if (updates.status === 'completed' && existing.status !== 'completed'
+        && (updates.requires_code_change ?? existing.requires_code_change) === true) {
+        throw new Error('Use transition-task-status with completion evidence.');
+      }
+      if (existing.requires_code_change === true && updates.requires_code_change === false) {
+        throw new Error('Cannot disable completion evidence for an implementation task.');
+      }
       const rawDeps = updates.depends_on ?? updates.blocked_by ?? existing.depends_on ?? existing.blocked_by ?? [];
       const normalizedDeps = Array.isArray(rawDeps) ? rawDeps : [];
       const merged = normalizeTask({
@@ -1861,8 +1930,49 @@ export async function listTasks(teamName: string, cwd: string): Promise<TeamTask
   });
 }
 
+/** Strictly observational task listing for diagnostics. Never recovers or acquires locks. */
+export async function listTasksSnapshot(teamName: string, cwd: string): Promise<TeamTask[]> {
+  return await listTasksImpl(teamName, cwd, {
+    teamDir,
+    isTeamTask,
+    normalizeTask,
+  });
+}
+
 export async function computeTaskReadiness(teamName: string, taskId: string, cwd: string): Promise<TaskReadiness> {
   return await computeTaskReadinessImpl(teamName, taskId, cwd, { readTask });
+}
+
+// Ownership and capacity metadata share the existing task/membership commit boundary.
+async function persistTaskOwnership(teamName: string, task: TeamTaskV2, cwd: string): Promise<void> {
+  const config = await readTeamConfig(teamName, cwd);
+  if (!config) throw new Error(`team_config_missing:${teamName}`);
+  let assignmentsChanged = false;
+  const workers = config.workers.map((worker) => {
+    const assignedTasks = worker.name === task.owner
+      ? worker.assigned_tasks.includes(task.id) ? worker.assigned_tasks : [...worker.assigned_tasks, task.id]
+      : worker.assigned_tasks.filter((id) => id !== task.id);
+    if (assignedTasks.length === worker.assigned_tasks.length
+      && assignedTasks.every((id, index) => id === worker.assigned_tasks[index])) return worker;
+    assignmentsChanged = true;
+    return { ...worker, assigned_tasks: assignedTasks };
+  });
+  const newTaskBytes = JSON.stringify(task, null, 2);
+  if (!assignmentsChanged) {
+    await writeAtomic(taskFilePath(teamName, task.id, cwd), newTaskBytes);
+    return;
+  }
+  const configBytes = await readFile(teamConfigPath(teamName, cwd), 'utf8');
+  const manifest = await readTeamManifestV2Raw(teamName, cwd);
+  await commitTeamMembershipTaskTransaction(teamName, cwd, {
+    baseGeneration: config.config_generation ?? 0,
+    tasks: [{ taskId: task.id, oldBytes: await readFile(taskFilePath(teamName, task.id, cwd), 'utf8'), newBytes: newTaskBytes }],
+    config: { oldBytes: configBytes, newBytes: JSON.stringify({ ...config, workers }, null, 2) },
+    ...(manifest ? { manifest: {
+      oldBytes: await readFile(teamManifestV2Path(teamName, cwd), 'utf8'),
+      newBytes: JSON.stringify({ ...manifest, workers }, null, 2),
+    } } : {}),
+  });
 }
 
 export async function claimTask(
@@ -1884,6 +1994,31 @@ export async function claimTask(
       isTerminalTaskStatus,
       taskFilePath,
       writeAtomic,
+      persistTaskOwnership: (task) => persistTaskOwnership(teamName, task, cwd),
+    });
+  });
+}
+
+export async function renewTaskClaim(
+  teamName: string,
+  taskId: string,
+  workerName: string,
+  claimToken: string,
+  cwd: string
+): Promise<RenewTaskClaimResult> {
+  return await withTeamTaskBarrier(teamName, cwd, async () => {
+    await recoverTeamMembershipTaskTransaction(teamName, cwd);
+    return await renewTaskClaimImpl(taskId, workerName, claimToken, {
+      teamName,
+      cwd,
+      readTask,
+      readTeamConfig,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus,
+      taskFilePath,
+      writeAtomic,
+      persistTaskOwnership: (task) => persistTaskOwnership(teamName, task, cwd),
     });
   });
 }
@@ -1896,12 +2031,14 @@ export async function transitionTaskStatus(
   claimToken: string,
   cwd: string,
   terminalData?: { result?: string; error?: string },
+  evidenceCwd = cwd,
 ): Promise<TransitionTaskResult> {
   return await withTeamTaskBarrier(teamName, cwd, async () => {
     await recoverTeamMembershipTaskTransaction(teamName, cwd);
     return await transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
       teamName,
       cwd,
+      evidenceCwd,
       readTask,
       readTeamConfig,
       withTaskClaimLock,
@@ -1910,6 +2047,7 @@ export async function transitionTaskStatus(
       canTransitionTaskStatus,
       taskFilePath,
       writeAtomic,
+      persistTaskOwnership: (task) => persistTaskOwnership(teamName, task, cwd),
       appendTeamEvent,
       readMonitorSnapshot,
       writeMonitorSnapshot,
@@ -1936,6 +2074,7 @@ export async function releaseTaskClaim(
       isTerminalTaskStatus,
       taskFilePath,
       writeAtomic,
+      persistTaskOwnership: (task) => persistTaskOwnership(teamName, task, cwd),
     });
   });
 }
@@ -1957,6 +2096,7 @@ export async function reclaimExpiredTaskClaim(
       isTerminalTaskStatus,
       taskFilePath,
       writeAtomic,
+      persistTaskOwnership: (task) => persistTaskOwnership(teamName, task, cwd),
     });
   });
 }
@@ -1982,80 +2122,174 @@ async function readMailbox(teamName: string, workerName: string, cwd: string): P
       const bridge = getDefaultBridge(resolveBridgeStateDir(cwd));
       const compat = bridge.readCompatFile<{ records?: unknown[] }>('mailbox.json');
       if (compat) {
+        const bridgeRecords = bridge.readMailboxRecords();
+        const legacyMessageIds = needsLegacyMailboxEvidence(teamName, workerName, legacyMailbox, bridgeRecords)
+          ? await readLegacyMailboxMessageIds(teamName, workerName, legacyMailbox, teamEventLogPath(teamName, cwd), bridgeRecords)
+          : new Set<string>();
         const legacyById = new Map(
           legacyMailbox.messages
             .filter((message) => typeof message.message_id === 'string' && message.message_id !== '')
             .map((message) => [message.message_id, message]),
         );
-        const bridgeMessages = bridge.readMailboxRecords()
-          .filter((record) => record.to_worker === workerName)
-          .map((record) => {
-            const normalized = normalizeBridgeMailboxMessage(record);
-            if (!normalized.body) {
-              const legacyMessage = legacyById.get(normalized.message_id);
-              if (legacyMessage?.body) return { ...normalized, body: legacyMessage.body };
-            }
-            return normalized;
-          });
-        return { worker: workerName, messages: bridgeMessages };
+        const bridgeMessages = bridgeRecords
+          .filter((record) => mailboxRecordBelongsToTeam(record, teamName, workerName, legacyMessageIds))
+          .map((record) => normalizeBridgeMailboxMessage(record,
+            legacyMessageIds.has(record.message_id) ? legacyById.get(record.message_id) : undefined));
+        const bridgeTeamIds = new Set(bridgeRecords
+          .filter((record) => mailboxRecordBelongsToTeam(record, teamName, workerName, legacyMessageIds))
+          .map((record) => record.message_id));
+        const fallbackMessages = legacyMailbox.messages.filter((message) => legacyMessageIds.has(message.message_id)
+          && !bridgeTeamIds.has(message.message_id));
+        return { worker: workerName, messages: [...bridgeMessages, ...fallbackMessages] };
       }
     } catch {
       // fall through to legacy file fallback
     }
   }
 
-  return legacyMailbox;
+  const ids = legacyMailbox.messages.length > 0
+    ? await readLegacyMailboxMessageIds(teamName, workerName, legacyMailbox, teamEventLogPath(teamName, cwd))
+    : new Set<string>();
+  return { worker: workerName, messages: legacyMailbox.messages.filter((message) => ids.has(message?.message_id)) };
 }
 
 async function readLegacyMailbox(teamName: string, workerName: string, cwd: string): Promise<TeamMailbox> {
   const p = mailboxPath(teamName, workerName, cwd);
   try {
-    if (!existsSync(p)) return { worker: workerName, messages: [] };
     const raw = await readFile(p, 'utf8');
     const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== 'object') return { worker: workerName, messages: [] };
+    if (!parsed || typeof parsed !== 'object') throw new Error(`Invalid team mailbox: ${p}`);
     const v = parsed as { worker?: unknown; messages?: unknown };
-    if (v.worker !== workerName || !Array.isArray(v.messages)) return { worker: workerName, messages: [] };
+    if (v.worker !== workerName || !Array.isArray(v.messages)) throw new Error(`Invalid team mailbox: ${p}`);
     return { worker: workerName, messages: v.messages as TeamMailboxMessage[] };
-  } catch {
-    return { worker: workerName, messages: [] };
+  } catch (error) {
+    if (isErrnoException(error) && error.code === 'ENOENT') return { worker: workerName, messages: [] };
+    throw error;
   }
 }
 
-async function writeMailbox(teamName: string, mailbox: TeamMailbox, cwd: string): Promise<void> {
+async function writeMailbox(teamName: string, mailbox: TeamMailbox, cwd: string, replacedMessage?: TeamMailboxMessage): Promise<void> {
   const p = mailboxPath(teamName, mailbox.worker, cwd);
-  await writeAtomic(p, JSON.stringify(mailbox, null, 2));
+  const existing = await readLegacyMailbox(teamName, mailbox.worker, cwd);
+  if (replacedMessage) {
+    const index = existing.messages.findIndex((message) => mailboxMessageIdentity(message) === mailboxMessageIdentity(replacedMessage));
+    if (index >= 0) existing.messages.splice(index, 1);
+  }
+  const existingById = new Map(existing.messages.map((message) => [message?.message_id, message]));
+  const needsRecovery = mailbox.messages.some((message) => {
+    const previous = existingById.get(message?.message_id);
+    return previous && previous.created_at !== message.created_at && mailboxMessageContentMatches(previous, message);
+  });
+  const records = needsRecovery && isBridgeEnabled() ? getDefaultBridge(resolveBridgeStateDir(cwd)).readMailboxRecords() : [];
+  const recoverableIds = needsRecovery && isBridgeEnabled()
+    ? await readLegacyMailboxMessageIds(teamName, mailbox.worker, existing, teamEventLogPath(teamName, cwd),
+      records)
+    : new Set<string>();
+  const updates = new Map<string, TeamMailboxMessage[]>();
+  for (const incoming of mailbox.messages) {
+    const previous = existingById.get(incoming?.message_id);
+    const recovering = previous && mailboxMessageContentMatches(previous, incoming)
+      && (recoverableIds.has(incoming?.message_id) || hasUniqueScopedMailboxMatch(teamName, incoming, records, existing.messages));
+    const message = recovering ? { ...incoming, created_at: previous.created_at } : incoming;
+    const key = mailboxMessageIdentity(message);
+    const pending = recovering ? [] : updates.get(key) ?? [];
+    pending.push(message);
+    updates.set(key, pending);
+  }
+  // Match immutable content one row at a time, retaining colliding recovery rows.
+  const messages = existing.messages.map((message) => updates.get(mailboxMessageIdentity(message))?.shift() ?? message);
+  for (const pending of updates.values()) messages.push(...pending);
+  await writeAtomic(p, JSON.stringify({ ...mailbox, messages }, null, 2));
 }
 
-async function readDispatchRequests(teamName: string, cwd: string): Promise<TeamDispatchRequest[]> {
-  if (isBridgeEnabled()) {
-    try {
-      const bridge = getDefaultBridge(resolveBridgeStateDir(cwd));
-      const compat = bridge.readCompatFile<{ records?: unknown[] }>('dispatch.json');
-      if (compat) {
-        const nowIso = new Date().toISOString();
-        return bridge.readDispatchRecords()
-          .map((record) => normalizeBridgeDispatchRecord(teamName, record, nowIso))
-          .filter((record): record is TeamDispatchRequest => record !== null);
-      }
-    } catch {
-      // fall through to legacy file fallback
+export async function readDispatchRequests(
+  teamName: string, cwd: string, authoritativeRecords?: readonly DispatchRecord[],
+  stateDir = resolveBridgeStateDir(cwd),
+): Promise<TeamDispatchRequest[]> {
+  const nowIso = new Date().toISOString();
+  const path = dispatchRequestsPath(teamName, cwd, stateDir);
+  let local: TeamDispatchRequest[] = [];
+  let localReadError: unknown = null;
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+    if (Array.isArray(parsed)) {
+      local = parsed.map((entry) => normalizeDispatchRequestImpl(teamName, entry ?? {}, nowIso))
+        .filter((entry): entry is TeamDispatchRequest => entry !== null);
+    }
+  } catch (error: unknown) {
+    // Capture non-ENOENT errors; we may throw them later if no authoritative state exists.
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
+      localReadError = error;
+    }
+    /* Missing legacy state (ENOENT) or captured error has no requests in local. */
+  }
+  if (!isBridgeEnabled()) {
+    // If bridge is disabled and local read failed, that's an unrecoverable error.
+    if (localReadError) throw localReadError;
+    return local;
+  }
+  if (!hasRuntimeAuthority(stateDir)) {
+    // If we have no runtime authority and local read failed, that's unrecoverable.
+    if (localReadError) throw localReadError;
+    return local;
+  }
+  const compat = authoritativeRecords !== undefined ? { records: authoritativeRecords } : getDefaultBridge(stateDir).readCompatFile<{ records?: DispatchRecord[] }>('dispatch.json');
+  if (compat === null && localReadError) {
+    // Unable to read authoritative dispatch records and local read also failed; propagate as retryable.
+    throw localReadError;
+  }
+  const records = compat?.records;
+  const authoritative = (Array.isArray(records) && records.every(isStrictDispatchRecord) ? records : [])
+    .map((record) => normalizeBridgeDispatchRecord(teamName, record, nowIso))
+    .filter((entry): entry is TeamDispatchRequest => entry !== null);
+  const localById = new Map(local.map((request) => [request.request_id, request]));
+  const receipts = new Map<string, Set<TeamDispatchRequestStatus>>();
+  const journal = join(stateDir, 'team', teamName, 'dispatch', 'runtime-finalizations.jsonl');
+  const finalizations = await readFile(journal, 'utf8').catch((error: unknown) => {
+    if (isErrnoException(error) && error.code === 'ENOENT') return '';
+    throw error;
+  });
+  for (const command of parseRuntimeFinalizationJournal(finalizations)) {
+    const status = command.command === 'MarkNotified' ? 'notified'
+      : command.command === 'MarkDelivered' ? 'delivered' : command.command === 'MarkFailed' ? 'failed' : null;
+    if (status && typeof command.request_id === 'string') {
+      const states = receipts.get(command.request_id) ?? new Set<TeamDispatchRequestStatus>();
+      states.add(status);
+      receipts.set(command.request_id, states);
     }
   }
-
-  const path = dispatchRequestsPath(teamName, cwd);
-  try {
-    if (!existsSync(path)) return [];
-    const raw = await readFile(path, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (!Array.isArray(parsed)) return [];
-    const nowIso = new Date().toISOString();
-    return parsed
-      .map((entry) => normalizeDispatchRequestImpl(teamName, (entry ?? {}) as Partial<TeamDispatchRequest>, nowIso))
-      .filter((entry): entry is TeamDispatchRequest => entry !== null);
-  } catch {
-    return [];
-  }
+  const merged = authoritative.map((request) => {
+    const shadow = localById.get(request.request_id);
+    if (!shadow || shadow.to_worker !== request.to_worker || shadow.kind !== request.kind
+      || shadow.trigger_message !== request.trigger_message) return request;
+    const localMetadata = {
+      attempt_count: Math.max(request.attempt_count, shadow.attempt_count),
+      ...(request.status === shadow.status ? { last_reason: shadow.last_reason ?? request.last_reason, updated_at: shadow.updated_at } : {}),
+    };
+    if (request.status === 'delivered' || request.status === 'failed') return { ...request, ...localMetadata };
+    // Only durable runtime receipts may overlay lifecycle state; retry metadata stays Team-local.
+    if (receipts.get(request.request_id)?.has(shadow.status)) return {
+      ...request,
+      status: shadow.status,
+      attempt_count: Math.max(request.attempt_count, shadow.attempt_count),
+      updated_at: shadow.updated_at,
+      notified_at: shadow.notified_at,
+      delivered_at: shadow.delivered_at,
+      failed_at: shadow.failed_at,
+      last_reason: shadow.last_reason,
+    };
+    return {
+      ...request,
+      ...localMetadata,
+    };
+  });
+  const authoritativeIds = new Set(authoritative.map((request) => request.request_id));
+  // Identify unmatched legacy-json candidates first to avoid loading the ledger in the common authoritative-only case
+  const unmatchedFallbacks = local.filter((request) => request.creation_transport === 'legacy-json'
+    && !authoritativeIds.has(request.request_id));
+  if (unmatchedFallbacks.length === 0) return merged;
+  const runtimeIds = loadRuntimeDispatchIdentitySet(stateDir);
+  return [...merged, ...unmatchedFallbacks.filter((request) => !runtimeIds?.has(request.request_id))];
 }
 
 /** Read only strictly recognized target-team legacy request records for rollback scoping. */
@@ -2096,60 +2330,14 @@ async function readLegacyDispatchRequestsForRollback(teamName: string, cwd: stri
     }
     return raw as TeamDispatchRequest[];
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (isErrnoException(error) && error.code === 'ENOENT') return [];
     throw error;
   }
 }
 
 async function writeDispatchRequests(teamName: string, requests: TeamDispatchRequest[], cwd: string): Promise<void> {
   await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(requests, null, 2));
-  await writeBridgeDispatchCompat(teamName, requests, cwd);
 }
-
-function serializeDispatchRequestToBridgeRecord(request: TeamDispatchRequest): DispatchRecord {
-  return {
-    request_id: request.request_id,
-    target: request.to_worker,
-    status: request.status,
-    created_at: request.created_at,
-    notified_at: request.notified_at ?? null,
-    delivered_at: request.delivered_at ?? null,
-    failed_at: request.failed_at ?? null,
-    reason: request.last_reason ?? null,
-    metadata: {
-      kind: request.kind,
-      team_name: request.team_name,
-      worker_index: request.worker_index,
-      pane_id: request.pane_id,
-      trigger_message: request.trigger_message,
-      intent: request.intent,
-      message_id: request.message_id,
-      inbox_correlation_key: request.inbox_correlation_key,
-      transport_preference: request.transport_preference,
-      fallback_allowed: request.fallback_allowed,
-      attempt_count: request.attempt_count,
-    },
-  };
-}
-
-async function writeBridgeDispatchCompat(teamName: string, requests: TeamDispatchRequest[], cwd: string): Promise<void> {
-  if (!isBridgeEnabled()) return;
-  const stateDir = resolveBridgeStateDir(cwd);
-  const path = join(stateDir, 'dispatch.json');
-  const existing = getDefaultBridge(stateDir).readCompatFile<{ records?: DispatchRecord[] }>('dispatch.json');
-  const otherRecords = Array.isArray(existing?.records)
-    ? existing.records.filter((record) => {
-      const metadata = record?.metadata && typeof record.metadata === 'object'
-        ? record.metadata as Record<string, unknown>
-        : {};
-      const metadataTeam = typeof metadata.team_name === 'string' ? metadata.team_name.trim() : '';
-      return metadataTeam !== teamName;
-    })
-    : [];
-  const records = [...otherRecords, ...requests.map(serializeDispatchRequestToBridgeRecord)];
-  await writeAtomic(path, JSON.stringify({ records }, null, 2));
-}
-
 
 export function resolveDispatchLockTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   return resolveDispatchLockTimeoutMsImpl(env);
@@ -2171,6 +2359,7 @@ export async function removeDispatchRequestsForWorkers(
     // and other-team records can share a target worker name. This team's legacy
     // file is the canonical rollback scope.
     const requests = await readLegacyDispatchRequestsForRollback(teamName, cwd);
+    const retained = requests.filter((request) => !names.has(request.to_worker));
     const legacyRequestIds = requests
       .filter((request) => names.has(request.to_worker))
       .map((request) => request.request_id);
@@ -2178,19 +2367,35 @@ export async function removeDispatchRequestsForWorkers(
     if (isBridgeEnabled()) {
       const stateDir = resolveBridgeStateDir(cwd);
       const bridge = getDefaultBridge(stateDir);
+      const compat = bridge.readCompatFile<{ records?: unknown[] }>('dispatch.json');
+      const compatPath = join(stateDir, 'dispatch.json');
+      if (legacyRequestIds.length === 0
+        && !hasRuntimeAuthority(stateDir)
+        && (!existsSync(compatPath) || (Array.isArray(compat?.records) && compat.records.length === 0))) {
+        await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(requests, null, 2));
+        return;
+      }
       const snapshot = bridge.execCommand({ command: 'CaptureSnapshot' });
       if (snapshot.event !== 'SnapshotCaptured') {
         throw new Error(`authoritative_dispatch_rollback_discovery_failed:${[...names].join(',')}`);
       }
-      const scopedAuthoritativeIds = bridge.readDispatchRecordsStrict()
+      const authoritativeRecords = snapshot.dispatch_records === undefined ? bridge.readDispatchRecordsStrict() : snapshot.dispatch_records;
+      if (!Array.isArray(authoritativeRecords) || !authoritativeRecords.every(isStrictDispatchRecord)) {
+        throw new Error(`authoritative_dispatch_rollback_discovery_failed:${[...names].join(',')}`);
+      }
+      const authoritativeIds = new Set(authoritativeRecords.map((record) => record.request_id));
+      const scopedAuthoritativeIds = authoritativeRecords
         .filter((record) => {
           const metadataTeam = typeof record.metadata?.team_name === 'string' ? record.metadata.team_name : '';
           return metadataTeam === teamName && names.has(record.target);
         })
         .map((record) => record.request_id);
-      removedRequestIds = [...new Set([...legacyRequestIds, ...scopedAuthoritativeIds])];
+      removedRequestIds = [...new Set([
+        ...legacyRequestIds.filter((id) => authoritativeIds.has(id)),
+        ...scopedAuthoritativeIds,
+      ])];
       if (removedRequestIds.length === 0) {
-        await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(requests, null, 2));
+        await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(retained, null, 2));
         return;
       }
       const removal = bridge.removeDispatchRecords(removedRequestIds);
@@ -2207,16 +2412,15 @@ export async function removeDispatchRequestsForWorkers(
       if (verificationSnapshot.event !== 'SnapshotCaptured') {
         throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
-      const remainingRemovedRecord = bridge.readDispatchRecordsStrict()
-        .some((record) => removedRequestIds.includes(record.request_id));
-      if (remainingRemovedRecord) {
+      const remaining = verificationSnapshot.dispatch_records === undefined ? bridge.readDispatchRecordsStrict() : verificationSnapshot.dispatch_records;
+      if (!Array.isArray(remaining) || !remaining.every(isStrictDispatchRecord)
+        || remaining.some((record) => removedRequestIds.includes(record.request_id))) {
         throw new Error(`authoritative_dispatch_rollback_verification_failed:${[...names].join(',')}`);
       }
     }
     // The legacy per-team request file is compatibility output only. Update it
     // only after the authoritative runtime confirms removal; never regenerate
     // the shared bridge dispatch.json from a local snapshot during rollback.
-    const retained = requests.filter((request) => !names.has(request.to_worker));
     await writeAtomic(dispatchRequestsPath(teamName, cwd), JSON.stringify(retained, null, 2));
   });
 }
@@ -2312,6 +2516,22 @@ export async function markDispatchRequestDelivered(
   });
 }
 
+export async function markDispatchRequestFailed(
+  teamName: string,
+  requestId: string,
+  reason: string,
+  cwd: string,
+): Promise<void> {
+  await markDispatchRequestFailedImpl(requestId, reason, {
+    teamName,
+    cwd,
+    validateWorkerName,
+    withDispatchLock,
+    readDispatchRequests,
+    writeDispatchRequests,
+  });
+}
+
 export async function sendDirectMessage(
   teamName: string,
   fromWorker: string,
@@ -2319,7 +2539,7 @@ export async function sendDirectMessage(
   body: string,
   cwd: string
 ): Promise<TeamMailboxMessage> {
-  return await sendDirectMessageImpl(fromWorker, toWorker, body, {
+  return await withTeamTaskBarrier(teamName, cwd, async () => await sendDirectMessageImpl(fromWorker, toWorker, body, {
     teamName,
     cwd,
     withMailboxLock,
@@ -2328,7 +2548,7 @@ export async function sendDirectMessage(
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,
-  });
+  }));
 }
 
 export async function broadcastMessage(
@@ -2337,7 +2557,7 @@ export async function broadcastMessage(
   body: string,
   cwd: string
 ): Promise<TeamMailboxMessage[]> {
-  return await broadcastMessageImpl(fromWorker, body, {
+  return await withTeamTaskBarrier(teamName, cwd, async () => await broadcastMessageImpl(fromWorker, body, {
     teamName,
     cwd,
     withMailboxLock,
@@ -2346,7 +2566,7 @@ export async function broadcastMessage(
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,
-  });
+  }));
 }
 
 export async function markMessageDelivered(
@@ -2400,6 +2620,141 @@ export async function listMailboxMessages(
     appendTeamEvent,
     readTeamConfig,
   });
+}
+
+/** Retire only mailbox messages proven by this Team's per-target compatibility shadows. */
+export async function retireTeamMailboxMessages(
+  teamName: string,
+  workerNames: readonly string[],
+  cwd: string,
+): Promise<number> {
+  let retired = 0;
+  const targets = new Set(workerNames);
+  try {
+    for (const entry of await readdir(join(teamDir(teamName, cwd), 'mailbox'))) {
+      if (!entry.endsWith('.json')) continue;
+      const workerName = entry.slice(0, -'.json'.length);
+      if (WORKER_NAME_SAFE_PATTERN.test(workerName)) targets.add(workerName);
+    }
+  } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') throw error;
+  }
+  if (isBridgeEnabled()) {
+    const stateDir = resolveBridgeStateDir(cwd);
+    if (['events.json', 'snapshot.json', 'mailbox.json', 'dispatch-seen.json'].some((name) => existsSync(join(stateDir, name)))) {
+      const bridge = getDefaultBridge(stateDir);
+      // Creations can outlive both their projection and their per-Team shadow.
+      try { bridge.execCommand({ command: 'CaptureSnapshot' }); } catch (error) {
+        throw new Error('authoritative_mailbox_retirement_discovery_failed', { cause: error });
+      }
+      for (const record of bridge.readMailboxRecords()) {
+        if (record?.team_name !== teamName) continue;
+        if (typeof record.to_worker !== 'string' || !WORKER_NAME_SAFE_PATTERN.test(record.to_worker)) {
+          throw new Error('authoritative_mailbox_retirement_discovery_failed');
+        }
+        targets.add(record.to_worker);
+      }
+    }
+  }
+  for (const workerName of targets) {
+    await withMailboxLock(teamName, workerName, cwd, async () => {
+      const mailbox = await readLegacyMailbox(teamName, workerName, cwd);
+      if (isBridgeEnabled()) {
+        const stateDir = resolveBridgeStateDir(cwd);
+        const bridge = getDefaultBridge(stateDir);
+        const compatPath = join(stateDir, 'mailbox.json');
+        const compat = bridge.readCompatFile<{ records?: unknown[] }>('mailbox.json');
+        if (!existsSync(compatPath) && mailbox.messages.length === 0) return;
+        if (!existsSync(compatPath) || !Array.isArray(compat?.records)) {
+          throw new Error('authoritative_mailbox_retirement_discovery_failed');
+        }
+        const bridgeRecords = bridge.readMailboxRecords();
+        if (bridgeRecords.some((record) => !record
+          || typeof record.message_id !== 'string'
+          || typeof record.from_worker !== 'string'
+          || typeof record.to_worker !== 'string'
+          || typeof record.body !== 'string'
+          || typeof record.created_at !== 'string'
+          || (record.team_name != null && (typeof record.team_name !== 'string' || !TEAM_NAME_SAFE_PATTERN.test(record.team_name)))
+          || (record.notified_at !== null && typeof record.notified_at !== 'string')
+          || (record.delivered_at !== null && typeof record.delivered_at !== 'string'))) {
+          throw new Error('authoritative_mailbox_retirement_discovery_failed');
+        }
+        const legacyMessageIds = mailbox.messages.length > 0
+          ? await readLegacyMailboxMessageIds(teamName, workerName, mailbox, teamEventLogPath(teamName, cwd), bridgeRecords)
+          : new Set<string>();
+        const bridgeTeamIds = new Set(bridgeRecords
+          .filter((record) => mailboxRecordBelongsToTeam(record, teamName, workerName, legacyMessageIds))
+          .map((record) => record.message_id));
+        const unproven = mailbox.messages.filter((message) => !message.delivered_at && !bridgeTeamIds.has(message.message_id) && !legacyMessageIds.has(message.message_id));
+        if (unproven.length > 0) {
+          throw new Error(`authoritative_mailbox_retirement_discovery_failed:${unproven.map((message) => message.message_id).join(',')}`);
+        }
+        let changed = false;
+        let retiredFromMailbox = 0;
+        for (const authoritative of bridgeRecords) {
+          if (!mailboxRecordBelongsToTeam(authoritative, teamName, workerName, legacyMessageIds)) continue;
+          const normalized = normalizeBridgeMailboxMessage(authoritative, legacyMessageIds.has(authoritative.message_id)
+            ? mailbox.messages.find((entry) => entry.message_id === authoritative.message_id) : undefined);
+          const uniqueScopedMatch = hasUniqueScopedMailboxMatch(teamName, normalized, bridgeRecords, mailbox.messages);
+          let message = mailbox.messages.find((entry) => mailboxMessageIdentity(entry) === mailboxMessageIdentity(normalized)
+            || ((legacyMessageIds.has(authoritative.message_id) || uniqueScopedMatch) && mailboxMessageContentMatches(entry, normalized)));
+          if (!message) {
+            message = normalized;
+            mailbox.messages.push(message);
+            changed = true;
+          }
+          if (!authoritative.delivered_at) {
+            const event = bridge.execCommand({ command: 'MarkMailboxDelivered', team_name: teamName, message_id: message.message_id });
+            if (event.event !== 'MailboxDelivered' || event.message_id !== message.message_id) {
+              throw new Error(`authoritative_mailbox_retirement_failed:${message.message_id}`);
+            }
+          }
+          const verified = bridge.readMailboxRecords().find((record) => record.message_id === message.message_id
+            && mailboxRecordBelongsToTeam(record, teamName, workerName, legacyMessageIds));
+          if (!verified?.delivered_at) {
+            throw new Error(`authoritative_mailbox_retirement_verification_failed:${message.message_id}`);
+          }
+          if (!message.delivered_at) {
+            message.delivered_at = new Date().toISOString();
+            changed = true;
+            retiredFromMailbox += 1;
+          }
+        }
+        for (const message of mailbox.messages) {
+          if (!message.delivered_at && !bridgeTeamIds.has(message.message_id) && legacyMessageIds.has(message.message_id)) {
+            message.delivered_at = new Date().toISOString();
+            changed = true;
+            retiredFromMailbox += 1;
+          }
+        }
+        if (changed) {
+          await writeMailbox(teamName, mailbox, cwd);
+          retired += retiredFromMailbox;
+        }
+        const unresolved = mailbox.messages.filter((message) => !message.delivered_at);
+        if (unresolved.length > 0) {
+          throw new Error(`authoritative_mailbox_retirement_discovery_failed:${unresolved.map((message) => message.message_id).join(',')}`);
+        }
+        return;
+      }
+
+      const legacyMessageIds = mailbox.messages.length > 0
+        ? await readLegacyMailboxMessageIds(teamName, workerName, mailbox, teamEventLogPath(teamName, cwd))
+        : new Set<string>();
+      const pending = mailbox.messages.filter((message) => !message.delivered_at);
+      if (pending.length === 0) return;
+      const unproven = pending.filter((message) => !legacyMessageIds.has(message.message_id));
+      if (unproven.length > 0) {
+        throw new Error(`authoritative_mailbox_retirement_discovery_failed:${unproven.map((message) => message.message_id).join(',')}`);
+      }
+      const deliveredAt = new Date().toISOString();
+      for (const message of pending) message.delivered_at = deliveredAt;
+      await writeMailbox(teamName, mailbox, cwd);
+      retired += pending.length;
+    });
+  }
+  return retired;
 }
 
 export async function writeTaskApproval(
@@ -2482,7 +2837,7 @@ export async function readShutdownAck(
     }
     return parsed;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    if (isErrnoException(error) && error.code === 'ENOENT') return null;
     return null;
   }
 }
@@ -2492,6 +2847,9 @@ export async function readShutdownAck(
 export interface TeamWorkerIntegrationState {
   last_seen_head?: string;
   last_integrated_head?: string;
+  delivery_leader_commit?: string;
+  pending_rebase_leader_head?: string;
+  rebase_error?: string;
   last_leader_head?: string;
   last_rebased_leader_head?: string;
   status?: TeamWorkerIntegrationStatus;
@@ -2685,15 +3043,15 @@ async function deriveLeaderStopAttentionState(
 >> {
   const [config, tasks, snapshot, mailbox] = await Promise.all([
     readTeamConfig(teamName, cwd),
-    listTasks(teamName, cwd).catch(() => [] as TeamTask[]),
+    listTasks(teamName, cwd).catch(() => null),
     readMonitorSnapshot(teamName, cwd),
     listMailboxMessages(teamName, 'leader-fixed', cwd).catch(() => [] as TeamMailboxMessage[]),
   ]);
 
-  const pendingCount = tasks.filter((task) => task.status === 'pending').length;
-  const blockedCount = tasks.filter((task) => task.status === 'blocked').length;
-  const inProgressCount = tasks.filter((task) => task.status === 'in_progress').length;
-  const workRemaining = pendingCount + blockedCount + inProgressCount > 0;
+  const pendingCount = tasks?.filter((task) => task.status === 'pending').length ?? 0;
+  const blockedCount = tasks?.filter((task) => task.status === 'blocked').length ?? 0;
+  const inProgressCount = tasks?.filter((task) => task.status === 'in_progress').length ?? 0;
+  const workRemaining = tasks === null || pendingCount + blockedCount + inProgressCount > 0;
 
   const workerNames = config?.workers.map((worker) => worker.name) ?? Object.keys(snapshot?.workerStateByName ?? {});
   const workerStates = workerNames
@@ -2704,19 +3062,23 @@ async function deriveLeaderStopAttentionState(
     && workerStates.every((state) => state === 'idle' || state === 'done');
 
   const leaderDecisionState: TeamLeaderDecisionState =
-    pendingCount === 0 && blockedCount === 0 && inProgressCount === 0 && allWorkersIdle
-      ? 'done_waiting_on_leader'
-      : blockedCount > 0 && pendingCount === 0 && inProgressCount === 0 && allWorkersIdle
-        ? 'stuck_waiting_on_leader'
-        : existing?.leader_decision_state ?? 'still_actionable';
+    tasks === null
+      ? 'still_actionable'
+      : pendingCount === 0 && blockedCount === 0 && inProgressCount === 0 && allWorkersIdle
+        ? 'done_waiting_on_leader'
+        : blockedCount > 0 && pendingCount === 0 && inProgressCount === 0 && allWorkersIdle
+          ? 'stuck_waiting_on_leader'
+          : existing?.leader_decision_state ?? 'still_actionable';
 
   const unreadLeaderMessageCount = mailbox.filter((message) => {
     const deliveredAt = typeof message.delivered_at === 'string' ? message.delivered_at.trim() : '';
     return deliveredAt.length === 0;
   }).length;
   const attentionReasons = new Set(existing?.attention_reasons ?? []);
+  if (tasks === null) attentionReasons.add('task_state_unavailable');
   const leaderAttentionPending =
-    leaderDecisionState !== 'still_actionable'
+    tasks === null
+    || leaderDecisionState !== 'still_actionable'
     || unreadLeaderMessageCount > 0
     || existing?.leader_attention_pending === true;
   if (leaderAttentionPending) {

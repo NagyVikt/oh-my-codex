@@ -7,11 +7,13 @@ import {
   teamReadDispatchRequest as readDispatchRequest,
   teamTransitionDispatchRequest as transitionDispatchRequest,
   teamMarkDispatchRequestNotified as markDispatchRequestNotified,
+  teamMarkDispatchRequestFailed as markDispatchRequestFailed,
   type TeamDispatchRequest,
   type TeamDispatchRequestInput,
 } from './team-ops.js';
 import { appendTeamDeliveryLogForCwd } from './delivery-log.js';
 import type { TeamReminderIntent } from './reminder-intents.js';
+import { withTeamTaskBarrier } from './state.js';
 
 export interface TeamNotifierTarget {
   workerName: string;
@@ -19,7 +21,7 @@ export interface TeamNotifierTarget {
   paneId?: string;
 }
 
-export type DispatchTransport = 'hook' | 'prompt_stdin' | 'tmux_send_keys' | 'mailbox' | 'none';
+export type DispatchTransport = 'hook' | 'prompt_stdin' | 'tmux_send_keys' | 'herdr_prompt' | 'mailbox' | 'none';
 
 export interface DispatchOutcome {
   ok: boolean;
@@ -100,27 +102,16 @@ async function markImmediateDispatchFailure(params: {
   teamName: string;
   request: TeamDispatchRequest;
   reason: string;
-  messageId?: string;
   cwd: string;
 }): Promise<void> {
-  const { teamName, request, reason, messageId, cwd } = params;
+  const { teamName, request, reason, cwd } = params;
   if (request.transport_preference === 'hook_preferred_with_fallback') return;
 
   const current = await readDispatchRequest(teamName, request.request_id, cwd);
   if (!current) return;
   if (current.status === 'failed' || current.status === 'notified' || current.status === 'delivered') return;
 
-  await transitionDispatchRequest(
-    teamName,
-    request.request_id,
-    current.status,
-    'failed',
-    {
-      message_id: messageId ?? current.message_id,
-      last_reason: reason,
-    },
-    cwd,
-  ).catch(() => {});
+  await markDispatchRequestFailed(teamName, request.request_id, reason, cwd);
 }
 
 async function markLeaderPaneMissingDeferred(params: {
@@ -147,12 +138,11 @@ async function markLeaderPaneMissingDeferred(params: {
   ).catch(() => {});
 }
 
-interface QueueInboxParams {
+interface QueueInboxNotificationParams {
   teamName: string;
   workerName: string;
   workerIndex: number;
   paneId?: string;
-  inbox: string;
   triggerMessage: string;
   intent?: TeamReminderIntent;
   cwd: string;
@@ -162,8 +152,13 @@ interface QueueInboxParams {
   notify: TeamNotifier;
 }
 
-export async function queueInboxInstruction(params: QueueInboxParams): Promise<DispatchOutcome> {
+export async function queueInboxInstruction(params: QueueInboxNotificationParams & { inbox: string }): Promise<DispatchOutcome> {
   await writeWorkerInbox(params.teamName, params.workerName, params.inbox, params.cwd);
+  return await queueInboxNotification(params);
+}
+
+// Startup has already published its inbox before providers can execute.
+export async function queueInboxNotification(params: QueueInboxNotificationParams): Promise<DispatchOutcome> {
   const queued = await enqueueDispatchRequest(
     params.teamName,
     {
@@ -247,6 +242,7 @@ interface QueueDirectMessageParams {
 }
 
 export async function queueDirectMailboxMessage(params: QueueDirectMessageParams): Promise<DispatchOutcome> {
+  return await withTeamTaskBarrier(params.teamName, params.cwd, async () => {
   const message = await sendDirectMessage(params.teamName, params.fromWorker, params.toWorker, params.body, params.cwd);
   if (message.notified_at && !message.delivered_at) {
     const outcome = {
@@ -332,19 +328,18 @@ export async function queueDirectMailboxMessage(params: QueueDirectMessageParams
     return outcome;
   }
   if (isConfirmedNotification(outcome)) {
-    await markMessageNotified(params.teamName, params.toWorker, message.message_id, params.cwd);
     await markDispatchRequestNotified(
       params.teamName,
       queued.request.request_id,
       { message_id: message.message_id, last_reason: outcome.reason },
       params.cwd,
     );
+    await markMessageNotified(params.teamName, params.toWorker, message.message_id, params.cwd);
   } else {
     await markImmediateDispatchFailure({
       teamName: params.teamName,
       request: queued.request,
       reason: outcome.reason,
-      messageId: message.message_id,
       cwd: params.cwd,
     });
   }
@@ -361,6 +356,7 @@ export async function queueDirectMailboxMessage(params: QueueDirectMessageParams
     transportPreference: params.transportPreference,
   });
   return outcome;
+  });
 }
 
 interface QueueBroadcastParams {
@@ -377,6 +373,7 @@ interface QueueBroadcastParams {
 }
 
 export async function queueBroadcastMailboxMessage(params: QueueBroadcastParams): Promise<DispatchOutcome[]> {
+  return await withTeamTaskBarrier(params.teamName, params.cwd, async () => {
   const messages = await broadcastMessage(params.teamName, params.fromWorker, params.body, params.cwd);
   const recipientByName = new Map(params.recipients.map((r) => [r.workerName, r]));
   const outcomes: DispatchOutcome[] = [];
@@ -432,19 +429,18 @@ export async function queueBroadcastMailboxMessage(params: QueueBroadcastParams)
     outcomes.push(outcome);
 
     if (isConfirmedNotification(outcome)) {
-      await markMessageNotified(params.teamName, recipient.workerName, message.message_id, params.cwd);
       await markDispatchRequestNotified(
         params.teamName,
         queued.request.request_id,
         { message_id: message.message_id, last_reason: outcome.reason },
         params.cwd,
       );
+      await markMessageNotified(params.teamName, recipient.workerName, message.message_id, params.cwd);
     } else {
       await markImmediateDispatchFailure({
         teamName: params.teamName,
         request: queued.request,
         reason: outcome.reason,
-        messageId: message.message_id,
         cwd: params.cwd,
       });
     }
@@ -463,6 +459,7 @@ export async function queueBroadcastMailboxMessage(params: QueueBroadcastParams)
   }
 
   return outcomes;
+  });
 }
 
 export async function waitForDispatchReceipt(

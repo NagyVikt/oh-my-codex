@@ -1,8 +1,10 @@
 import { spawnSync, execFile } from 'child_process';
+
+import { readMultiplexerConfig } from '../config/multiplexer.js';
 import { promisify } from 'util';
-import { closeSync, chmodSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { closeSync, chmodSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import {
@@ -20,6 +22,7 @@ import {
   normalizeTmuxCapture as sharedNormalizeTmuxCapture,
   paneHasActiveTask as sharedPaneHasActiveTask,
   paneIsBootstrapping as sharedPaneIsBootstrapping,
+  paneHasTrustPrompt,
   paneShowsCodexViewport as sharedPaneShowsCodexViewport,
   paneLooksReady as sharedPaneLooksReady,
 } from '../scripts/tmux-hook-engine.js';
@@ -34,11 +37,11 @@ import {
 import { sleep, sleepSync } from '../utils/sleep.js';
 import {
   buildPlatformCommandSpec,
-  classifySpawnError,
   resolveCommandPathForPlatform,
   spawnPlatformCommandSync,
 } from '../utils/platform-command.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
+import { isUnsupportedWindowsSync, syncFileDescriptorSync } from '../utils/file-durability.js';
 import { readExactPaneProof, readExactPaneProofsSync, readExactPaneProofSync, type ExactPaneProof } from './exact-pane.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
@@ -110,7 +113,11 @@ export class CreateTeamSessionPartialError extends Error {
     /** Cleanup commands that failed after resources were created and must be retried. */
     readonly cleanupErrors: string[] = [],
   ) {
-    super('create_team_session_cleanup_incomplete');
+    super(
+      `create_team_session_cleanup_incomplete: ${originalError instanceof Error ? originalError.message : String(originalError)}`
+        + (cleanupErrors.length > 0 ? `; cleanup: ${cleanupErrors.join('; ')}` : ''),
+      { cause: originalError },
+    );
     this.name = 'CreateTeamSessionPartialError';
   }
 }
@@ -209,7 +216,7 @@ const OMX_TEAM_STATE_ROOT_ENV = 'OMX_TEAM_STATE_ROOT';
 
 export type TeamWorkerCli = 'codex' | 'claude' | 'gemini';
 type TeamWorkerCliMode = 'auto' | TeamWorkerCli;
-export type TeamWorkerLaunchMode = 'interactive' | 'prompt';
+export type TeamWorkerLaunchMode = 'interactive' | 'prompt' | 'herdr';
 
 export interface WorkerSubmitPlan {
   shouldInterrupt: boolean;
@@ -254,7 +261,7 @@ function runTmux(args: string[], preserveStdout = false): { ok: true; stdout: st
 export function parseSplitWindowPaneId(stdout: string, expectedReceipt?: string): string | null {
   const match = expectedReceipt === undefined
     ? /^(%\d+)(?:\r?\n)?$/.exec(stdout)
-    : /^(%\d+)\t([^\r\n\t]+)(?:\r?\n)?$/.exec(stdout);
+    : /^(%\d+)(?::|\t)([^\r\n:\t]+)(?:\r?\n)?$/.exec(stdout);
   if (!match || (expectedReceipt !== undefined && match[2] !== expectedReceipt)) return null;
   return match[1];
 }
@@ -337,19 +344,43 @@ function sourceAuthorityPredicate(source: SourcePaneAuthority): string {
   ].reduce((combined, condition) => `#{&&:${combined},${condition}}`);
 }
 
+const SOURCE_TRANSACTION_RECEIPT_PATTERN = /^omx_source_[A-Za-z0-9_]+$/;
+const SPLIT_WINDOW_PANE_FORMAT = "-F '#{pane_id}'";
+
 function sourceTransactionReceipt(): string {
-  return `omx_source_${process.pid}_${Date.now()}_${randomBytes(16).toString('hex')}`;
+  const receipt = `omx_source_${process.pid}_${Date.now()}_${randomBytes(16).toString('hex')}`;
+  if (!SOURCE_TRANSACTION_RECEIPT_PATTERN.test(receipt)) {
+    throw new Error('tmux_source_transaction_receipt_invalid');
+  }
+  return receipt;
 }
 
-function bindSplitReceiptToPaneCommand(command: string, receipt: string): string {
-  return `${command} # ${receipt}`;
+export function bindSplitReceiptToPaneCommand(command: string, receipt: string): string {
+  // Receipt should be embedded at construction time (in buildWorkerStartupCommand for PowerShell,
+  // or directly in the command string for POSIX). This function is kept for backward compatibility.
+  // Always append the receipt as a comment if not already present.
+  if (!command.includes(`# ${receipt}`)) {
+    return `${command} # ${receipt}`;
+  }
+  return command;
+}
+
+export function bindSplitWindowReceiptFormat(effect: string, receipt: string): string {
+  if (!SOURCE_TRANSACTION_RECEIPT_PATTERN.test(receipt)) {
+    throw new Error('tmux_source_transaction_receipt_invalid');
+  }
+  const firstFormatIndex = effect.indexOf(SPLIT_WINDOW_PANE_FORMAT);
+  if (firstFormatIndex < 0 || effect.indexOf(SPLIT_WINDOW_PANE_FORMAT, firstFormatIndex + SPLIT_WINDOW_PANE_FORMAT.length) >= 0) {
+    throw new Error('tmux_split_window_format_contract_invalid');
+  }
+  return `${effect.slice(0, firstFormatIndex)}-F '#{pane_id}:${receipt}'${effect.slice(firstFormatIndex + SPLIT_WINDOW_PANE_FORMAT.length)}`;
 }
 
 /** Queue an effect in the source pane's tmux server only when its exact pane/session/window incarnation still matches. */
 export function runSourceAuthorizedTmux(source: SourcePaneAuthority, effect: string, receipt: string = sourceTransactionReceipt()): string {
   const result = runTmux([
     'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
-    `${effect} ; display-message -p ${shellQuoteSingle(receipt)}`,
+    `${effect} ; display-message -p ${shellQuoteSingle(receipt.replaceAll('#', '##'))}`,
     "display-message -p ''",
   ]);
   if (!result.ok) throw new Error(`tmux source authority transaction failed: ${result.stderr}`);
@@ -357,7 +388,23 @@ export function runSourceAuthorizedTmux(source: SourcePaneAuthority, effect: str
   return receipt;
 }
 
-function runSourceAuthorizedSplit(
+function paneHasReceipt(pane: { startCommand: string }, receipt: string): boolean {
+  // Check if receipt is directly in the command (POSIX shell case with comment)
+  if (pane.startCommand.includes(receipt)) {
+    return true;
+  }
+  // On Windows with PowerShell, the receipt is encoded inside the -EncodedCommand.
+  // Reuse the existing helper to decode and check if the receipt is inside.
+  const decodedCommands = decodePowerShellEncodedCommands(pane.startCommand);
+  for (const decoded of decodedCommands) {
+    if (decoded.includes(receipt)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function runSourceAuthorizedSplit(
   source: SourcePaneAuthority,
   buildEffect: (receipt: string) => string,
 ): string {
@@ -374,7 +421,7 @@ function runSourceAuthorizedSplit(
   const effect = buildEffect(receipt);
   const result = runTmux([
     'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
-    effect.replace("-F '#{pane_id}'", `-F '#{pane_id}\\t${receipt}'`),
+    bindSplitWindowReceiptFormat(effect, receipt),
     "display-message -p ''",
   ], true);
   if (!result.ok) throw new Error(`tmux source authority transaction failed: ${result.stderr}`);
@@ -384,7 +431,7 @@ function runSourceAuthorizedSplit(
     const newlyObservedPaneIds = afterTopology.error
       ? []
       : afterTopology.panes
-        .filter((pane) => !beforePaneIds.has(pane.paneId) && pane.startCommand.includes(receipt))
+        .filter((pane) => !beforePaneIds.has(pane.paneId) && paneHasReceipt(pane, receipt))
         .map((pane) => pane.paneId);
     throw new AmbiguousSplitWindowOutputError(newlyObservedPaneIds, afterTopology.error);
   }
@@ -439,11 +486,12 @@ function restoredHudCleanupDebtPath(cwd: string, stateRoot?: string | null): str
 function syncRestoredHudDebtParentSync(path: string): void {
   let descriptor: number | undefined;
   try {
+    // Windows can reject the directory open itself with EPERM, so the open and
+    // the fsync share one capability boundary.
     descriptor = openSync(dirname(path), 'r');
-    fsyncSync(descriptor);
+    syncFileDescriptorSync(descriptor);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (!(code === 'EPERM' && process.platform === 'win32')) throw error;
+    if (!isUnsupportedWindowsSync(error)) throw error;
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
@@ -464,7 +512,9 @@ function persistRestoredHudCleanupDebtSync(
   writeFileSync(temporaryPath, `${JSON.stringify(debt)}\n`, { mode: 0o600 });
   const temporaryDescriptor = openSync(temporaryPath, 'r');
   try {
-    fsyncSync(temporaryDescriptor);
+    // Windows reports EPERM for fsync on an otherwise valid handle; Team
+    // startup must degrade durability there rather than abort.
+    syncFileDescriptorSync(temporaryDescriptor);
   } finally {
     closeSync(temporaryDescriptor);
   }
@@ -785,7 +835,7 @@ function frozenWindowTopologyError(
   const unexpected = actual.filter((paneId) => !expectedPaneIds.has(paneId));
   const missing = expected.filter((paneId) => !actualPaneIds.has(paneId));
   return new Error(
-    `tmux window topology changed before layout mutation: target=${teamTarget}; expected=[${expected.join(',')}]; actual=[${actual.join(',')}]; unexpected=[${unexpected.join(',')}]; missing=[${missing.join(',')}]. Team requires an isolated tmux window with no host-owned foreign panes`,
+    `tmux window topology changed before layout mutation: target=${teamTarget}; expected=[${expected.join(',')}]; actual=[${actual.join(',')}]; unexpected=[${unexpected.join(',')}]; missing=[${missing.join(',')}]. Team requires an isolated tmux window with no host-owned foreign panes. Open a new tmux window (by default, Ctrl-b c), launch OMX there, and retry \`omx team\`.`,
   );
 }
 
@@ -1612,9 +1662,15 @@ export function resolveTeamWorkerLaunchMode(
   env: NodeJS.ProcessEnv = process.env,
 ): TeamWorkerLaunchMode {
   const raw = String(env[OMX_TEAM_WORKER_LAUNCH_MODE_ENV] ?? 'interactive').trim().toLowerCase();
-  if (raw === '' || raw === 'interactive') return 'interactive';
+  if (raw === 'herdr') return 'herdr';
+  if (raw === '' || raw === 'interactive') {
+    // Default interactive mode runs on tmux unless the multiplexer setting
+    // selects the Herdr runtime backend (issue #3241, Phase 2).
+    if (readMultiplexerConfig({ env }).backend === 'herdr') return 'herdr';
+    return 'interactive';
+  }
   if (raw === 'prompt') return 'prompt';
-  throw new Error(`Invalid ${OMX_TEAM_WORKER_LAUNCH_MODE_ENV} value "${env[OMX_TEAM_WORKER_LAUNCH_MODE_ENV]}". Expected: interactive, prompt`);
+  throw new Error(`Invalid ${OMX_TEAM_WORKER_LAUNCH_MODE_ENV} value "${env[OMX_TEAM_WORKER_LAUNCH_MODE_ENV]}". Expected: interactive, prompt, herdr`);
 }
 
 function extractModelOverride(args: string[]): string | null {
@@ -1807,11 +1863,8 @@ export function translateWorkerLaunchArgsForCli(
 }
 
 function commandExists(binary: string): boolean {
-  const { result } = spawnPlatformCommandSync(binary, ['--version'], { encoding: 'utf-8' });
-  if (result.error) {
-    return classifySpawnError(result.error as NodeJS.ErrnoException) !== 'missing';
-  }
-  return true;
+  // Launch wrappers may bootstrap profiles even for --version. Discovery must not execute them.
+  return resolveCommandPathForPlatform(binary) !== null;
 }
 
 export function trustWorkerMiseConfigIfAvailable(workerCwd: string): boolean {
@@ -1886,6 +1939,13 @@ export function scrubTeamWorkerHudOwnershipEnv<T extends Record<string, string |
   const scrubbed = { ...env };
   delete scrubbed[OMX_TMUX_HUD_OWNER_ENV];
   delete scrubbed[OMX_TMUX_HUD_LEADER_PANE_ENV];
+  // Issue #3629: the sentinel marks worker envs that must not carry a
+  // CODEX_HOME (project-derived homes are not exported to children);
+  // translate it into an explicit unset for the generated command.
+  if (scrubbed.CODEX_HOME_UNSET === '1') {
+    delete scrubbed.CODEX_HOME_UNSET;
+    delete scrubbed.CODEX_HOME;
+  }
   return scrubbed;
 }
 
@@ -2014,6 +2074,7 @@ export function buildWorkerStartupCommand(
   workerCliOverride?: TeamWorkerCli,
   initialPrompt?: string,
   workerRole?: string,
+  receipt?: string,
 ): string {
   const processSpec = buildWorkerStartupProcessLaunchSpec(
     teamName,
@@ -2049,15 +2110,15 @@ export function buildWorkerStartupCommand(
       .map(([key, value]) => `$env:${key} = ${quotePowerShellArg(value)}`)
       .join('; ');
     const invocation = ['&', quotePowerShellArg(processSpec.command), ...startupArgs.map(quotePowerShellArg)].join(' ');
-    const encodedCommand = encodePowerShellCommand(
-      [
-        "$ErrorActionPreference = 'Stop'",
-        pathBootstrap,
-        hudEnvUnset,
-        envAssignments,
-        invocation,
-      ].filter(Boolean).join('; '),
-    );
+    const scriptLines = [
+      "$ErrorActionPreference = 'Stop'",
+      pathBootstrap,
+      hudEnvUnset,
+      envAssignments,
+      invocation,
+    ].filter(Boolean);
+    const script = scriptLines.join('; ') + (receipt ? `; # ${receipt}` : '');
+    const encodedCommand = encodePowerShellCommand(script);
     return `${powershellPath} -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
   }
 
@@ -2075,7 +2136,8 @@ export function buildWorkerStartupCommand(
   const rcPrefix = shouldSourceTeamWorkerShellRc({ ...process.env, ...extraEnv }) && launchSpec.rcFile
     ? `if [ -f ${launchSpec.rcFile} ]; then source ${launchSpec.rcFile}; fi; `
     : '';
-  const inner = `${rcPrefix}${pathPrefix}${cliInvocation}`;
+  const receiptComment = receipt ? ` # ${receipt}` : '';
+  const inner = `${rcPrefix}${pathPrefix}${cliInvocation}${receiptComment}`;
   const envParts = Object.entries(startupEnv).map(([key, value]) => `${key}=${value}`);
   const unsetParts = ['-u', OMX_TMUX_HUD_OWNER_ENV, '-u', OMX_TMUX_HUD_LEADER_PANE_ENV];
 
@@ -2269,10 +2331,22 @@ function buildWorkerProcessLaunchSpecForMode(
       ? { [CODEX_SQLITE_HOME_ENV]: workerSqliteHomeOverride }
       : {}),
     ...codexProviderEnv,
+    // Issue #3629: when no child-safe CODEX_HOME is selected, mark the env for
+    // explicit clearing downstream so a stale ambient/tmux-server value cannot
+    // reach the worker; codex then falls back to the caller's own home.
+    ...(workerCli === 'codex' && !workerCodexHomeOverride ? { CODEX_HOME_UNSET: '1' } : {}),
   };
   for (const [key, value] of Object.entries(extraEnv)) {
     if (typeof value !== 'string' || value.trim() === '') continue;
     workerEnv[key] = value;
+  }
+  delete workerEnv.OMX_CODEX_LAUNCH_ID;
+  if (workerCli === 'codex') {
+    const omxEntryPath = resolveOmxCliEntryPath({ cwd });
+    if (omxEntryPath) {
+      workerEnv.OMX_CODEX_LAUNCH_ID = randomUUID();
+      workerEnv.OMX_ENTRY_PATH = omxEntryPath;
+    }
   }
 
   return {
@@ -2442,7 +2516,16 @@ export function createTeamSession(
     partialLeaderPaneId = leaderPaneId;
     partialLeaderPanePid = leaderPanePid;
 
-    const initialHudPaneIds = findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId });
+    // Legacy HUDs may carry either the leader marker or the OMX session marker,
+    // but not both. Keep the compatibility identities independent so combining
+    // them in one owner query does not reject a leader-owned HUD that lacks a
+    // session tag.
+    const initialHudPaneIds = Array.from(new Set([
+      ...findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId }),
+      ...(ownerSessionId
+        ? findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId, sessionId: ownerSessionId })
+        : []),
+    ]));
     const initialWindowPanePids = new Map<string, number>([[leaderPaneId, leaderPanePid]]);
 
     const omxEntry = resolveOmxCliEntryPath();
@@ -2526,16 +2609,6 @@ export function createTeamSession(
       const attachedStartupPlan = buildAttachedTmuxWorkerStartupPlan(safeTeamName, i, launchArgsForWorker, workerCwd, workerEnv, workerCliPlan[i - 1], startup.initialPrompt, startup.workerRole);
       workerStartupArgs[i - 1] = attachedStartupPlan.startupArgs;
       trustWorkerMiseConfigIfAvailable(workerCwd);
-      const cmd = writeWorkerStartupScriptCommand(safeTeamName, i, launchArgsForWorker, workerCwd, workerEnv, workerCliPlan[i - 1], startup.initialPrompt, startup.workerRole, attachedStartupPlan) ?? buildWorkerStartupCommand(
-        safeTeamName,
-        i,
-        launchArgsForWorker,
-        workerCwd,
-        workerEnv,
-        workerCliPlan[i - 1],
-        startup.initialPrompt,
-        startup.workerRole,
-      );
       // First split creates the right side from leader. Remaining splits stack on the right.
       const splitDirection = i === 1 ? '-h' : '-v';
       const splitTarget = requireLiveTeamOwnedPaneSync(
@@ -2549,7 +2622,21 @@ export function createTeamSession(
       try {
         paneId = runSourceAuthorizedSplit(
           splitSource,
-          (receipt) => `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(bindSplitReceiptToPaneCommand(cmd, receipt))}`,
+          (receipt) => {
+            const scriptCmd = writeWorkerStartupScriptCommand(safeTeamName, i, launchArgsForWorker, workerCwd, workerEnv, workerCliPlan[i - 1], startup.initialPrompt, startup.workerRole, attachedStartupPlan);
+            const cmd = scriptCmd ? `${scriptCmd} # ${receipt}` : buildWorkerStartupCommand(
+              safeTeamName,
+              i,
+              launchArgsForWorker,
+              workerCwd,
+              workerEnv,
+              workerCliPlan[i - 1],
+              startup.initialPrompt,
+              startup.workerRole,
+              receipt,
+            );
+            return `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(cmd)}`;
+          },
         );
       } catch (error) {
         if (error instanceof AmbiguousSplitWindowOutputError) {
@@ -2647,7 +2734,6 @@ export function createTeamSession(
     let resizeHookName: string | null = null;
     let resizeHookTarget: string | null = null;
     if (canRecreateTeamHud && omxEntry) {
-      const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: ownerSessionId, leaderPaneId })} node ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
       const hudCwd = translatePathForMsys(cwd);
       requireFrozenWindowTopologySync(teamTarget, frozenWindowPanePids, frozenWindowPaneOwners);
       const hudSplitTarget = leaderPaneId;
@@ -2657,7 +2743,10 @@ export function createTeamSession(
       try {
         id = runSourceAuthorizedSplit(
           hudSource,
-          (receipt) => `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(bindSplitReceiptToPaneCommand(hudCmd, receipt))}`,
+          (receipt) => {
+            const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: ownerSessionId, leaderPaneId })} node ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch # ${receipt}`;
+            return `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(hudCmd)}`;
+          },
         );
       } catch (error) {
         if (error instanceof AmbiguousSplitWindowOutputError) {
@@ -3043,10 +3132,7 @@ export function restoreStandaloneHudPane(
   const beforeSplitPaneIds = new Set(paneListResult.panes.map((pane) => pane.paneId));
 
   const splitReceipt = sourceTransactionReceipt();
-  const hudCmd = bindSplitReceiptToPaneCommand(
-    `exec env ${formatHudEnvAssignments(process.env, { sessionId: options.sessionId, leaderPaneId: normalizedLeaderPaneId })} ${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`,
-    splitReceipt,
-  );
+  const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: options.sessionId, leaderPaneId: normalizedLeaderPaneId })} ${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch # ${splitReceipt}`;
   let hudResult: ReturnType<typeof runTmux> | null = null;
   for (const restoreCwd of resolveStandaloneHudRestoreCwdCandidates(
     normalizedLeaderPaneId,
@@ -3196,27 +3282,20 @@ function paneTarget(sessionName: string, workerIndex: number): string {
 export const paneIsBootstrapping = sharedPaneIsBootstrapping;
 export const paneLooksReady = sharedPaneLooksReady;
 
-function paneHasTrustPrompt(captured: string): boolean {
-  const lines = captured
-    .split('\n')
-    .map((line) => line.replace(/\r/g, '').trim())
-    .filter((line) => line.length > 0);
-  const tail = lines.slice(-12);
-  const hasQuestion = tail.some((line) => /Do you trust the contents of this directory\?/i.test(line));
-  const hasActiveChoices = tail.some((line) => /Yes,\s*continue|No,\s*quit|Press enter to continue/i.test(line));
-  return hasQuestion && hasActiveChoices;
-}
-
 function paneHasClaudeBypassPermissionsPrompt(captured: string): boolean {
   const lines = captured
     .split('\n')
     .map((line) => line.replace(/\r/g, '').trim())
     .filter((line) => line.length > 0);
   const tail = lines.slice(-20);
+  // Claude Code renders "WARNING: Claude Code running in Bypass Permissions mode";
+  // keep the plain fragment for older/edge renderings.
   const hasWarning = tail.some((line) => /Bypass Permissions mode/i.test(line));
   const hasChoices = tail.some((line) => /No,\s*exit/i.test(line))
     && tail.some((line) => /Yes,\s*I\s*accept/i.test(line))
-    && tail.some((line) => /Enter\s*to\s*confirm/i.test(line));
+    && (tail.some((line) => /Enter\s*to\s*confirm/i.test(line))
+      || (tail.some((line) => /1\.\s*No,\s*exit/i.test(line))
+        && tail.some((line) => /2\.\s*Yes,\s*I\s*accept/i.test(line))));
   return hasWarning && hasChoices;
 }
 
@@ -3258,7 +3337,7 @@ function acceptClaudeBypassPermissionsPrompt(resolveTarget: () => string | null)
   sleepFractionalSeconds(0.12);
   const submitTarget = resolveTarget();
   if (!submitTarget) return false;
-  runTmux(['send-keys', '-t', submitTarget, 'C-m']);
+  runTmux(['send-keys', '-t', submitTarget, 'Enter']);
   return true;
 }
 
@@ -3285,7 +3364,7 @@ async function dismissClaudeBypassPermissionsPromptIfPresentAsync(
 
   const submitTarget = await resolveTarget();
   if (!submitTarget) return false;
-  const submitSend = await runTmuxAsync(['send-keys', '-t', submitTarget, 'C-m']);
+  const submitSend = await runTmuxAsync(['send-keys', '-t', submitTarget, 'Enter']);
   return submitSend.ok;
 }
 
@@ -3444,10 +3523,10 @@ async function attemptSubmitRounds(
     if (round === 0 && queueFirstRound) {
       await sendKeyAsync(resolveTarget, 'Tab');
       await sleep(80);
-      await sendKeyAsync(resolveTarget, 'C-m');
+      await sendKeyAsync(resolveTarget, 'Enter');
     } else {
       for (let press = 0; press < presses; press++) {
-        await sendKeyAsync(resolveTarget, 'C-m');
+        await sendKeyAsync(resolveTarget, 'Enter');
         if (press < presses - 1) {
           await sleep(200);
         }
@@ -3487,15 +3566,16 @@ export function waitForWorkerReady(
   const resolveTarget = createPinnedWorkerPaneTargetResolverSync(sessionName, workerIndex, workerPaneId, expectedPanePid, expectedTeamOwnerId, hudPaneId);
 
   const sendRobustEnter = (): void => {
-    // Trust + follow-up splash can require two submits in Codex TUI.
-    // Use C-m (carriage return) for raw-mode compatibility.
+    // Trust + follow-up splash can require two submits in agent TUIs.
+    // Named `Enter` submits in both Codex and Claude Code (2.1.x only accepts
+    // the named key, not the C-m byte).
     const firstTarget = resolveTarget();
     if (!firstTarget) return;
-    runTmux(['send-keys', '-t', firstTarget, 'C-m']);
+    runTmux(['send-keys', '-t', firstTarget, 'Enter']);
     sleepFractionalSeconds(0.12);
     const secondTarget = resolveTarget();
     if (!secondTarget) return;
-    runTmux(['send-keys', '-t', secondTarget, 'C-m']);
+    runTmux(['send-keys', '-t', secondTarget, 'Enter']);
   };
 
   const check = (): boolean => {
@@ -3534,9 +3614,18 @@ export function waitForWorkerReady(
     return paneLooksReady(scrollbackResult.stdout);
   };
 
+  // Reserve time for a final readiness poll to catch incompatibility markers
+  // that may appear after the first check() consumes most of the budget (finding #4309679342).
+  // Use a conservative estimate for check() runtime to ensure the final poll happens before deadline.
+  const minCheckTimeMs = 50;
   let delayMs = initialBackoffMs;
   while (Date.now() - startedAt < timeoutMs) {
-    if (check()) return true;
+    if (check()) {
+      // Poll returned true (ready). Verify we're still within deadline.
+      const checkElapsed = Date.now() - startedAt;
+      if (checkElapsed <= timeoutMs) return true;
+      // Exceeded deadline during the poll; don't report success.
+    }
     if (blockedByTrustPrompt) return false;
     // After dismissing a trust prompt, reset backoff so we re-check quickly
     // instead of sleeping 2s/4s/8s while the worker is starting up.
@@ -3545,10 +3634,23 @@ export function waitForWorkerReady(
       promptDismissed = false;
     }
     const remaining = timeoutMs - (Date.now() - startedAt);
-    if (remaining <= 0) break;
-    sleepSeconds(Math.max(0, Math.min(delayMs, remaining)) / 1000);
+    // Reserve time for one final check; exit early if not enough time remains
+    if (remaining <= minCheckTimeMs) break;
+    // Sleep for min of backoff or remaining-minCheckTimeMs to leave time for final poll
+    sleepSeconds(Math.max(0, Math.min(delayMs, remaining - minCheckTimeMs)) / 1000);
     delayMs = Math.min(maxBackoffMs, delayMs * 2);
   }
+
+  // Final check before returning false, only if budget remains (finding #4310223535).
+  // Recheck elapsed time after the poll to ensure the result is returned before deadline.
+  const finalRemaining = timeoutMs - (Date.now() - startedAt);
+  if (finalRemaining > 0 && check()) {
+    // Poll returned true (ready). Verify we're still within deadline.
+    const finalElapsed = Date.now() - startedAt;
+    if (finalElapsed <= timeoutMs) return true;
+    // Exceeded deadline during the final poll; don't report success.
+  }
+  if (blockedByTrustPrompt) return false;
 
   return false;
 }
@@ -3566,7 +3668,10 @@ export async function waitForWorkerReadyDetailedAsync(
   hudPaneId?: string,
   incompatibility?: { workerCli?: TeamWorkerCli; finalArgs?: readonly string[]; onIncompatible: (reason: typeof CODEX_BYPASS_MDM_INCOMPATIBLE_REASON) => void },
 ): Promise<boolean> {
-  const initialBackoffMs = 150;
+  // Adaptive backoff: for very short timeouts (e.g., during tests), use a proportionally short backoff
+  // to allow multiple polling attempts. This ensures that incompatibility markers like MDM rejection
+  // can be detected even when the timeout is short.
+  const initialBackoffMs = Math.max(25, Math.min(150, timeoutMs / 2));
   const maxBackoffMs = 8000;
   const startedAt = Date.now();
   let blockedByTrustPrompt = false;
@@ -3576,15 +3681,16 @@ export async function waitForWorkerReadyDetailedAsync(
 
 
   const sendRobustEnter = async (): Promise<void> => {
-    // Trust + follow-up splash can require two submits in Codex TUI.
-    // Use C-m (carriage return) for raw-mode compatibility.
+    // Trust + follow-up splash can require two submits in agent TUIs.
+    // Named `Enter` submits in both Codex and Claude Code (2.1.x only accepts
+    // the named key, not the C-m byte).
     const firstTarget = await resolveTarget();
     if (!firstTarget) return;
-    await runTmuxAsync(['send-keys', '-t', firstTarget, 'C-m']);
+    await runTmuxAsync(['send-keys', '-t', firstTarget, 'Enter']);
     await sleep(120);
     const secondTarget = await resolveTarget();
     if (!secondTarget) return;
-    await runTmuxAsync(['send-keys', '-t', secondTarget, 'C-m']);
+    await runTmuxAsync(['send-keys', '-t', secondTarget, 'Enter']);
   };
 
   const check = async (): Promise<boolean> => {
@@ -3629,9 +3735,18 @@ export async function waitForWorkerReadyDetailedAsync(
     return paneLooksReady(scrollbackResult.stdout);
   };
 
+  // Reserve time for a final readiness poll to catch incompatibility markers
+  // that may appear after the first check() consumes most of the budget (finding #4309679342).
+  // Use a conservative estimate for check() runtime to ensure the final poll happens before deadline.
+  const minCheckTimeMs = 50;
   let delayMs = initialBackoffMs;
   while (Date.now() - startedAt < timeoutMs) {
-    if (await check()) return true;
+    if (await check()) {
+      // Poll returned true (ready). Verify we're still within deadline.
+      const checkElapsed = Date.now() - startedAt;
+      if (checkElapsed <= timeoutMs) return true;
+      // Exceeded deadline during the poll; don't report success.
+    }
     if (startupIncompatible) return false;
     if (blockedByTrustPrompt) return false;
     // After dismissing a trust prompt, reset backoff so we re-check quickly
@@ -3641,10 +3756,24 @@ export async function waitForWorkerReadyDetailedAsync(
       promptDismissed = false;
     }
     const remaining = timeoutMs - (Date.now() - startedAt);
-    if (remaining <= 0) break;
-    await sleep(Math.max(0, Math.min(delayMs, remaining)));
+    // Reserve time for one final check; exit early if not enough time remains
+    if (remaining <= minCheckTimeMs) break;
+    // Sleep for min of backoff or remaining-minCheckTimeMs to leave time for final poll
+    await sleep(Math.max(0, Math.min(delayMs, remaining - minCheckTimeMs)));
     delayMs = Math.min(maxBackoffMs, delayMs * 2);
   }
+
+  // Final check before returning false, only if budget remains (finding #4310223535).
+  // Recheck elapsed time after the poll to ensure the result is returned before deadline.
+  const finalRemaining = timeoutMs - (Date.now() - startedAt);
+  if (finalRemaining > 0 && await check()) {
+    // Poll returned true (ready). Verify we're still within deadline.
+    const finalElapsed = Date.now() - startedAt;
+    if (finalElapsed <= timeoutMs) return true;
+    // Exceeded deadline during the final poll; don't report success.
+  }
+  if (startupIncompatible) return false;
+  if (blockedByTrustPrompt) return false;
 
   return false;
 }
@@ -3682,14 +3811,14 @@ export function dismissTrustPromptIfPresent(
   const result = runTmux(sharedBuildVisibleCapturePaneArgv(captureTarget));
   if (!result.ok) return false;
   if (!paneHasTrustPrompt(result.stdout)) return false;
-  // Trust prompt detected; send C-m twice to dismiss (trust + follow-up splash)
+  // Trust prompt detected; send Enter twice to dismiss (trust + follow-up splash)
   const firstTarget = resolveTarget();
   if (!firstTarget) return false;
-  runTmux(['send-keys', '-t', firstTarget, 'C-m']);
+  runTmux(['send-keys', '-t', firstTarget, 'Enter']);
   sleepFractionalSeconds(0.12);
   const secondTarget = resolveTarget();
   if (!secondTarget) return false;
-  runTmux(['send-keys', '-t', secondTarget, 'C-m']);
+  runTmux(['send-keys', '-t', secondTarget, 'Enter']);
   return true;
 }
 
@@ -3761,15 +3890,15 @@ export async function sendToWorker(
     await sleep(200);
   }
   if (paneHasTrustPrompt(capturedStr)) {
-    await sendKeyAsync(resolveTarget, 'C-m');
+    await sendKeyAsync(resolveTarget, 'Enter');
     await sleep(120);
-    await sendKeyAsync(resolveTarget, 'C-m');
+    await sendKeyAsync(resolveTarget, 'Enter');
     await sleep(200);
   }
 
   await sendLiteralTextOrThrow(resolveTarget, text);
 
-  // Allow the input buffer to settle before sending C-m
+  // Allow the input buffer to settle before submitting with Enter
   await sleep(150);
 
   const allowAutoInterruptRetry = process.env[OMX_TEAM_AUTO_INTERRUPT_RETRY_ENV] !== '0';
@@ -3781,8 +3910,8 @@ export async function sendToWorker(
   }
 
   // Submit deterministically using CLI-specific plan:
-  // - Codex: queue-first Tab+C-m when configured/busy, then double C-m rounds.
-  // - Claude: direct C-m rounds only (never queue-first Tab).
+  // - Codex: queue-first Tab+Enter when configured/busy, then double Enter rounds.
+  // - Claude: direct Enter rounds only (never queue-first Tab).
   if (await attemptSubmitRounds(
     resolveTarget,
     text,
@@ -3792,7 +3921,7 @@ export async function sendToWorker(
   )) return;
 
   // Adaptive escalation for "likely unsent trigger text at ready prompt" cases:
-  // clear line, re-send trigger, then re-submit with deterministic C-m rounds.
+  // clear line, re-send trigger, then re-submit with deterministic Enter rounds.
   const latestCapture = await capturePaneAsync(resolveTarget);
   if (shouldAttemptAdaptiveRetry(strategy, paneBusy, submitPlan.allowAdaptiveRetry, latestCapture || null, text)) {
     // Keep this branch non-interrupting to avoid canceling active turns on false positives.
@@ -3810,10 +3939,10 @@ export async function sendToWorker(
     throw new Error('sendToWorker: submit_failed (trigger text still visible after retries)');
   }
 
-  // One last best-effort double C-m nudge, then verify.
-  await sendKeyAsync(resolveTarget, 'C-m');
+  // One last best-effort double Enter nudge, then verify.
+  await sendKeyAsync(resolveTarget, 'Enter');
   await sleep(120);
-  await sendKeyAsync(resolveTarget, 'C-m');
+  await sendKeyAsync(resolveTarget, 'Enter');
 
   // Post-submit verification: wait briefly and confirm the worker consumed the
   // trigger (draft disappeared or active-task indicator appeared). Fixes #391.
@@ -3830,10 +3959,10 @@ export async function sendToWorker(
     ) {
       return;
     }
-    // Draft still visible and no active task — one more C-m attempt.
-    await sendKeyAsync(resolveTarget, 'C-m');
+    // Draft still visible and no active task — one more Enter attempt.
+    await sendKeyAsync(resolveTarget, 'Enter');
     await sleep(150);
-    await sendKeyAsync(resolveTarget, 'C-m');
+    await sendKeyAsync(resolveTarget, 'Enter');
     const finalVisibleCapture = await captureVisiblePaneAsync(resolveTarget);
     if (paneHasQueuedCodexSubmission(finalVisibleCapture)) {
       throw new Error('sendToWorker: submit_queued_after_tool_call');

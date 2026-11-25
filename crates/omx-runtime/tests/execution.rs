@@ -1,3 +1,154 @@
+#[cfg(unix)]
+mod lease_mutex_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::process::{Child, ChildStdout, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    const MUTEX_LEAF: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.mutex";
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "omx-lease-mutex-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn spawn_lease(dir: &std::path::Path) -> (Child, BufReader<ChildStdout>) {
+        let metadata = std::fs::metadata(dir).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
+            .args([
+                "lease-mutex",
+                dir.to_str().unwrap(),
+                &metadata.dev().to_string(),
+                &metadata.ino().to_string(),
+                MUTEX_LEAF,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        (child, stdout)
+    }
+
+    fn read_line(reader: &mut BufReader<ChildStdout>) -> serde_json::Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn lease_mutex_serializes_contenders() {
+        let dir = temp_dir();
+        let (mut first, mut first_out) = spawn_lease(&dir);
+        assert_eq!(read_line(&mut first_out)["ready"], true);
+        let (mut second, second_out) = spawn_lease(&dir);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = second_out;
+            let mut line = String::new();
+            let result = reader.read_line(&mut line).map(|_| line);
+            let _ = tx.send(result);
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err());
+        first
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"id\":1,\"op\":\"close\"}\n")
+            .unwrap();
+        assert!(first.wait().unwrap().success());
+        let line = rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["ready"],
+            true
+        );
+        let _ = second.kill();
+        let _ = second.wait();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lease_mutex_releases_on_process_death() {
+        let dir = temp_dir();
+        let (mut first, mut first_out) = spawn_lease(&dir);
+        assert_eq!(read_line(&mut first_out)["ready"], true);
+        first.kill().unwrap();
+        first.wait().unwrap();
+        let (mut second, mut second_out) = spawn_lease(&dir);
+        assert_eq!(read_line(&mut second_out)["ready"], true);
+        second.kill().unwrap();
+        second.wait().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lease_mutex_rejects_symlink_and_directory_identity_mismatch() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir();
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, dir.join("link")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
+            .args([
+                "lease-mutex",
+                dir.join("link").to_str().unwrap(),
+                "0",
+                "0",
+                MUTEX_LEAF,
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let metadata = std::fs::metadata(&dir).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
+            .args([
+                "lease-mutex",
+                target.to_str().unwrap(),
+                &metadata.dev().to_string(),
+                &metadata.ino().to_string(),
+                MUTEX_LEAF,
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn lease_mutex_assert_fails_after_directory_path_replacement() {
+        let dir = temp_dir();
+        let replacement = dir.with_extension("replacement");
+        let (mut child, mut output) = spawn_lease(&dir);
+        assert_eq!(read_line(&mut output)["ready"], true);
+        std::fs::rename(&dir, &replacement).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"{\"id\":7,\"op\":\"assert\"}\n")
+            .unwrap();
+        let response = read_line(&mut output);
+        assert_eq!(response["ok"], false);
+        assert!(response["error"].as_str().unwrap().contains("identity"));
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(replacement);
+    }
+}
 use std::process::Command;
 
 #[test]
@@ -27,6 +178,10 @@ fn schema_json_subcommand_prints_valid_json() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(parsed["schema_version"], 1);
+    assert!(parsed["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("team-mailbox-scope-v1")));
     assert!(parsed["commands"].is_array());
     assert!(parsed["events"].is_array());
 }
@@ -89,6 +244,64 @@ fn exec_subcommand_processes_json_command() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     assert_eq!(parsed["event"], "SnapshotCaptured");
+    assert_eq!(parsed["dispatch_records"], serde_json::json!([]));
+}
+
+#[test]
+fn capture_snapshot_returns_event_authoritative_dispatch_records() {
+    let dir = std::env::temp_dir().join(format!("omx-capture-records-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let state_arg = format!("--state-dir={}", dir.display());
+    let run = |command: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
+            .args(["exec-scoped", command, &state_arg])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    run(
+        r#"{"command":"QueueDispatch","request_id":"queued","target":"worker-1","metadata":{"team_name":"alpha"}}"#,
+    );
+    let stale = std::fs::read(dir.join("dispatch.json")).unwrap();
+    run(r#"{"command":"MarkNotified","request_id":"queued","channel":"tmux"}"#);
+    std::fs::write(dir.join("dispatch.json"), stale).unwrap();
+    let response = run(r#"{"command":"CaptureSnapshot"}"#);
+    let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("dispatch.json")).unwrap()).unwrap();
+    assert_eq!(response["dispatch_records"], expected["records"]);
+    assert_eq!(response["dispatch_records"][0]["status"], "notified");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn exec_scoped_checks_and_persists_team_scope_in_the_mutating_process() {
+    let dir = std::env::temp_dir().join("omx-runtime-test-exec-scoped");
+    let _ = std::fs::remove_dir_all(&dir);
+    let state_arg = format!("--state-dir={}", dir.display());
+    let command = r#"{"command":"CreateMailboxMessage","team_name":"alpha","message_id":"scoped","from_worker":"leader-fixed","to_worker":"worker-1","body":"private"}"#;
+    let output = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
+        .args(["exec-scoped", command, &state_arg, "--compact"])
+        .output()
+        .expect("ran omx-runtime");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["team_name"], "alpha");
+    let mailbox: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("mailbox.json")).unwrap()).unwrap();
+    assert_eq!(mailbox["records"][0]["team_name"], "alpha");
+    let events: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("events.json")).unwrap()).unwrap();
+    assert_eq!(events[0]["team_name"], "alpha");
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -371,7 +584,7 @@ fn exec_compact_immediately_persists_only_nonterminal_dispatch_records() {
     )
     .expect("valid events JSON");
     let events = events.as_array().expect("events array");
-    assert!(events
+    assert!(!events
         .iter()
         .any(|event| event["event"] == "SnapshotCaptured"));
     assert!(events
@@ -439,6 +652,7 @@ fn concurrent_exec_queue_accepts_exactly_one_request_id() {
 // ---------------------------------------------------------------------------
 
 /// Helper: run `fs-rename-no-replace <from> <to>` and return (exit_ok, stdout, stderr).
+#[cfg(target_os = "linux")]
 fn run_rename_no_replace(from: &str, to: &str) -> (bool, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_omx-runtime"))
         .args(["fs-rename-no-replace", from, to])

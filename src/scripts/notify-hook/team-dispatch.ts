@@ -1,12 +1,16 @@
 // @ts-nocheck
 import { appendFile, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { appendFileSync, existsSync, mkdirSync } from 'fs';
-import { execFileSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { safeString } from './utils.js';
-import { resolveBridgeStateDir, resolveRuntimeBinaryPath } from '../../runtime/bridge.js';
+import { getDefaultBridge, isRuntimeTransportError, isStrictDispatchRecord, preflightRuntimeBridge, resolveBridgeStateDir, RuntimeBridgeError } from '../../runtime/bridge.js';
+import { hasRuntimeAuthority, hasRuntimeDispatchIdentity, recordRuntimeFinalization, reconcileRuntimeFinalizations } from '../../team/state/dispatch-recovery.js';
+import { readDispatchRequests } from '../../team/state.js';
+import { assertTeamLockNotStale } from '../../team/state/locks.js';
 import { appendTeamDeliveryLog } from '../../team/delivery-log.js';
+import { hasUniqueScopedMailboxMatch, mailboxMessageContentMatches, mailboxMessageIdentity, mailboxRecordBelongsToTeam, normalizeBridgeMailboxMessage, readLegacyMailboxMessageIds } from '../../team/state/mailbox.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -37,13 +41,20 @@ import {
 function runtimeExec(command, stateDir, team) {
   if (process.env.OMX_RUNTIME_BRIDGE === '0') return;
   try {
-    const binaryPath = resolveRuntimeBinaryPath();
-    execFileSync(binaryPath, ['exec', JSON.stringify(command), `--state-dir=${stateDir}`], {
-      timeout: 5000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
+    getDefaultBridge(stateDir).execCommand(command);
   } catch (error) {
+    const isSchemaFailure = error instanceof RuntimeBridgeError && error.context.command === 'schema';
+    const isTransportFailure = isRuntimeTransportError(error);
+    const isFinalization = command.command === 'MarkNotified'
+      || command.command === 'MarkDelivered'
+      || command.command === 'MarkFailed';
+    if (isFinalization && !isSchemaFailure && !isTransportFailure
+      && hasRuntimeDispatchIdentity(stateDir, command.request_id)) throw error;
+    if (isFinalization && (isSchemaFailure || isTransportFailure)) {
+      // Compatibility JSON alone is overwritten by runtime event replay.
+      recordRuntimeFinalization(stateDir, team, command);
+    }
+    if (!isFinalization && (command.command === 'MarkMailboxNotified' || !isTransportFailure)) throw error;
     recordBridgeFallback({
       stateDir,
       team,
@@ -57,6 +68,7 @@ function runtimeExec(command, stateDir, team) {
     // non-fatal: JS path is the fallback
   }
 }
+
 
 function bridgeErrorReason(error) {
   const err = error || {};
@@ -125,66 +137,18 @@ function readJson(path, fallback) {
     .catch(() => fallback);
 }
 
-async function readBridgeDispatchRequests(stateDir, teamName) {
-  const candidate = join(stateDir, 'dispatch.json');
-  if (!existsSync(candidate)) return null;
-  let parsed;
-  try {
-    parsed = JSON.parse(await readFile(candidate, 'utf8'));
-  } catch (error) {
-    recordBridgeFallback({
-      stateDir,
-      team: teamName,
-      operation: 'readBridgeDispatchRequests',
-      fallbackTarget: 'legacy_dispatch_requests',
-      reason: `parse_failed:${bridgeErrorReason(error)}`,
-    });
-    return null;
+async function readBridgeDispatchRequests(stateDir, teamName, cwd, authoritativeRecords) {
+  if (!authoritativeRecords && existsSync(join(stateDir, 'dispatch.json'))) {
+    const compat = getDefaultBridge(stateDir).readCompatFile('dispatch.json');
+    if (!compat || !Array.isArray(compat.records)) {
+      recordBridgeFallback({
+        stateDir, team: teamName, operation: 'readBridgeDispatchRequests',
+        fallbackTarget: 'legacy_dispatch_requests',
+        reason: compat ? 'invalid_dispatch_compat_schema' : 'parse_failed:invalid_dispatch_compat_json',
+      });
+    }
   }
-  if (!parsed || !Array.isArray(parsed.records)) {
-    recordBridgeFallback({
-      stateDir,
-      team: teamName,
-      operation: 'readBridgeDispatchRequests',
-      fallbackTarget: 'legacy_dispatch_requests',
-      reason: 'invalid_dispatch_compat_schema',
-    });
-    return null;
-  }
-  return parsed.records
-    .map((record) => {
-      if (!record || typeof record !== 'object') return null;
-      const metadata = record.metadata && typeof record.metadata === 'object' ? record.metadata : {};
-      const metadataTeam = safeString(metadata.team_name).trim();
-      if (metadataTeam && metadataTeam !== teamName) return null;
-      return {
-        request_id: safeString(record.request_id).trim(),
-        kind: safeString(metadata.kind).trim() || 'inbox',
-        team_name: teamName,
-        to_worker: safeString(record.target).trim(),
-        worker_index: typeof metadata.worker_index === 'number' ? metadata.worker_index : undefined,
-        pane_id: safeString(metadata.pane_id).trim() || undefined,
-        trigger_message: safeString(metadata.trigger_message).trim() || safeString(record.reason).trim() || safeString(record.request_id).trim(),
-        message_id: safeString(metadata.message_id).trim() || undefined,
-        inbox_correlation_key: safeString(metadata.inbox_correlation_key).trim() || undefined,
-        transport_preference: safeString(metadata.transport_preference).trim() || 'hook_preferred_with_fallback',
-        fallback_allowed: typeof metadata.fallback_allowed === 'boolean' ? metadata.fallback_allowed : true,
-        status: safeString(record.status).trim() || 'pending',
-        attempt_count: Number.isFinite(metadata.attempt_count) ? Number(metadata.attempt_count) : 0,
-        created_at: safeString(record.created_at).trim() || new Date().toISOString(),
-        updated_at:
-          safeString(record.delivered_at).trim()
-          || safeString(record.failed_at).trim()
-          || safeString(record.notified_at).trim()
-          || safeString(record.created_at).trim()
-          || new Date().toISOString(),
-        notified_at: safeString(record.notified_at).trim() || undefined,
-        delivered_at: safeString(record.delivered_at).trim() || undefined,
-        failed_at: safeString(record.failed_at).trim() || undefined,
-        last_reason: safeString(record.reason).trim() || undefined,
-      };
-    })
-    .filter((record) => record && record.request_id && record.to_worker && record.trigger_message);
+  return await readDispatchRequests(teamName, resolve(cwd), authoritativeRecords, stateDir);
 }
 
 async function writeJsonAtomic(path, value) {
@@ -335,15 +299,7 @@ async function withLockDirectory(lockDir, timeoutError, fn) {
       break;
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
-      try {
-        const info = await stat(lockDir);
-        if (Date.now() - info.mtimeMs > DISPATCH_LOCK_STALE_MS) {
-          await rm(lockDir, { recursive: true, force: true });
-          continue;
-        }
-      } catch {
-        // best effort
-      }
+      await assertTeamLockNotStale(lockDir, DISPATCH_LOCK_STALE_MS);
       if (Date.now() > deadline) throw new Error(timeoutError);
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
     }
@@ -424,43 +380,6 @@ async function releaseDispatchRequestLease(lease) {
 
 function resolveLeaderPaneId(config) {
   return safeString(config?.leader_pane_id).trim();
-}
-
-function serializeDispatchRequestRecord(request) {
-  return {
-    request_id: safeString(request.request_id).trim(),
-    target: safeString(request.to_worker).trim(),
-    status: safeString(request.status).trim() || 'pending',
-    created_at: safeString(request.created_at).trim() || new Date().toISOString(),
-    notified_at: safeString(request.notified_at).trim() || null,
-    delivered_at: safeString(request.delivered_at).trim() || null,
-    failed_at: safeString(request.failed_at).trim() || null,
-    reason: safeString(request.last_reason).trim() || null,
-    metadata: {
-      kind: safeString(request.kind).trim() || 'inbox',
-      team_name: safeString(request.team_name).trim(),
-      worker_index: Number.isFinite(request.worker_index) ? Number(request.worker_index) : undefined,
-      pane_id: safeString(request.pane_id).trim() || undefined,
-      trigger_message: safeString(request.trigger_message).trim(),
-      message_id: safeString(request.message_id).trim() || undefined,
-      inbox_correlation_key: safeString(request.inbox_correlation_key).trim() || undefined,
-      transport_preference: safeString(request.transport_preference).trim() || 'hook_preferred_with_fallback',
-      fallback_allowed: typeof request.fallback_allowed === 'boolean' ? request.fallback_allowed : true,
-      attempt_count: Number.isFinite(request.attempt_count) ? Number(request.attempt_count) : 0,
-    },
-  };
-}
-
-async function writeBridgeDispatchCompat(stateDir, teamName, requests) {
-  const compatPath = join(stateDir, 'dispatch.json');
-  const current = await readJson(compatPath, { records: [] });
-  const existing = Array.isArray(current?.records) ? current.records : [];
-  const otherTeams = existing.filter((record) => {
-    const metadata = record?.metadata && typeof record.metadata === 'object' ? record.metadata : {};
-    return safeString(metadata.team_name).trim() !== teamName;
-  });
-  const records = [...otherTeams, ...requests.map(serializeDispatchRequestRecord)];
-  await writeJsonAtomic(compatPath, { records });
 }
 
 function explicitPaneIdentity(value) {
@@ -591,12 +510,13 @@ async function finalizeClaimedDispatchRequest({
   let summary = { processed: 0, skipped: 0, failed: 0 };
 
   await withDispatchLock(teamDirPath, async () => {
-    const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);
-    const usingLegacyRequests = bridgeRequests === null;
-    const requests = usingLegacyRequests ? await readJson(requestsPath, []) : bridgeRequests;
+    const records = getDefaultBridge(stateDir).readCompatFile('dispatch.json')?.records;
+    // A live lease may finalize its preflight snapshot when injection damages the projection.
+    const requests = await readBridgeDispatchRequests(stateDir, teamName, cwd,
+      Array.isArray(records) && records.every(isStrictDispatchRecord) ? records : claim.authoritativeRecords);
     if (!Array.isArray(requests)) return;
 
-    const index = requests.findIndex((entry) => safeString(entry?.request_id).trim() === claim.request.request_id);
+    const index = requests.findIndex((entry) => safeString(entry?.request_id).trim() === safeString(claim.request.request_id).trim());
     if (index < 0) return;
 
     const request = requests[index];
@@ -694,20 +614,32 @@ async function finalizeClaimedDispatchRequest({
           status: 'failed',
         });
       } else {
+        if (result.delivery_confirmed === true && process.env.OMX_RUNTIME_BRIDGE !== '0'
+          && hasRuntimeDispatchIdentity(stateDir, request.request_id)) {
+          // Persist a no-reinject receipt before runtime finalization can reject semantically.
+          recordRuntimeFinalization(stateDir, teamName, {
+            command: 'MarkNotified', request_id: request.request_id, channel: 'tmux',
+          });
+          recordRuntimeFinalization(stateDir, teamName, {
+            command: 'MarkDelivered', request_id: request.request_id,
+          });
+        }
         request.status = 'notified';
         request.notified_at = nowIso;
         request.last_reason = result.reason;
         runtimeExec({ command: 'MarkNotified', request_id: request.request_id, channel: 'tmux' }, stateDir, teamName);
         if (request.kind === 'mailbox' && request.message_id) {
-          runtimeExec({ command: 'MarkMailboxNotified', message_id: request.message_id }, stateDir, teamName);
-          if (usingLegacyRequests) {
-            await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
-          }
+          await updateMailboxNotified(stateDir, teamName, request.to_worker, request.message_id).catch(() => {});
+        }
+        if (result.delivery_confirmed === true) {
+          runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, teamName);
+          request.status = 'delivered';
+          request.delivered_at = nowIso;
         }
         summary.processed += 1;
         mutated = true;
         await appendDispatchLog(logsDir, {
-          type: 'dispatch_notified',
+          type: result.delivery_confirmed === true ? 'dispatch_delivered' : 'dispatch_notified',
           team: teamName,
           request_id: request.request_id,
           worker: request.to_worker,
@@ -722,7 +654,7 @@ async function finalizeClaimedDispatchRequest({
           message_id: request.message_id || null,
           to_worker: request.to_worker,
           transport: 'send-keys',
-          result: 'notified',
+          result: result.delivery_confirmed === true ? 'delivered' : 'notified',
           reason: result.reason,
         });
       }
@@ -772,9 +704,6 @@ async function finalizeClaimedDispatchRequest({
     triggerCooldownState.by_trigger = triggerCooldownByKey;
     await writeJsonAtomic(triggerCooldownStatePath(teamDirPath), triggerCooldownState);
     await writeJsonAtomic(requestsPath, requests);
-    if (!usingLegacyRequests) {
-      await writeBridgeDispatchCompat(stateDir, teamName, requests);
-    }
   });
 
   return summary;
@@ -954,6 +883,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
     expectedHudPaneId: dispatchTarget.expectedHudPaneId,
     prompt: request.trigger_message,
     submitKeyPresses,
+    submitKey: 'Enter',
     typePrompt: shouldTypePrompt,
     queueFirstSubmit: leaderTargeted,
   });
@@ -973,7 +903,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
 
   // Post-injection verification: confirm the trigger text was consumed.
   // Fixes #391: without this, dispatch marks 'notified' even when the worker
-  // pane is sitting on an unsent draft (C-m was not effectively applied).
+  // pane is sitting on an unsent draft (Enter was not effectively applied).
   const verifyNarrowArgv = buildJoinedCapturePaneArgv(resolution.paneTarget, 8);
   const verifyWideArgv = buildJoinedCapturePaneArgv(resolution.paneTarget);
   for (let round = 0; round < INJECT_VERIFY_ROUNDS; round++) {
@@ -990,17 +920,22 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       // full-scrollback false positives.
       narrowCap = await runProcess('tmux', verifyNarrowArgv, 2000);
     } catch {
-      // Capture failed; fall through to retry C-m.
+      // Capture failed; fall through to retry Enter.
     }
     if (narrowCap) {
       const wideProof = await verifyExplicitPane();
       if (!wideProof.ok) return exactPaneFailure(wideProof, true);
+      let wideCap;
       try {
-        const wideCap = await runProcess('tmux', verifyWideArgv, 2000);
+        wideCap = await runProcess('tmux', verifyWideArgv, 2000);
+      } catch {
+        // Capture failed; fall through to retry Enter.
+      }
+      if (wideCap) {
         const triggerInNarrow = capturedPaneContainsTrigger(narrowCap.stdout, request.trigger_message);
         const triggerNearTail = capturedPaneContainsTriggerNearTail(wideCap.stdout, request.trigger_message);
         if (triggerInNarrow || triggerNearTail) {
-          // Draft is still visible, so C-m has not actually submitted it yet.
+          // Draft is still visible, so Enter has not actually submitted it yet.
           // Do not let transient spinner/active-task text mask an unsent draft.
           const retrySend = await sendPaneInput({
             paneTarget: resolution.paneTarget,
@@ -1010,6 +945,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
             expectedHudPaneId: dispatchTarget.expectedHudPaneId,
             prompt: request.trigger_message,
             submitKeyPresses,
+            submitKey: 'Enter',
             typePrompt: false,
           });
           if (!retrySend.ok && retrySend.reason === EXACT_PANE_UNAVAILABLE_REASON) {
@@ -1020,10 +956,10 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
         }
         // Worker is actively processing (mirrors sync path tmux-session.ts:1292-1294)
         if (paneHasActiveTask(wideCap.stdout)) {
-          runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
           return {
             ok: true,
             reason: 'tmux_send_keys_confirmed_active_task',
+            delivery_confirmed: true,
             pane: resolution.paneTarget,
             pane_source: resolution.source || null,
             readiness_evidence: paneGuard.readinessEvidence || null,
@@ -1042,10 +978,10 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
           continue;
         }
         if (!triggerInNarrow && !triggerNearTail) {
-          runtimeExec({ command: 'MarkDelivered', request_id: request.request_id }, stateDir, request.team_name);
           return {
             ok: true,
             reason: 'tmux_send_keys_confirmed',
+            delivery_confirmed: true,
             pane: resolution.paneTarget,
             pane_source: resolution.source || null,
             readiness_evidence: paneGuard.readinessEvidence || null,
@@ -1054,11 +990,9 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
             tmux_injection_attempted: true,
           };
         }
-      } catch {
-        // Capture failed; fall through to retry C-m.
       }
     }
-    // Draft still visible and no active task — retry C-m
+    // Draft still visible and no active task — retry Enter
     const retrySend = await sendPaneInput({
       paneTarget: resolution.paneTarget,
       exactPaneId,
@@ -1067,6 +1001,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir) {
       expectedHudPaneId: dispatchTarget.expectedHudPaneId,
       prompt: request.trigger_message,
       submitKeyPresses,
+      submitKey: 'Enter',
       typePrompt: false,
       queueFirstSubmit: leaderTargeted,
     });
@@ -1100,8 +1035,34 @@ async function updateMailboxNotified(stateDir, teamName, workerName, messageId) 
   const mailboxPath = join(teamDirPath, 'mailbox', `${workerName}.json`);
   return await withMailboxLock(teamDirPath, workerName, async () => {
     const mailbox = await readJson(mailboxPath, { worker: workerName, messages: [] });
-    if (!mailbox || !Array.isArray(mailbox.messages)) return false;
-    const msg = mailbox.messages.find((candidate) => candidate?.message_id === messageId);
+    if (!mailbox || mailbox.worker !== workerName || !Array.isArray(mailbox.messages)) return false;
+    let msg = mailbox.messages.find((candidate) => candidate?.message_id === messageId && candidate.to_worker === workerName);
+    if (process.env.OMX_RUNTIME_BRIDGE !== '0') {
+      const records = getDefaultBridge(stateDir).readMailboxRecords();
+      const candidates = records.filter((candidate) => candidate.message_id === messageId
+        && (candidate.team_name == null || candidate.team_name === teamName));
+      const legacyIds = candidates.length === 0 || candidates.some((record) => record.team_name == null || record.body === ''
+        || mailbox.messages.some((message) => message?.message_id === messageId && message.created_at !== record.created_at))
+        ? await readLegacyMailboxMessageIds(teamName, workerName, mailbox, join(teamDirPath, 'events', 'events.ndjson'), records)
+        : new Set<string>();
+      const record = candidates.find((candidate) => mailboxRecordBelongsToTeam(candidate, teamName, workerName, legacyIds));
+      if (record) {
+        const normalized = normalizeBridgeMailboxMessage(record, legacyIds.has(messageId) ? msg : undefined);
+        msg = mailbox.messages.find((candidate) => mailboxMessageIdentity(candidate) === mailboxMessageIdentity(normalized)
+          || ((legacyIds.has(messageId) || hasUniqueScopedMailboxMatch(teamName, normalized, records, mailbox.messages))
+            && mailboxMessageContentMatches(candidate, normalized)));
+        if (!msg) {
+          msg = normalized;
+          mailbox.messages.push(msg);
+        }
+        runtimeExec({ command: 'MarkMailboxNotified', team_name: teamName, message_id: messageId }, stateDir, teamName);
+      } else if (candidates.length > 0 || !legacyIds.has(messageId)) {
+        return false;
+      }
+    } else {
+      const legacyIds = await readLegacyMailboxMessageIds(teamName, workerName, mailbox, join(teamDirPath, 'events', 'events.ndjson'));
+      if (!legacyIds.has(messageId)) return false;
+    }
     if (!msg) return false;
     if (!msg.notified_at) msg.notified_at = new Date().toISOString();
     await writeJsonAtomic(mailboxPath, mailbox);
@@ -1136,6 +1097,52 @@ function buildDispatchAttemptEvidence(result, fallback = {}) {
   };
 }
 
+async function listTeamDirectories(teamRoot: string): Promise<string[]> {
+  const entries = await readdir(teamRoot, { withFileTypes: true }).catch(() => []);
+  const names: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      names.push(entry.name);
+      continue;
+    }
+    if (!entry.isSymbolicLink()) continue;
+    const resolved = await stat(join(teamRoot, entry.name)).catch(() => null);
+    if (resolved?.isDirectory()) names.push(entry.name);
+  }
+  return names;
+}
+
+// Cache only a projection verified against unchanged event contents and state versions.
+const refreshedDispatchStates = new Map();
+async function refreshDispatchProjection(stateDir) {
+  const readStateVersion = async () => Promise.all(['events.json', 'dispatch.json'].map((name) =>
+    stat(join(stateDir, name), { bigint: true }).then((info) =>
+      [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].map(String).join(':')).catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    })));
+  const before = await readStateVersion();
+  const cached = refreshedDispatchStates.get(stateDir);
+  if (cached && cached.state[0] === before[0] && cached.state[1] === before[1]) return cached.records;
+  refreshedDispatchStates.delete(stateDir);
+  const eventsPath = join(stateDir, 'events.json');
+  const readEvents = () => readFile(eventsPath, 'utf8').catch((error) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const eventsBefore = await readEvents();
+  const snapshot = getDefaultBridge(stateDir).execCommand({ command: 'CaptureSnapshot' });
+  if (!Array.isArray(snapshot.dispatch_records)) return; // Older compatible runtimes do not return records.
+  const eventsAfter = await readEvents();
+  const after = await readStateVersion();
+  let projected;
+  try { projected = JSON.parse(await readFile(join(stateDir, 'dispatch.json'), 'utf8')).records; } catch { /* A concurrent writer cannot prove a cache entry. */ }
+  if (eventsBefore === eventsAfter && isDeepStrictEqual(projected, snapshot.dispatch_records)) {
+    refreshedDispatchStates.set(stateDir, { state: after, records: snapshot.dispatch_records });
+  }
+  return snapshot.dispatch_records;
+}
+
 export async function drainPendingTeamDispatch({
   cwd,
   stateDir = resolveBridgeStateDir(cwd),
@@ -1155,7 +1162,10 @@ export async function drainPendingTeamDispatch({
   const teamRoot = join(stateDir, 'team');
   if (!existsSync(teamRoot)) return { processed: 0, skipped: 0, failed: 0 };
 
-  const teams = await readdir(teamRoot).catch(() => []);
+  // `.omx/state/team` also holds plain files (e.g. `notice-ledger.json`).
+  // Only real directories are Team roots; treating a file as one makes every
+  // dispatch-state write fail with ENOTDIR on `<file>/dispatch`.
+  const teams = await listTeamDirectories(teamRoot);
 
   let processed = 0;
   let skipped = 0;
@@ -1171,127 +1181,151 @@ export async function drainPendingTeamDispatch({
     const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
     const config = await readJson(existsSync(manifestPath) ? manifestPath : configPath, {});
     const claims = [];
-    await withDispatchLock(teamDirPath, async () => {
-      const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);
-      const usingLegacyRequests = bridgeRequests === null;
-      const requests = usingLegacyRequests ? await readJson(requestsPath, []) : bridgeRequests;
-      if (!Array.isArray(requests)) return;
-      const issueCooldownState = await readIssueCooldownState(teamDirPath);
-      const triggerCooldownState = await readTriggerCooldownState(teamDirPath);
-      const issueCooldownByIssue = issueCooldownState.by_issue || {};
-      const triggerCooldownByKey = triggerCooldownState.by_trigger || {};
-      const nowMs = Date.now();
-
-      let mutated = false;
-      for (const request of requests) {
-        if (processed + claims.length >= maxPerTick) break;
-        if (!request || typeof request !== 'object') continue;
-        if (shouldSkipRequest(request)) {
-          skipped += 1;
-          continue;
-        }
-
-        if (request.to_worker === 'leader-fixed' && !resolveLeaderPaneId(config) && !explicitPaneIdentity(request.pane_id).provided) {
-          const nowIso = new Date().toISOString();
-          const alreadyDeferred = safeString(request.last_reason).trim() === LEADER_PANE_MISSING_DEFERRED_REASON;
-          request.updated_at = nowIso;
-          request.last_reason = LEADER_PANE_MISSING_DEFERRED_REASON;
-          request.status = 'pending';
-          skipped += 1;
-          mutated = true;
-          if (!alreadyDeferred) {
-            await appendDispatchLog(logsDir, {
-              type: 'dispatch_deferred',
-              team: teamName,
-              request_id: request.request_id,
-              worker: request.to_worker,
-              to_worker: request.to_worker,
-              message_id: request.message_id || null,
-              reason: LEADER_PANE_MISSING_DEFERRED_REASON,
-              status: 'pending',
-              tmux_session: safeString(config?.tmux_session).trim() || null,
-              leader_pane_id: safeString(config?.leader_pane_id).trim() || null,
-              tmux_injection_attempted: false,
-              pane_target: null,
-              pane_source: null,
-              readiness_evidence: null,
-              pane_current_command: null,
-            });
-            await appendDeliveryTelemetry(logsDir, {
-              event: 'dispatch_result',
-              team: teamName,
-              request_id: request.request_id,
-              message_id: request.message_id || null,
-              to_worker: request.to_worker,
-              transport: 'send-keys',
-              result: 'deferred',
-              reason: LEADER_PANE_MISSING_DEFERRED_REASON,
-            });
-            await appendLeaderNotificationDeferredEvent({
-              stateDir,
-              teamName,
-              request,
-              reason: LEADER_PANE_MISSING_DEFERRED_REASON,
-              nowIso,
-              tmuxSession: safeString(config?.tmux_session).trim(),
-              leaderPaneId: safeString(config?.leader_pane_id).trim(),
-              sourceType: 'team_dispatch',
-            });
+    let lockAcquired = false;
+    try {
+      await withDispatchLock(teamDirPath, async () => {
+        lockAcquired = true;
+        await reconcileRuntimeFinalizations(stateDir, teamName);
+        let authoritativeRecords;
+        if (hasRuntimeAuthority(stateDir)) {
+          if (process.env.OMX_RUNTIME_BRIDGE === '0') throw new Error('runtime dispatch authority requires an enabled bridge');
+          authoritativeRecords = await refreshDispatchProjection(stateDir);
+          if (!authoritativeRecords) {
+            const records = getDefaultBridge(stateDir).readCompatFile('dispatch.json')?.records;
+            if (Array.isArray(records)) authoritativeRecords = records;
           }
-          continue;
         }
+        const requests = await readBridgeDispatchRequests(stateDir, teamName, cwd, authoritativeRecords);
+        if (!Array.isArray(requests)) return;
+        if (requests.some((request) => request && typeof request === 'object' && !shouldSkipRequest(request))) {
+          preflightRuntimeBridge(stateDir);
+        }
+        const issueCooldownState = await readIssueCooldownState(teamDirPath);
+        const triggerCooldownState = await readTriggerCooldownState(teamDirPath);
+        const issueCooldownByIssue = issueCooldownState.by_issue || {};
+        const triggerCooldownByKey = triggerCooldownState.by_trigger || {};
+        const nowMs = Date.now();
 
-        const issueKey = extractIssueKey(request.trigger_message);
-        if (issueCooldownMs > 0 && issueKey) {
-          const lastInjectedMs = Number(issueCooldownByIssue[issueKey]);
-          if (Number.isFinite(lastInjectedMs) && lastInjectedMs > 0 && nowMs - lastInjectedMs < issueCooldownMs) {
+        let mutated = false;
+        for (const request of requests) {
+          if (processed + claims.length >= maxPerTick) break;
+          if (!request || typeof request !== 'object') continue;
+          if (shouldSkipRequest(request)) {
             skipped += 1;
             continue;
           }
-        }
 
-        const triggerKey = normalizeTriggerKey(request.trigger_message);
-        if (triggerCooldownMs > 0 && triggerKey) {
-          const parsed = parseTriggerCooldownEntry(triggerCooldownByKey[triggerKey]);
-          const withinCooldown = Number.isFinite(parsed.at) && parsed.at > 0 && nowMs - parsed.at < triggerCooldownMs;
-          const sameRequestRetry = parsed.lastRequestId !== '' && parsed.lastRequestId === safeString(request.request_id).trim();
-          if (withinCooldown && !sameRequestRetry) {
+          if (request.to_worker === 'leader-fixed' && !resolveLeaderPaneId(config) && !explicitPaneIdentity(request.pane_id).provided) {
+            const nowIso = new Date().toISOString();
+            const alreadyDeferred = safeString(request.last_reason).trim() === LEADER_PANE_MISSING_DEFERRED_REASON;
+            request.updated_at = nowIso;
+            request.last_reason = LEADER_PANE_MISSING_DEFERRED_REASON;
+            request.status = 'pending';
+            skipped += 1;
+            mutated = true;
+            if (!alreadyDeferred) {
+              await appendDispatchLog(logsDir, {
+                type: 'dispatch_deferred',
+                team: teamName,
+                request_id: request.request_id,
+                worker: request.to_worker,
+                to_worker: request.to_worker,
+                message_id: request.message_id || null,
+                reason: LEADER_PANE_MISSING_DEFERRED_REASON,
+                status: 'pending',
+                tmux_session: safeString(config?.tmux_session).trim() || null,
+                leader_pane_id: safeString(config?.leader_pane_id).trim() || null,
+                tmux_injection_attempted: false,
+                pane_target: null,
+                pane_source: null,
+                readiness_evidence: null,
+                pane_current_command: null,
+              });
+              await appendDeliveryTelemetry(logsDir, {
+                event: 'dispatch_result',
+                team: teamName,
+                request_id: request.request_id,
+                message_id: request.message_id || null,
+                to_worker: request.to_worker,
+                transport: 'send-keys',
+                result: 'deferred',
+                reason: LEADER_PANE_MISSING_DEFERRED_REASON,
+              });
+              await appendLeaderNotificationDeferredEvent({
+                stateDir,
+                teamName,
+                request,
+                reason: LEADER_PANE_MISSING_DEFERRED_REASON,
+                nowIso,
+                tmuxSession: safeString(config?.tmux_session).trim(),
+                leaderPaneId: safeString(config?.leader_pane_id).trim(),
+                sourceType: 'team_dispatch',
+              });
+            }
+            continue;
+          }
+
+          const issueKey = extractIssueKey(request.trigger_message);
+          if (issueCooldownMs > 0 && issueKey) {
+            const lastInjectedMs = Number(issueCooldownByIssue[issueKey]);
+            if (Number.isFinite(lastInjectedMs) && lastInjectedMs > 0 && nowMs - lastInjectedMs < issueCooldownMs) {
+              skipped += 1;
+              continue;
+            }
+          }
+
+          const triggerKey = normalizeTriggerKey(request.trigger_message);
+          if (triggerCooldownMs > 0 && triggerKey) {
+            const parsed = parseTriggerCooldownEntry(triggerCooldownByKey[triggerKey]);
+            const withinCooldown = Number.isFinite(parsed.at) && parsed.at > 0 && nowMs - parsed.at < triggerCooldownMs;
+            const sameRequestRetry = parsed.lastRequestId !== '' && parsed.lastRequestId === safeString(request.request_id).trim();
+            if (withinCooldown && !sameRequestRetry) {
+              skipped += 1;
+              continue;
+            }
+          }
+
+          const lease = await tryAcquireDispatchRequestLease(teamDirPath, request.request_id);
+          if (!lease) {
             skipped += 1;
             continue;
           }
+          mutated = reserveDispatchCooldowns({
+            issueCooldownMs,
+            triggerCooldownMs,
+            issueCooldownByIssue,
+            triggerCooldownByKey,
+            issueKey,
+            triggerKey,
+            requestId: request.request_id,
+          }) || mutated;
+          claims.push({
+            request: { ...request },
+            authoritativeRecords,
+            lease,
+          });
         }
 
-        const lease = await tryAcquireDispatchRequestLease(teamDirPath, request.request_id);
-        if (!lease) {
-          skipped += 1;
-          continue;
+        if (mutated) {
+          issueCooldownState.by_issue = issueCooldownByIssue;
+          await writeJsonAtomic(issueCooldownStatePath(teamDirPath), issueCooldownState);
+          triggerCooldownState.by_trigger = triggerCooldownByKey;
+          await writeJsonAtomic(triggerCooldownStatePath(teamDirPath), triggerCooldownState);
+          await writeJsonAtomic(requestsPath, requests);
         }
-        mutated = reserveDispatchCooldowns({
-          issueCooldownMs,
-          triggerCooldownMs,
-          issueCooldownByIssue,
-          triggerCooldownByKey,
-          issueKey,
-          triggerKey,
-          requestId: request.request_id,
-        }) || mutated;
-        claims.push({
-          request: { ...request },
-          lease,
-        });
-      }
-
-      if (mutated) {
-        issueCooldownState.by_issue = issueCooldownByIssue;
-        await writeJsonAtomic(issueCooldownStatePath(teamDirPath), issueCooldownState);
-        triggerCooldownState.by_trigger = triggerCooldownByKey;
-        await writeJsonAtomic(triggerCooldownStatePath(teamDirPath), triggerCooldownState);
-        await writeJsonAtomic(requestsPath, requests);
-        if (!usingLegacyRequests) {
-          await writeBridgeDispatchCompat(stateDir, teamName, requests);
-        }
-      }
-    });
+      });
+    } catch (error) {
+      // An abandoned dispatch lock needs manual recovery for this team only: keep the lock,
+      // report it, and let the other teams under the same state root drain.
+      if (lockAcquired || !safeString(error?.message).startsWith('team_lock_recovery_required:')) throw error;
+      failed += 1;
+      await appendDispatchLog(logsDir, {
+        type: 'dispatch_lock_recovery_required',
+        team: teamName,
+        reason: safeString(error.message),
+      });
+      continue;
+    }
 
     try {
       for (const claim of claims) {

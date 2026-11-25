@@ -8,6 +8,8 @@ type CodexHookEventName =
   | "UserPromptSubmit"
   | "PreCompact"
   | "PostCompact"
+  | "SubagentStart"
+  | "SubagentStop"
   | "Stop";
 
 type CodexHookPayload = Record<string, unknown>;

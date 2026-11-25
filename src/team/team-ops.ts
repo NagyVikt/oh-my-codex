@@ -38,6 +38,7 @@ export type {
   TeamDispatchTransportPreference,
   TaskReadiness,
   ClaimTaskResult,
+  RenewTaskClaimResult,
   TransitionTaskResult,
   ReleaseTaskClaimResult,
   ReclaimTaskResult,
@@ -56,7 +57,9 @@ export { DEFAULT_MAX_WORKERS, ABSOLUTE_MAX_WORKERS } from './state.js';
 // === Team lifecycle ===
 export { initTeamState as teamInit } from './state.js';
 export { readTeamConfig as teamReadConfig } from './state.js';
+export { readTeamConfigSnapshot as teamReadConfigSnapshot } from './state.js';
 export { readTeamManifestV2 as teamReadManifest } from './state.js';
+export { readTeamManifestV2Snapshot as teamReadManifestSnapshot } from './state.js';
 export { writeTeamManifestV2 as teamWriteManifest } from './state.js';
 export { saveTeamConfig as teamSaveConfig } from './state.js';
 export { cleanupTeamState as teamCleanup } from './state.js';
@@ -76,8 +79,10 @@ export { writeWorkerInbox as teamWriteWorkerInbox } from './state.js';
 export { createTask as teamCreateTask } from './state.js';
 export { readTask as teamReadTask } from './state.js';
 export { listTasks as teamListTasks } from './state.js';
+export { listTasksSnapshot as teamListTasksSnapshot } from './state.js';
 export { updateTask as teamUpdateTask } from './state.js';
 export { claimTask as teamClaimTask } from './state.js';
+export { renewTaskClaim as teamRenewTaskClaim } from './state.js';
 export { releaseTaskClaim as teamReleaseTaskClaim } from './state.js';
 export { reclaimExpiredTaskClaim as teamReclaimExpiredTaskClaim } from './state.js';
 export { transitionTaskStatus as teamTransitionTaskStatus } from './state.js';
@@ -89,12 +94,14 @@ export { broadcastMessage as teamBroadcast } from './state.js';
 export { listMailboxMessages as teamListMailbox } from './state.js';
 export { markMessageDelivered as teamMarkMessageDelivered } from './state.js';
 export { markMessageNotified as teamMarkMessageNotified } from './state.js';
+export { retireTeamMailboxMessages as teamRetireMailboxMessages } from './state.js';
 export { enqueueDispatchRequest as teamEnqueueDispatchRequest } from './state.js';
 export { listDispatchRequests as teamListDispatchRequests } from './state.js';
 export { readDispatchRequest as teamReadDispatchRequest } from './state.js';
 export { transitionDispatchRequest as teamTransitionDispatchRequest } from './state.js';
 export { markDispatchRequestNotified as teamMarkDispatchRequestNotified } from './state.js';
 export { markDispatchRequestDelivered as teamMarkDispatchRequestDelivered } from './state.js';
+export { markDispatchRequestFailed as teamMarkDispatchRequestFailed } from './state.js';
 export { removeDispatchRequestsForWorkers as teamRemoveDispatchRequestsForWorkers } from './state.js';
 
 // === Events ===

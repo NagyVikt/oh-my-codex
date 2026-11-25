@@ -2,9 +2,9 @@ import { dirname, join } from "path";
 import { homedir } from "os";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { spawnPlatformCommandSync, classifySpawnError } from "../utils/platform-command.js";
+import { DEFAULT_LEADER_MODEL } from "../config/models.js";
 import { readAuthConfig } from "../auth/config.js";
 import { resolveLiveAuthPath } from "../auth/paths.js";
-import { redactAuthSecrets } from "../auth/redact.js";
 import { addSlotFromAuthFile, listSlots, useSlot } from "../auth/storage.js";
 import { readTopLevelTomlString, upsertTopLevelTomlString } from "../utils/toml.js";
 
@@ -23,7 +23,7 @@ Auth slots are stored under ~/.omx/auth/<slot>.json with owner-only permissions.
 function wantsJson(args: string[]): boolean {
   return args.includes("--json");
 }
-const DEFAULT_SUBSCRIPTION_MODEL = "gpt-5-codex";
+const DEFAULT_SUBSCRIPTION_MODEL = DEFAULT_LEADER_MODEL;
 const DEFAULT_SUBSCRIPTION_MODEL_PROVIDER = "openai-chatgpt";
 
 
@@ -154,8 +154,4 @@ export async function authCommand(args: string[], env: NodeJS.ProcessEnv = proce
   }
 
   throw new Error(`Unknown auth command: ${command}\n${AUTH_HELP.trim()}`);
-}
-
-export function formatAuthError(err: unknown): string {
-  return redactAuthSecrets(err);
 }

@@ -3,7 +3,8 @@
  * Team worker: heartbeat, idle detection, and leader notification.
  */
 
-import { readFile, writeFile, mkdir, appendFile, rename, stat, readdir } from 'fs/promises';
+import { renewWorkerTaskLease, reportWorkerTaskLeaseLoss } from './team-worker-lease.js';
+import { readFile, writeFile, mkdir, appendFile, rename, stat, readdir, rm } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { resolveWorkerNotifyTeamStateRootPath } from '../../team/state-root.js';
@@ -17,7 +18,7 @@ import {
   resolveWorkerIdleIntent,
 } from './orchestration-intent.js';
 import { DEFAULT_MARKER, paneHasActiveTask } from '../tmux-hook-engine.js';
-import { registerTeamNotice, releaseTeamNoticeWake } from '../../team/notice-ledger.js';
+import { confirmTeamNoticeWake, registerTeamNotice, releaseTeamNoticeWake } from '../../team/notice-ledger.js';
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = 'leader_pane_shell_no_injection';
 
 function positivePanePid(value) {
@@ -106,7 +107,7 @@ async function readTeamPhaseSnapshot(stateDir, teamName, nowIso = new Date().toI
     const currentPhase = safeString(parsed && parsed.current_phase).trim();
     return {
       currentPhase,
-      terminal: isTerminalPhase(currentPhase),
+      terminal: Boolean(parsed && parsed.terminal_epoch) || isTerminalPhase(currentPhase),
       completedAt: resolveTerminalAtFromPhaseDoc(parsed, nowIso),
     };
   } catch {
@@ -342,10 +343,20 @@ export async function updateWorkerHeartbeat(stateDir, teamName, workerName) {
     turn_count: turnCount + 1,
     alive: true,
   };
-  // Atomic write: tmp + rename
+  // Best-effort heartbeat telemetry must not bypass authoritative renewal.
   const tmpPath = heartbeatPath + '.tmp.' + process.pid;
-  await writeFile(tmpPath, JSON.stringify(heartbeat, null, 2));
-  await rename(tmpPath, heartbeatPath);
+  try {
+    await writeFile(tmpPath, JSON.stringify(heartbeat, null, 2));
+    await rename(tmpPath, heartbeatPath);
+  } catch {
+    await rm(tmpPath, { force: true }).catch(() => {});
+  }
+  const renewal = await renewWorkerTaskLease(stateDir, teamName, workerName);
+  if (renewal && !renewal.ok) {
+    const stopMessage = await reportWorkerTaskLeaseLoss(stateDir, teamName, workerName, renewal.error);
+    return { ok: false, error: renewal.error, stopMessage };
+  }
+  return renewal;
 }
 
 export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, parsedTeamWorker }) {
@@ -482,6 +493,10 @@ export async function maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, 
       expectedHudPaneId: hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
+    if (queuedNoticeRegistration?.targetKey && queuedNoticeRegistration?.wakeId
+      && !await confirmTeamNoticeWake(stateDir, queuedNoticeRegistration.targetKey, queuedNoticeRegistration.wakeId)) {
+      throw new Error('team_notice_wake_confirmation_failed');
+    }
     queuedNoticeRegistration = null;
 
     const nextIdleState = {
@@ -700,6 +715,10 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
       expectedHudPaneId: hudPaneId,
     });
     if (!sendResult.ok) throw new Error(sendResult.error || sendResult.reason || 'send_failed');
+    if (queuedNoticeRegistration?.targetKey && queuedNoticeRegistration?.wakeId
+      && !await confirmTeamNoticeWake(stateDir, queuedNoticeRegistration.targetKey, queuedNoticeRegistration.wakeId)) {
+      throw new Error('team_notice_wake_confirmation_failed');
+    }
     queuedNoticeRegistration = null;
 
     // Update cooldown state

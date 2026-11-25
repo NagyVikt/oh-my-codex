@@ -13,6 +13,7 @@ import {
 	writeFile,
 	stat,
 	lstat,
+	realpath,
 	rm,
 	open,
 	chmod,
@@ -57,6 +58,7 @@ import {
 } from "../utils/file-durability.js";
 import {
 	buildMergedConfig,
+	formatTomlStringArray,
 	getRootModelName,
 	getRootTomlArray,
 	hasLegacyOmxTeamRunTable,
@@ -71,21 +73,27 @@ import {
 	upsertPluginModeRuntimeFeatureFlags,
 	upsertManagedCodexHookTrustState,
 	stripManagedCodexHookTrustState,
+	migrateManagedCodexHookTrustStateCoordinates,
+	migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged,
 	OMX_DEVELOPER_INSTRUCTIONS,
 	OMX_PLUGIN_DEVELOPER_INSTRUCTIONS,
 	hasFirstPartyOmxMcpRegistrations,
 	extractFirstPartyOmxMcpSections,
 	stripFirstPartyOmxMcpSections,
 } from "../config/generator.js";
-import type { CodexHookFeatureFlag } from "../config/codex-feature-flags.js";
+import type { CodexHookFeatureFlag, CodexPluginHookFeatureFlag } from "../config/codex-feature-flags.js";
 import {
 	buildManagedCodexNativeHookWindowsShimContent,
-	buildManagedCodexNativeHookWindowsShimPath,
+	buildManagedCodexNativeHookWindowsShimPathForFilesystem,
+	escapeTomlBasicString,
 	planManagedCodexHooksMerge,
 	planManagedCodexHooksRemoval,
 	classifyManagedCodexNativeHookWindowsShimOwnership,
 	ManagedCodexHooksPlanError,
+	type ManagedCodexHookCoordinateMove,
+	type ManagedCodexHookRemovalCoordinate,
 	type ManagedCodexHookTrustState,
+	type ManagedCodexHooksPlan,
 	validateCodexHooksConfigStrict,
 } from "../config/codex-hooks.js";
 
@@ -105,10 +113,10 @@ import {
 	isSetupPromptAssetName,
 } from "../agents/policy.js";
 import { getPackageRoot } from "../utils/package.js";
-import { readSessionState, isSessionStale } from "../hooks/session.js";
+import { readSessionState, classifySessionStateLiveness } from "../hooks/session.js";
 import { getCatalogHeadlineCounts } from "./catalog-contract.js";
 import { tryReadCatalogManifest } from "../catalog/reader.js";
-import { DEFAULT_FRONTIER_MODEL } from "../config/models.js";
+import { DEFAULT_LEADER_MODEL } from "../config/models.js";
 import {
 	teamModeEnabled,
 	type SetupTeamMode,
@@ -138,13 +146,13 @@ import {
 import {
 	OMX_LOCAL_MARKETPLACE_NAME,
 	OMX_PLUGIN_NAME,
+	discoverOmxPluginCacheDirs,
 	materializePackagedOmxPluginCache,
 	resolvePackagedOmxMarketplace,
 	upsertLocalOmxMarketplaceRegistration,
 	upsertLocalOmxPluginEnablement,
 	upsertLocalOmxPluginMcpServerEnablement,
 	hasLocalOmxPluginMcpServerRegistrations,
-	pluginHookCacheMatchesPackaged,
 } from "./plugin-marketplace.js";
 import { resolveCodexHookFeatureSupportForCli } from "./codex-feature-probe.js";
 
@@ -186,7 +194,10 @@ interface PluginDeveloperInstructionsDecision {
 interface SetupOptions {
 	codexFeaturesProbe?: () => string | null;
 	codexVersionProbe?: () => string | null;
+	disableHooks?: boolean;
 	force?: boolean;
+	/** Repair stale managed caches and verified claims from exited publishers. */
+	repairPluginCache?: boolean;
 	mergeAgents?: boolean;
 	mergeAgentsPolicy?: { kind: "set"; value: boolean } | { kind: "clear" };
 	dryRun?: boolean;
@@ -196,7 +207,8 @@ interface SetupOptions {
 	scope?: SetupScope;
 	verbose?: boolean;
 	agentsOverwritePrompt?: (destinationPath: string) => Promise<boolean>;
-	skipNativeAgentRefresh?: boolean;
+	/** Trusted setup-owned receipt location, never inside the user skills directory. */
+	skillReceiptPath?: string;
 	setupScopePrompt?: (defaultScope: SetupScope) => Promise<SetupScope>;
 	persistedSetupReviewPrompt?: (
 		preferences: Partial<PersistedSetupScope>,
@@ -265,6 +277,8 @@ export interface SkillFrontmatterMetadata {
 
 const PROJECT_GITIGNORE_ENTRIES = [
 	".omx/",
+	".omx-state-locks/",
+	".omx-state-locks.identity.json",
 	".codex/*",
 	"!.codex/agents/",
 	"!.codex/agents/**",
@@ -277,8 +291,6 @@ const PROJECT_GITIGNORE_ENTRIES = [
 const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
 const SETUP_ONLY_INSTALLABLE_SKILLS = new Set(["wiki"]);
 const DEFAULT_SETUP_MCP_MODE: SetupMcpMode = "none";
-const SKIP_NATIVE_AGENT_REFRESH_ENV = "OMX_SKIP_NATIVE_AGENT_REFRESH";
-const HARD_DEPRECATED_SKILL_NAMES = new Set(["web-clone"]);
 const TEAM_MODE_SKILL_NAMES = new Set(["team", "worker"]);
 const TEAM_MODE_PROMPT_NAMES = new Set(["team-executor"]);
 const TEAM_MODE_NATIVE_AGENT_NAMES = new Set(["team-executor"]);
@@ -332,42 +344,77 @@ function stripNamedXmlSection(content: string, sectionName: string): string {
 	);
 }
 
-function applyTeamModeToAgentsTemplate(content: string, teamMode: SetupTeamMode): string {
+/**
+ * #3699: clause-level rewrites for lines that mix Team wording with guidance that
+ * must survive Team opt-out (native subagent delegation, child-agent limits,
+ * cancellation and state-ownership invariants). Dropping such lines wholesale
+ * deleted non-Team rules and left malformed sentences behind.
+ */
+const TEAM_DISABLED_CLAUSE_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
+	[/ THIS IS COMPLEMENTARY TO OMX TEAM MODE\./g, ""],
+	[/Within one Codex session or team pane,/g, "Within one Codex session,"],
+	[/;\s*`worker` is a team-runtime surface, not a general-purpose child role/g, ""],
+	[/Use Team only for durable multi-lane coordination that is worth the overhead; when/g, "When"],
+	[/Outside active `team`\/`swarm` mode,/g, "Outside active `swarm` mode,"],
+	[/current, proven session or Team scope/g, "current, proven session scope"],
+	[/, legacy roots, Team artifacts, and tmux sessions untouched/g, ", legacy roots, and tmux sessions untouched"],
+	[/hook boundaries, cancellation, and Team coordination\./g, "hook boundaries, and cancellation."],
+];
+
+/**
+ * #3699: lines whose entire subject is the Team runtime. Each pattern must be
+ * anchored on the Team-only subject so that future mixed guidance is rewritten
+ * by {@link TEAM_DISABLED_CLAUSE_REWRITES} instead of silently disappearing.
+ */
+const TEAM_DISABLED_LINE_DROP_PATTERNS: readonly RegExp[] = [
+	/^- Use `\$team` when\b/i,
+	/^- Reserve `worker` strictly for active\b/i,
+	/^- `worker` is a team-runtime surface\b/i,
+	/^- `<!-- OMX:TEAM:WORKER:START -->/,
+	/^- Teams may \b/i,
+	/^- The Team state files\b/i,
+	/^- Team cancellation requires\b/i,
+	/^- Team runtime is explicit\b/i,
+	/^- Team shutdown waits\b/i,
+	/^- Workers ACK startup\b/i,
+	/^- Prefer durable state writes and `omx team api\b/i,
+	/team mode/i,
+	/team orchestration/i,
+	/team pipeline/i,
+	/omx team/i,
+];
+
+function stripMarkdownSection(content: string, heading: string): string {
+	return content.replace(
+		new RegExp(`\\n${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n[\\s\\S]*?(?=\\n#{2,3} )`, "g"),
+		"\n",
+	);
+}
+
+export function applyTeamModeToAgentsTemplate(content: string, teamMode: SetupTeamMode): string {
 	if (teamModeEnabled(teamMode)) return content;
 
 	let next = content;
 	for (const section of ["team_compositions", "team_pipeline", "team_model_resolution"]) {
 		next = stripNamedXmlSection(next, section);
 	}
+	next = stripMarkdownSection(next, "### Team protocol");
 
-	return next
+	for (const [pattern, replacement] of TEAM_DISABLED_CLAUSE_REWRITES) {
+		next = next.replace(pattern, replacement);
+	}
+	next = next
 		.replace(/\(\+ \$team if needed\)/g, "")
-		.replace(/- `\$team` when[^\n]*\n/g, "")
 		.replace(/,?\s*`team`,?/g, "")
 		.replace(/\s*\|\s*`\$team ".*?"`\s*\|.*\|\n/g, "\n")
+		.replace(/\/?\s*`team`\/`swarm`/g, "`swarm`");
+
+	return next
+		.split("\n")
+		.filter((line) => !TEAM_DISABLED_LINE_DROP_PATTERNS.some((pattern) => pattern.test(line)))
+		.join("\n")
 		.replace(/,?\s*`\$team`/g, "")
 		.replace(/`\$team`,?\s*/g, "")
-		.replace(/\/?\s*`team`\/`swarm`/g, "`swarm`")
-		.split("\n")
-		.filter((line) => {
-			const normalized = line.toLowerCase();
-			if (normalized.includes("team mode")) return false;
-			if (normalized.includes("team runtime")) return false;
-			if (normalized.includes("team orchestration")) return false;
-			if (normalized.includes("team/swarm")) return false;
-			if (normalized.includes("team pipeline")) return false;
-			if (normalized.includes("runtime/team")) return false;
-			if (normalized.includes("team overlays")) return false;
-			if (normalized.includes("team pane")) return false;
-			if (normalized.startsWith("- teams may ")) return false;
-			if (normalized.includes("outside active `team`")) return false;
-			if (normalized.includes("reserve `worker`")) return false;
-			if (normalized.includes("worker` is a team-runtime")) return false;
-			if (normalized.includes("team-plan")) return false;
-			if (normalized.includes("omx team")) return false;
-			return true;
-		})
-		.join("\n")
 		.replace(/\n{3,}/g, "\n\n");
 }
 
@@ -406,7 +453,7 @@ const REQUIRED_TEAM_CLI_API_MARKERS = [
 const DEFAULT_SETUP_SCOPE: SetupScope = "user";
 const DEFAULT_SETUP_INSTALL_MODE: SetupInstallMode = "legacy";
 const LEGACY_SETUP_MODELS = new Set(["gpt-5.3-codex", "gpt-5.5"]);
-const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
+const DEFAULT_SETUP_MODEL = DEFAULT_LEADER_MODEL;
 const OBSOLETE_NATIVE_AGENT_FIELD = ["skill", "ref"].join("_");
 const GITHUB_AUTH_STATUS_TIMEOUT_MS = 2_000;
 
@@ -443,9 +490,14 @@ function getBackupContext(
 			baseRoot: projectRoot,
 		};
 	}
+	// For user scope, keep backups under ~/.omx/backups (not under CODEX_HOME).
+	// The baseRoot is used for validation scope determination per destination:
+	// - Destinations under CODEX_HOME are validated against CODEX_HOME
+	// - Destinations under ~/.omx are validated against homedir() (or OMX_ROOT if set)
+	const homeDir = homedir();
 	return {
-		backupRoot: join(homedir(), ".omx", "backups", "setup", timestamp),
-		baseRoot: homedir(),
+		backupRoot: join(homeDir, ".omx", "backups", "setup", timestamp),
+		baseRoot: homeDir,
 	};
 }
 
@@ -1939,16 +1991,50 @@ async function cleanupNativeHookTransactionStagedDeletions(
 	}
 }
 
+/**
+ * Sanitize an absolute path to be a valid relative path component for backups.
+ * Handles Windows paths by removing drive letters, colons, and backslashes.
+ * On Windows: C:\custom-codex\config.toml -> custom-codex_config.toml
+ * On Unix: /custom-codex/config.toml -> custom-codex_config.toml
+ */
+function sanitizePathForBackup(absPath: string): string {
+	// Remove the Windows drive letter (e.g., "C:"), then leading slashes and backslashes
+	let sanitized = absPath.replace(/^[A-Za-z]:/, "").replace(/^[\\/]+/, "");
+	// Remove any remaining backslashes and colons, replacing with underscores
+	sanitized = sanitized.replace(/[\\/\\:]/g, "_");
+	// Collapse multiple underscores
+	sanitized = sanitized.replace(/_+/g, "_");
+	return sanitized;
+}
+
+/**
+ * Relative location of `targetPath` inside a backup root. Falls back to a sanitized
+ * absolute path when the target is outside `baseRoot`, including Windows cross-drive
+ * targets where `relative()` returns an absolute path instead of a `..` path.
+ */
+export function backupRelativePath(
+	baseRoot: string,
+	targetPath: string,
+	pathApi: Pick<typeof import("path"), "relative" | "isAbsolute"> = { relative, isAbsolute },
+): string {
+	const relativePath = pathApi.relative(baseRoot, targetPath);
+	if (
+		relativePath === "" ||
+		relativePath === ".." ||
+		relativePath.startsWith("../") ||
+		relativePath.startsWith("..\\") ||
+		pathApi.isAbsolute(relativePath)
+	) {
+		return sanitizePathForBackup(targetPath);
+	}
+	return relativePath;
+}
+
 function nativeHookTransactionBackupPath(
 	artifactPath: string,
 	backupContext: SetupBackupContext,
 ): string {
-	const relativePath = relative(backupContext.baseRoot, artifactPath);
-	const safeRelativePath =
-		relativePath.startsWith("..") || relativePath === ""
-			? artifactPath.replace(/^[/]+/, "")
-			: relativePath;
-	return join(backupContext.backupRoot, safeRelativePath);
+	return join(backupContext.backupRoot, backupRelativePath(backupContext.baseRoot, artifactPath));
 }
 
 async function ensureSnapshotBackup(
@@ -2139,22 +2225,287 @@ async function commitNativeHookTransaction(
 }
 
 
+/**
+ * Canonicalize a path to its real form using the deepest-existing-ancestor pattern.
+ * Uses fs.realpath (follows symlinks) on the deepest existing component, then
+ * re-appends any non-existent tail. This ensures consistent handling of OS-level
+ * symlinks in parent directories (e.g., /tmp -> /private/tmp on macOS).
+ * #4352912480: Handles MISSING scope roots by canonicalizing through deepest existing ancestor.
+ */
+async function canonicalizePathToRealForm(absolutePath: string): Promise<string> {
+	let realPath: string = absolutePath;
+	let currentPath = absolutePath;
+	
+	while (currentPath && currentPath !== dirname(currentPath)) {
+		try {
+			// Check with lstat first to detect dangling symlinks before realpath (#4353639282)
+			// If this component is a symlink (even dangling), try its parent instead of following it
+			try {
+				const stats = await lstat(currentPath);
+				if (stats.isSymbolicLink()) {
+					// This is a symlink; don't follow it, try the parent instead
+					currentPath = dirname(currentPath);
+					continue;
+				}
+			} catch (lstatError) {
+				// lstat failed; this might be ENOENT, continue to realpath attempt
+			}
+			
+			// Try to realpath the current component (follows all symlinks)
+			realPath = await realpath(currentPath);
+			// Successfully realpathhed; now append the remaining tail
+			const tail = absolutePath.slice(currentPath.length);
+			realPath = tail ? join(realPath, tail) : realPath;
+			break;
+		} catch (error) {
+			if (isMissingPathError(error)) {
+				// This component doesn't exist; try its parent
+				currentPath = dirname(currentPath);
+				if (currentPath === dirname(currentPath)) {
+					// Reached the filesystem root; use absolute path as-is
+				realPath = absolutePath;
+				break;
+				}
+			} else {
+				throw error;
+			}
+		}
+	}
+	
+	return realPath;
+}
+
+/**
+ * Try to find an alternative symlinked path that resolves to the canonical path.
+ * Used for error messages to show symlinked paths when possible.
+ */
+async function findSymlinkedAlternativePath(canonicalPath: string): Promise<string | null> {
+	try {
+		const parts = canonicalPath.split(sep).filter(Boolean);
+		if (parts.length < 2) return null;
+		
+		// Walk up the canonical path, checking each ancestor for symlinks
+		for (let i = 1; i < parts.length; i++) {
+			const canonicalPrefix = sep + parts.slice(0, i).join(sep);
+			const suffix = parts.slice(i).join(sep);
+			
+			try {
+				const parentDir = dirname(canonicalPrefix);
+				const baseName = basename(canonicalPrefix);
+				
+				// Check if there's a symlink with the same name at the same level
+				try {
+					const symlinkPath = join(parentDir, baseName);
+					const stat = await lstat(symlinkPath);
+					if (stat.isSymbolicLink()) {
+						// Verify it points to the right place
+						const target = await canonicalizePathToRealForm(symlinkPath);
+						if (target === canonicalPrefix) {
+							return join(symlinkPath, suffix);
+						}
+					}
+				} catch {
+					// Continue if this check fails
+				}
+			} catch {
+				// Continue searching
+			}
+		}
+	} catch {
+		// If anything goes wrong, return null and use the canonical path
+	}
+	return null;
+}
+
+/**
+ * Validates that a destination path is safe for managed setup operations (install, read, compare).
+ * Refuses if the destination is a symlink or lies outside the specified scope root,
+ * or if any ancestor component within the scope is a symlink.
+ *
+ * This guard prevents symlink attacks that would redirect reads, backups, and writes outside
+ * the managed tree. Uses a single algorithm that:
+ * 1. Canonicalizes the scope root via deepest-existing-ancestor realpath (follows ALL symlinks)
+ * 2. Walks prefixes of the LEXICAL absolute destination from shortest to longest
+ * 3. Finds the FIRST prefix P whose deepest-existing-ancestor canonical form equals canonicalScope
+ * 4. For each lexical component after P down to destination, lstat it:
+ *    - symlink (including dangling) → throw error
+ *    - ENOENT → stop (rest is missing, fine)
+ *
+ * This handles cases like /tmp -> /private/tmp on macOS where scopeRoot and destination
+ * may be in different lexical forms but resolve to the same canonical path.
+ *
+ * MUST be called BEFORE reading/comparing contents and BEFORE mkdir of any intermediate dir.
+ * It is the single authoritative source of symlink validation for all managed scope writes.
+ *
+ * Addresses Codex findings:
+ * - 4351464979: validate before compare (filesDiffer) ✓
+ * - 4351464989: validate before compare (readFile) ✓
+ * - 4351560195: respects CODEX_HOME via codexHome() ✓
+ * - 4351560207: validate before compare ✓
+ * - 4351560219: validate before mkdir ✓
+ * - 4352912480: canonicalizes through OS-level symlinks in ancestors ✓
+ * - 4352912502: validates against override root ✓
+ */
+async function assertManagedDestination(
+	destinationPath: string,
+	scopeRoot: string,
+): Promise<void> {
+	// Resolve paths to absolute forms
+	const absolutePath = isAbsolute(destinationPath) ? destinationPath : join(process.cwd(), destinationPath);
+	const absoluteScopeRoot = isAbsolute(scopeRoot) ? scopeRoot : join(process.cwd(), scopeRoot);
+	
+	// Step 1: Canonicalize the scope root via deepest-existing-ancestor realpath.
+	const canonicalScope = await canonicalizePathToRealForm(absoluteScopeRoot);
+	
+	// Step 2 & 3: Walk lexical prefixes of destination to find the matching scope point.
+	// Build the list of prefixes from root downward.
+	const prefixes: string[] = [];
+	let currentPrefix = absolutePath;
+	while (true) {
+		prefixes.unshift(currentPrefix);
+		if (currentPrefix === sep) break;
+		const parent = dirname(currentPrefix);
+		if (parent === currentPrefix) {
+			// Shouldn't happen, but break to avoid infinite loop
+			break;
+		}
+		currentPrefix = parent;
+	}
+	
+	let matchingPrefixPath = '';
+	for (const prefix of prefixes) {
+		const canonicalPrefix = await canonicalizePathToRealForm(prefix);
+		if (canonicalPrefix === canonicalScope) {
+			matchingPrefixPath = prefix;
+			break;
+		}
+	}
+	
+	if (!matchingPrefixPath) {
+		// No prefix matched the scope; destination is outside managed scope
+		throw new Error(
+			`Destination ${absolutePath} is outside managed scope ${absoluteScopeRoot}.`,
+		);
+	}
+	
+	// Step 4: For each component lexically after the matching prefix, check with lstat.
+	// Extract the remaining path components after the matching prefix.
+	let current = matchingPrefixPath;
+	const remaining = relative(current, absolutePath);
+	
+	if (remaining && remaining !== '.') {
+		const remainingComponents = remaining.split(sep);
+		let currentForDisplay = matchingPrefixPath;
+		
+		for (const component of remainingComponents) {
+			current = join(current, component);
+			currentForDisplay = join(currentForDisplay, component);
+			
+			try {
+				const stats = await lstat(current);
+				if (stats.isSymbolicLink()) {
+					// Try to find a symlinked alternative path for the error message
+					let displayPath = current;
+					const altPath = await findSymlinkedAlternativePath(current);
+					if (altPath) {
+						displayPath = altPath;
+					}
+					
+					const msg =
+						`Refusing to install through symlink ${displayPath}. ` +
+						`Either remove the symlink (rm ${displayPath}), ` +
+						`or move the target to the expected location before running setup again.`;
+					throw new Error(msg);
+				}
+			} catch (error) {
+				// If component doesn't exist yet, that's fine; we'll create it during mkdir
+				if (isMissingPathError(error)) {
+					// Stop checking further components; rest of path is missing
+					break;
+				}
+				// Re-throw symlink errors and other unexpected errors
+				if (error instanceof Error && error.message.includes('Refusing to install through symlink')) {
+					throw error;
+				}
+				throw error;
+			}
+		}
+	}
+}
+
+
+
+/**
+ * Determine the validation scope root for a destination based on its location.
+ * Canonicalizes paths to handle OS-level symlinks (e.g., /tmp -> /private/tmp on macOS).
+ * For project scope: validates against projectRoot (#4352912487)
+ * Destinations under CODEX_HOME validate against CODEX_HOME;
+ * Destinations under OMX_ROOT (if set) validate against OMX_ROOT (#4352912502);
+ * other paths (like ~/.omx, ~/.claude) validate against the user's home.
+ */
+async function getValidationScopeRoot(destinationPath: string): Promise<string> {
+	const absPath = isAbsolute(destinationPath) ? destinationPath : join(process.cwd(), destinationPath);
+	const projectRoot = process.cwd();
+	const codexHomeDir = codexHome();
+	const projectCodexHome = join(projectRoot, ".codex");
+	
+	// Canonicalize both paths to handle symlinks consistently
+	const realDestPath = await canonicalizePathToRealForm(absPath);
+	const realCodexHome = await canonicalizePathToRealForm(
+		isAbsolute(codexHomeDir) ? codexHomeDir : join(process.cwd(), codexHomeDir)
+	);
+	const realProjectCodexHome = await canonicalizePathToRealForm(projectCodexHome);
+	const realProjectRoot = await canonicalizePathToRealForm(projectRoot);
+
+	// Check OMX_ROOT override first (#4352912502)
+	const omxRoot = process.env.OMX_ROOT;
+	if (omxRoot) {
+		const realOmxRoot = await canonicalizePathToRealForm(
+			isAbsolute(omxRoot) ? omxRoot : join(process.cwd(), omxRoot)
+		);
+		if (realDestPath.startsWith(realOmxRoot + sep) || realDestPath === realOmxRoot) {
+			return realOmxRoot; // Return the canonical OMX_ROOT for consistent scope comparison
+		}
+	}
+	
+	// Check if destination is under project root or project .codex (#4352912487)
+	// This indicates project scope files that should validate against projectRoot
+	if (realDestPath.startsWith(realProjectRoot + sep) || realDestPath === realProjectRoot ||
+		realDestPath.startsWith(realProjectCodexHome + sep) || realDestPath === realProjectCodexHome) {
+		// If the destination is under the project root but NOT under user's CODEX_HOME,
+		// it's a project-scoped file that should validate against projectRoot
+		if (!realDestPath.startsWith(realCodexHome + sep) && realDestPath !== realCodexHome) {
+			return realProjectRoot; // Return canonical project root
+		}
+	}
+	
+	// Check if the destination is under CODEX_HOME (using real paths for comparison)
+	if (realDestPath.startsWith(realCodexHome + sep) || realDestPath === realCodexHome) {
+		return realCodexHome; // Return the canonical CODEX_HOME for consistent scope comparison
+	}
+	
+	// Otherwise, it's validated against the home directory
+	return await canonicalizePathToRealForm(homedir());
+}
+
 async function ensureBackup(
 	destinationPath: string,
 	contentChanged: boolean,
 	backupContext: SetupBackupContext,
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 ): Promise<boolean> {
+	const scopeRoot = await getValidationScopeRoot(destinationPath);
+	await assertManagedDestination(destinationPath, scopeRoot);
 	if (!contentChanged || !existsSync(destinationPath)) return false;
 
-	const relativePath = relative(backupContext.baseRoot, destinationPath);
-	const safeRelativePath =
-		relativePath.startsWith("..") || relativePath === ""
-			? destinationPath.replace(/^[/]+/, "")
-			: relativePath;
-	const backupPath = join(backupContext.backupRoot, safeRelativePath);
+	const backupPath = join(
+		backupContext.backupRoot,
+		backupRelativePath(backupContext.baseRoot, destinationPath),
+	);
 
 	if (!options.dryRun) {
+		const backupScopeRoot = await getValidationScopeRoot(backupPath);
+		await assertManagedDestination(backupPath, backupScopeRoot);
 		await mkdir(dirname(backupPath), { recursive: true });
 		await copyFile(destinationPath, backupPath);
 	}
@@ -2292,12 +2643,201 @@ export async function validateSkillFile(skillMdPath: string): Promise<void> {
 	parseSkillFrontmatter(content, skillMdPath);
 }
 
+const INSTALLED_SKILL_BADGE_PREFIX = "[OMX] ";
+
+/**
+ * Does this installed skill directory carry the badge OMX writes on install?
+ *
+ * The badge replaced a hand-maintained name list as the SIGNAL that a directory came from OMX, and it
+ * is the only such signal that survives a skill being deleted from the catalog. It is NOT sufficient
+ * for deletion on its own: a user who edits the body keeps the badge, so ordinary removal paths also
+ * require `isUnmodifiedRecordedInstall` proof from the install receipt. The single exception is
+ * `--force` on a catalog-known name, which is an explicit destructive opt-in.
+ */
+/**
+ * Per-file digests of what OMX actually installed, so retirement can prove a directory is an
+ * UNMODIFIED OMX install rather than merely badged.
+ *
+ * The description badge alone is not sufficient ownership evidence for deletion: a user who edits the
+ * body of a retired skill keeps the badge, and archiving their edit is not preserving it. A receipt
+ * distinguishes "we wrote exactly these bytes" from "this looks like ours". Directories with no
+ * receipt - including installs that predate it - are conservatively RETAINED, which trades slower
+ * cleanup of legacy installs for never deleting user work.
+ */
+interface InstalledSkillReceipt {
+  version: 1;
+  skills: Record<string, { files: Record<string, string> }>;
+}
+
+function installedSkillReceiptPath(scope: SetupScope, projectRoot: string): string {
+  // For user scope, use CODEX_HOME as the managed authority root, not the user's home directory.
+  const authorityRoot = scope === "project" ? projectRoot : codexHome();
+  return join(authorityRoot, ".omx", "state", "setup", "installed-skills.json");
+}
+
+async function readInstalledSkillReceipt(receiptPath: string, legacyReceiptPath?: string): Promise<InstalledSkillReceipt> {
+  const parseReceipt = (content: string): InstalledSkillReceipt | null => {
+    try {
+      const parsed = JSON.parse(content) as InstalledSkillReceipt;
+      if (parsed?.version === 1 && parsed.skills && typeof parsed.skills === "object") {
+        // Re-key through a prototype-less record so a `__proto__` entry in a persisted receipt is a
+        // real own property on both sides of the comparison.
+        const skills: InstalledSkillReceipt["skills"] = Object.create(null);
+        for (const [name, entry] of Object.entries(parsed.skills)) {
+          const files: Record<string, string> = Object.create(null) as Record<string, string>;
+          for (const [file, digest] of Object.entries(entry?.files ?? {})) files[file] = String(digest);
+          skills[name] = { files };
+        }
+        return { version: 1, skills };
+      }
+    } catch {
+      // Invalid or malformed receipt
+    }
+    return null;
+  };
+
+  // Try reading from the new receipt path first
+  try {
+    const content = await readFile(receiptPath, "utf-8");
+    const parsed = parseReceipt(content);
+    if (parsed) return parsed;
+  } catch {
+    // New receipt does not exist or is unreadable; try legacy path
+  }
+
+  // Try reading from the legacy receipt path if provided
+  if (legacyReceiptPath) {
+    try {
+      const content = await readFile(legacyReceiptPath, "utf-8");
+      const parsed = parseReceipt(content);
+      if (parsed) return parsed;
+    } catch {
+      // Legacy receipt does not exist or is unreadable
+    }
+  }
+
+  // No valid receipt found; return empty receipt
+  return { version: 1, skills: Object.create(null) as InstalledSkillReceipt["skills"] };
+}
+
+/**
+ * Digest the CURRENT contents of a skill directory, used to compare against a receipt.
+ *
+ * Non-regular entries (symlinks, sockets) are recorded as a sentinel rather than skipped, so a
+ * directory containing one can never compare equal to a receipt of regular files and is therefore
+ * retained instead of deleted.
+ */
+async function digestSkillDirectory(skillDir: string): Promise<Record<string, string>> {
+  // Prototype-less: a file literally named `__proto__` assigned into a normal object literal is not an
+  // own enumerable property, so it would vanish from Object.keys() and let a user entry be deleted
+  // while the comparison still reported equality.
+  const files: Record<string, string> = Object.create(null) as Record<string, string>;
+  const walk = async (dir: string, prefix: string): Promise<void> => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full, relPath);
+        continue;
+      }
+      if (!entry.isFile()) {
+        files[relPath] = "non-regular-entry";
+        continue;
+      }
+      files[relPath] = createHash("sha256").update(await readFile(full)).digest("hex");
+    }
+  };
+  await walk(skillDir, "");
+  return files;
+}
+
+/** True only when every current file matches the digest OMX recorded at install time. */
+async function isUnmodifiedRecordedInstall(
+  receiptPath: string,
+  skillName: string,
+  skillDir: string,
+  legacyReceiptPath?: string,
+): Promise<boolean> {
+  const receipt = await readInstalledSkillReceipt(receiptPath, legacyReceiptPath);
+  const recorded = receipt.skills[skillName]?.files;
+  if (!recorded || Object.keys(recorded).length === 0) return false;
+  let current: Record<string, string>;
+  try {
+    current = await digestSkillDirectory(skillDir);
+  } catch {
+    return false;
+  }
+  const recordedNames = Object.keys(recorded).sort();
+  const currentNames = Object.keys(current).sort();
+  if (recordedNames.length !== currentNames.length) return false;
+  return recordedNames.every((name, index) => currentNames[index] === name && current[name] === recorded[name]);
+}
+
+/**
+ * Record digests for EXACTLY the files OMX wrote, keyed by skill.
+ *
+ * Digesting the destination tree instead would poison the receipt: a note a user drops into an active
+ * skill directory would be recorded as OMX-owned and then deleted when that skill is later retired.
+ * The receipt therefore describes the installer's own output, and any extra entry present at
+ * retirement time makes the comparison fail, which retains the directory.
+ */
+async function writeInstalledSkillReceipt(
+  receiptPath: string,
+  skillsDir: string,
+  writtenFilesBySkill: ReadonlyMap<string, readonly string[]>,
+  options: Pick<SetupOptions, "dryRun">,
+  scopeRoot: string,
+): Promise<void> {
+  if (options.dryRun) return;
+  const receipt = await readInstalledSkillReceipt(receiptPath);
+  for (const [name, relativePaths] of writtenFilesBySkill) {
+    const files: Record<string, string> = Object.create(null) as Record<string, string>;
+    let complete = true;
+    for (const relPath of relativePaths) {
+      const full = join(skillsDir, name, relPath);
+      try {
+        files[relPath] = createHash("sha256").update(await readFile(full)).digest("hex");
+      } catch {
+        complete = false;
+        break;
+      }
+    }
+    if (complete && Object.keys(files).length > 0) receipt.skills[name] = { files };
+    else delete receipt.skills[name];
+  }
+  try {
+    await assertManagedDestination(receiptPath, scopeRoot);
+    await mkdir(dirname(receiptPath), { recursive: true });
+    await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+  } catch (error) {
+    // Symlink assertions must propagate to prevent writes through symlinks
+    if (error instanceof Error && error.message.includes('Refusing to install through symlink')) {
+      throw error;
+    }
+    // A receipt we cannot persist for other reasons simply means the next refresh retains conservatively.
+  }
+}
+
+async function isOmxManagedInstalledSkillDir(skillDir: string): Promise<boolean> {
+	const skillMdPath = join(skillDir, "SKILL.md");
+	if (!existsSync(skillMdPath)) return false;
+	try {
+		const metadata = parseSkillFrontmatter(
+			await readFile(skillMdPath, "utf-8"),
+			skillMdPath,
+		);
+		return metadata.description.startsWith(INSTALLED_SKILL_BADGE_PREFIX);
+	} catch {
+		return false;
+	}
+}
+
 function rewriteInstalledSkillDescriptionBadge(
 	content: string,
 	filePath = "SKILL.md",
 ): string {
 	const metadata = parseSkillFrontmatter(content, filePath);
-	const badgePrefix = "[OMX] ";
+	const badgePrefix = INSTALLED_SKILL_BADGE_PREFIX;
 	const displayDescription = metadata.description.startsWith(badgePrefix)
 		? metadata.description
 		: `${badgePrefix}${metadata.description}`;
@@ -2800,204 +3340,11 @@ async function resolveSetupScope(
 	return { scope: DEFAULT_SETUP_SCOPE, source: "default" };
 }
 
-async function readPluginManifestName(
-	manifestPath: string,
-): Promise<string | null> {
-	try {
-		const parsed = JSON.parse(await readFile(manifestPath, "utf-8")) as unknown;
-		return typeof parsed === "object" &&
-			parsed !== null &&
-			"name" in parsed &&
-			typeof (parsed as { name?: unknown }).name === "string"
-			? (parsed as { name: string }).name
-			: null;
-	} catch {
-		return null;
-	}
-}
-
-interface OmxPluginCacheManifest {
-	name: string | null;
-	version: string | null;
-	skills: string | null;
-	hooks: string | null;
-}
-
-async function readPluginManifestSummary(
-	manifestPath: string,
-): Promise<OmxPluginCacheManifest | null> {
-	try {
-		const parsed = JSON.parse(await readFile(manifestPath, "utf-8")) as unknown;
-		if (typeof parsed !== "object" || parsed === null) return null;
-		const manifest = parsed as {
-			name?: unknown;
-			version?: unknown;
-			skills?: unknown;
-			hooks?: unknown;
-		};
-		return {
-			name: typeof manifest.name === "string" ? manifest.name : null,
-			version: typeof manifest.version === "string" ? manifest.version : null,
-			skills: typeof manifest.skills === "string" ? manifest.skills : null,
-			hooks: typeof manifest.hooks === "string" ? manifest.hooks : null,
-		};
-	} catch {
-		return null;
-	}
-}
-
-async function listChildDirectoryNames(dir: string): Promise<string[] | null> {
-	try {
-		const entries = await readdir(dir, { withFileTypes: true });
-		return entries
-			.filter((entry) => entry.isDirectory())
-			.map((entry) => entry.name)
-			.sort();
-	} catch {
-		return null;
-	}
-}
-
-async function discoverOmxPluginCacheDirs(
-	cacheRoot = join(codexHome(), "plugins", "cache"),
-): Promise<string[]> {
-	if (!existsSync(cacheRoot)) return [];
-
-	const queue: Array<{ path: string; depth: number }> = [
-		{ path: cacheRoot, depth: 0 },
-	];
-	const maxDepth = 5;
-	const matches: string[] = [];
-
-	while (queue.length > 0) {
-		const current = queue.shift();
-		if (!current) break;
-
-		const manifestPath = join(current.path, ".codex-plugin", "plugin.json");
-		if (existsSync(manifestPath)) {
-			const name = await readPluginManifestName(manifestPath);
-			if (name === "oh-my-codex") {
-				matches.push(current.path);
-				continue;
-			}
-		}
-
-		if (current.depth >= maxDepth) continue;
-
-		let entries;
-		try {
-			entries = await readdir(current.path, { withFileTypes: true });
-		} catch {
-			continue;
-		}
-
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			if (entry.name === ".git" || entry.name === "node_modules") continue;
-			queue.push({
-				path: join(current.path, entry.name),
-				depth: current.depth + 1,
-			});
-		}
-	}
-
-	return matches.sort();
-}
-
 async function discoverOmxPluginCacheDir(
-	cacheRoot = join(codexHome(), "plugins", "cache"),
-): Promise<string | null> {
-	return (await discoverOmxPluginCacheDirs(cacheRoot))[0] ?? null;
-}
-
-interface PluginDiscoveryCacheRefreshResult {
-	status: "unavailable" | "unchanged" | "refreshed";
-	staleDirs: string[];
-}
-
-async function refreshOmxPluginDiscoveryCache(
-	pkgRoot: string,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
 	codexHomeDir = codexHome(),
-): Promise<PluginDiscoveryCacheRefreshResult> {
-	const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
-	if (!packagedMarketplace) {
-		return { status: "unavailable", staleDirs: [] };
-	}
-
-	const [pkg, expectedSkillNames, cachedDirs] = await Promise.all([
-		readFile(join(pkgRoot, "package.json"), "utf-8").then((raw) =>
-			JSON.parse(raw) as { version?: unknown },
-		),
-		listChildDirectoryNames(join(packagedMarketplace.pluginRoot, "skills")),
-		discoverOmxPluginCacheDirs(join(codexHomeDir, "plugins", "cache")),
-	]);
-	const expectedVersion = typeof pkg.version === "string" ? pkg.version : null;
-	const staleDirs: string[] = [];
-
-	for (const cacheDir of cachedDirs) {
-		const manifest = await readPluginManifestSummary(
-			join(cacheDir, ".codex-plugin", "plugin.json"),
-		);
-		if (manifest?.name !== "oh-my-codex") continue;
-
-		const cachedSkillNames = await listChildDirectoryNames(join(cacheDir, "skills"));
-		const versionChanged =
-			expectedVersion !== null && manifest.version !== expectedVersion;
-		const skillsPointerChanged = manifest.skills !== "./skills/";
-		const hooksPointerChanged = manifest.hooks !== "./hooks/hooks.json";
-		const hookFilesMissing = !existsSync(join(cacheDir, "hooks", "hooks.json"))
-			|| !existsSync(join(cacheDir, "hooks", "codex-native-hook.mjs"))
-			|| !existsSync(join(cacheDir, "hooks", "omx-command.json"));
-		const hookFilesChanged = !hookFilesMissing
-			&& !(await pluginHookCacheMatchesPackaged(cacheDir, packagedMarketplace));
-		const skillListChanged =
-			expectedSkillNames !== null &&
-			cachedSkillNames !== null &&
-			JSON.stringify(cachedSkillNames) !== JSON.stringify(expectedSkillNames);
-
-		if (
-			!versionChanged &&
-			!skillsPointerChanged &&
-			!hooksPointerChanged &&
-			!hookFilesMissing &&
-			!hookFilesChanged &&
-			!skillListChanged
-		) continue;
-
-
-
-		staleDirs.push(cacheDir);
-		if (!options.dryRun) {
-			await rm(cacheDir, { recursive: true, force: true });
-		}
-		if (options.verbose) {
-			const reasons = [
-				versionChanged
-					? `version ${manifest.version ?? "unknown"} -> ${expectedVersion}`
-					: null,
-				skillsPointerChanged
-					? `skills pointer ${manifest.skills ?? "missing"} -> ./skills/`
-					: null,
-				hooksPointerChanged
-					? `hooks pointer ${manifest.hooks ?? "missing"} -> ./hooks/hooks.json`
-					: null,
-				hookFilesMissing ? "plugin hook files missing" : null,
-				hookFilesChanged ? "plugin hook files changed" : null,
-				skillListChanged ? "skill directory list changed" : null,
-			].filter(Boolean);
-			console.log(
-				`  ${options.dryRun ? "would invalidate" : "invalidated"} Codex plugin discovery cache ${cacheDir} (${reasons.join(", ")})`,
-			);
-		}
-	}
-
-	return {
-		status: staleDirs.length > 0 ? "refreshed" : "unchanged",
-		staleDirs,
-	};
+): Promise<string | null> {
+	return (await discoverOmxPluginCacheDirs(codexHomeDir))[0] ?? null;
 }
-
 
 function resolveSetupMcpMode(
 	scope: SetupScope,
@@ -3127,6 +3474,7 @@ async function ensureProjectGitignore(
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 ): Promise<"created" | "updated" | "unchanged"> {
 	const gitignorePath = join(projectRoot, ".gitignore");
+	await assertManagedDestination(gitignorePath, projectRoot);
 	const destinationExists = existsSync(gitignorePath);
 	const existing = destinationExists
 		? await readFile(gitignorePath, "utf-8")
@@ -3384,6 +3732,9 @@ interface PluginModeHooksConfigPlan {
 	finalConfig: string;
 	hooksFinalContent: string | null;
 	hooksRemovedCount: number;
+	removedCoordinates: ManagedCodexHookRemovalCoordinate[];
+	coordinateMoves: ManagedCodexHookCoordinateMove[];
+	trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
 	cleanedLegacyConfig: boolean;
 	diagnostics: readonly { message: string }[];
 }
@@ -3397,6 +3748,7 @@ function buildPluginModeHooksConfigPlan(
 	options: {
 		codexHookFeatureFlag: CodexHookFeatureFlag;
 		pluginScopedHooks: boolean;
+		pluginHookFeatureFlag?: CodexPluginHookFeatureFlag;
 		preserveFirstPartyMcp?: boolean;
 		developerInstructionsDecision: PluginDeveloperInstructionsDecision;
 		platform: NodeJS.Platform;
@@ -3439,29 +3791,47 @@ function buildPluginModeHooksConfigPlan(
 		},
 	);
 
+	const configWithDefaultModel = Object.prototype.hasOwnProperty.call(
+		TOML.parse(configAfterLegacyCleanup),
+		"model",
+	)
+		? configAfterLegacyCleanup
+		: `model = ${JSON.stringify(DEFAULT_LEADER_MODEL)}\n${configAfterLegacyCleanup}`;
 	const configWithRuntimeFeatures = upsertPluginModeRuntimeFeatureFlags(
-		configAfterLegacyCleanup,
+		configWithDefaultModel,
 		options.codexHookFeatureFlag,
 		{
 			pluginScopedHooks: options.pluginScopedHooks,
+			pluginHookFeatureFlag: options.pluginHookFeatureFlag,
 			preserveNativeHooks:
 				options.pluginScopedHooks && managedHooksPlan?.hasForeignHooks === true,
 		},
 	);
+	const trustMigration = migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+		configWithRuntimeFeatures,
+		managedHooksPlan?.coordinateMoves ?? [],
+		{
+			managedTrustState: managedHookTrustState,
+			priorManagedHookTrustState,
+		},
+	);
+	const configWithManagedTrustState = upsertManagedCodexHookTrustState(
+		trustMigration.config,
+		pkgRoot,
+		hooksPath,
+		{
+			...managedHookOptions,
+			managedTrustState: managedHookTrustState,
+			legacyHookTrustState,
+		},
+	);
 	return {
-		finalConfig: upsertManagedCodexHookTrustState(
-			configWithRuntimeFeatures,
-			pkgRoot,
-			hooksPath,
-			{
-				...managedHookOptions,
-				managedTrustState: managedHookTrustState,
-				priorManagedHookTrustState,
-				legacyHookTrustState,
-			},
-		),
+		finalConfig: configWithManagedTrustState,
 		hooksFinalContent: managedHooksPlan ? managedHooksPlan.finalContent : existingHooksContent,
-	hooksRemovedCount: managedHooksPlan?.removedCount ?? 0,
+		hooksRemovedCount: managedHooksPlan?.removedCount ?? 0,
+		removedCoordinates: managedHooksPlan?.removedCoordinates ?? [],
+		coordinateMoves: managedHooksPlan?.coordinateMoves ?? [],
+		trustKeyRewrites: trustMigration.keyRewrites,
 		cleanedLegacyConfig: configAfterLegacyCleanup !== existingConfig,
 		diagnostics: managedHooksPlan?.diagnostics ?? [],
 	};
@@ -3545,6 +3915,9 @@ interface NativeHookSetupTransactionPlan {
 	cleanedLegacyConfig: boolean;
 	pluginMarketplaceResult: "updated" | "unchanged" | "unavailable";
 	pluginDeveloperInstructionsResult: "updated" | "exists" | "skipped";
+	removedCoordinates: ManagedCodexHookRemovalCoordinate[];
+	coordinateMoves: ManagedCodexHookCoordinateMove[];
+	trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
 	diagnostics: readonly { message: string }[];
 	modelUpgrade?: { currentModel: string; modelOverride: string };
 	repairedLegacyTeamRunTable: boolean;
@@ -3558,6 +3931,7 @@ interface PlanNativeHookSetupTransactionOptions {
 	platform: NodeJS.Platform;
 	isPluginInstallMode: boolean;
 	pluginScopedHooks: boolean;
+	pluginHookFeatureFlag?: CodexPluginHookFeatureFlag;
 	codexHookFeatureFlag: CodexHookFeatureFlag;
 	preserveFirstPartyMcp: boolean;
 	removeFirstPartyMcp: boolean;
@@ -3571,6 +3945,167 @@ interface PlanNativeHookSetupTransactionOptions {
 	forceStatusLinePreset: boolean;
 	configSnapshot: NativeHookTransactionArtifactSnapshot;
 	notifyMetadataSnapshot?: NativeHookTransactionArtifactSnapshot;
+	disableHooks?: boolean;
+}
+
+function stripLocalOmxPluginEnablementForDisable(config: string): string {
+	const lines = config.split(/\r?\n/);
+	const header = '[plugins."oh-my-codex@oh-my-codex-local"]';
+	const start = lines.findIndex((line) => line.trim() === header);
+	if (start >= 0) {
+		let end = lines.length;
+		for (let index = start + 1; index < lines.length; index += 1) {
+			if (/^\s*\[/.test(lines[index]!)) {
+				end = index;
+				break;
+			}
+		}
+		for (let index = end - 1; index > start; index -= 1) {
+			if (/^\s*enabled\s*=\s*true\s*(?:#.*)?$/.test(lines[index]!)) {
+				lines[index] = lines[index]!.replace("true", "false");
+				break;
+			}
+		}
+	}
+	const pluginsStart = lines.findIndex((line) => /^\s*\[plugins\]\s*$/.test(line));
+	if (pluginsStart >= 0) {
+		for (let index = pluginsStart + 1; index < lines.length && !/^\s*\[/.test(lines[index]!); index += 1) {
+			if (/^\s*"oh-my-codex@oh-my-codex-local"\s*=\s*true\s*(?:#.*)?$/.test(lines[index]!)) {
+				lines[index] = lines[index]!.replace("true", "false");
+				break;
+			}
+		}
+	}
+	return lines.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function stripHookFeatureFlagsForDisable(
+	config: string,
+	preserveNativeHooks: boolean,
+): string {
+	const lines = config.split(/\r?\n/);
+	const featuresStart = lines.findIndex((line) => /^\s*\[features\]\s*$/.test(line));
+	if (featuresStart < 0) return config;
+	let sectionEnd = lines.length;
+	for (let index = featuresStart + 1; index < lines.length; index += 1) {
+		if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[index]!)) {
+			sectionEnd = index;
+			break;
+		}
+	}
+	const removable = new Set(preserveNativeHooks
+		? ["plugin_hooks"]
+		: ["hooks", "codex_hooks", "plugin_hooks"]);
+	for (let index = sectionEnd - 1; index > featuresStart; index -= 1) {
+		const match = /^\s*([A-Za-z0-9_-]+)\s*=\s*true\s*(?:#.*)?$/.exec(lines[index]!);
+		if (match && removable.has(match[1]!)) lines[index] = lines[index]!.replace("true", "false");
+	}
+	const nextFeaturesStart = lines.findIndex((line) => /^\s*\[features\]\s*$/.test(line));
+	if (nextFeaturesStart >= 0) {
+		let nextSectionEnd = lines.length;
+		for (let index = nextFeaturesStart + 1; index < lines.length; index += 1) {
+			if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[index]!)) {
+				nextSectionEnd = index;
+				break;
+			}
+		}
+		if (lines.slice(nextFeaturesStart + 1, nextSectionEnd).every((line) => line.trim() === "")) {
+			lines.splice(nextFeaturesStart, nextSectionEnd - nextFeaturesStart);
+		}
+	}
+	return lines.join("\n");
+}
+
+interface DisableHooksNotifyPlan {
+	finalConfig: string;
+	trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"];
+	metadataPath?: string;
+	metadataAfter: Buffer | null;
+}
+
+function parseDisableHooksNotifyMetadata(
+	snapshot: NativeHookTransactionArtifactSnapshot,
+	metadataPath: string,
+	currentNotify: readonly string[],
+): string[] | null {
+	if (!snapshot.bytes) {
+		throw new ManagedCodexHooksPlanError(
+			"invalid_document",
+			`Refusing to remove managed notification dispatcher: metadata ${metadataPath} is missing.`,
+		);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(decodeNativeHookTransactionUtf8(snapshot.bytes, `notification metadata ${metadataPath}`));
+	} catch (error) {
+		throw new ManagedCodexHooksPlanError(
+			"invalid_document",
+			`Refusing to remove managed notification dispatcher: metadata ${metadataPath} is invalid JSON (${error instanceof Error ? error.message : String(error)}).`,
+		);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new ManagedCodexHooksPlanError("invalid_document", `Refusing to remove managed notification dispatcher: metadata ${metadataPath} must be an object.`);
+	}
+	const metadata = parsed as Record<string, unknown>;
+	const dispatcherNotify = metadata.dispatcherNotify;
+	if (metadata.managedBy !== "oh-my-codex" || metadata.version !== 1 ||
+		!Array.isArray(dispatcherNotify) ||
+		dispatcherNotify.length !== currentNotify.length ||
+		dispatcherNotify.some((part, index) => part !== currentNotify[index])) {
+		throw new ManagedCodexHooksPlanError("invalid_document", `Refusing to remove managed notification dispatcher: metadata ${metadataPath} does not prove OMX ownership.`);
+	}
+	const previousNotify = metadata.previousNotify;
+	if (previousNotify !== null && (!Array.isArray(previousNotify) || !previousNotify.every((part) => typeof part === "string"))) {
+		throw new ManagedCodexHooksPlanError("invalid_document", `Refusing to remove managed notification dispatcher: metadata ${metadataPath} has invalid previousNotify.`);
+	}
+	return sanitizePreviousNotifyCommand(previousNotify as string[] | null, getPackageRoot());
+}
+
+async function planDisableHooksConfig(
+	existingConfig: string,
+	pkgRoot: string,
+	managedHooksPlan: ManagedCodexHooksPlan | null,
+	coordinateMoves: readonly ManagedCodexHookCoordinateMove[],
+	codexHomeDir: string,
+	notifyMetadataSnapshot?: NativeHookTransactionArtifactSnapshot,
+): Promise<DisableHooksNotifyPlan> {
+	const priorManagedHookTrustState = managedHooksPlan?.priorTrustState ?? {};
+	const trustMigration = migrateManagedCodexHookTrustStateCoordinatesAfterRemovingManaged(
+		existingConfig,
+		coordinateMoves,
+		{ priorManagedHookTrustState },
+	);
+	let finalConfig = trustMigration.config;
+	finalConfig = stripHookFeatureFlagsForDisable(
+		finalConfig,
+		managedHooksPlan?.hasForeignHooks === true,
+	);
+	finalConfig = stripLocalOmxPluginEnablementForDisable(finalConfig);
+	const notify = getRootTomlArray(finalConfig, "notify");
+	if (!notify || !isOmxManagedNotifyCommand(notify, pkgRoot)) {
+		return { finalConfig, trustKeyRewrites: trustMigration.keyRewrites, metadataAfter: null };
+	}
+	const metadataPath = getNotifyMetadataPath(codexHomeDir);
+	if (isOmxDispatcherNotifyCommand(notify, pkgRoot)) {
+		const previousNotify = parseDisableHooksNotifyMetadata(
+			notifyMetadataSnapshot ?? { bytes: null, topology: { kind: "absent" } },
+			metadataPath,
+			notify,
+		);
+		finalConfig = removeRootTomlKey(finalConfig, "notify");
+		if (previousNotify) {
+			finalConfig = insertRootTomlKey(
+				finalConfig,
+				`notify = ${formatTomlStringArray(previousNotify)}`,
+			);
+		}
+		return { finalConfig, trustKeyRewrites: trustMigration.keyRewrites, metadataPath, metadataAfter: null };
+	}
+	return {
+		finalConfig: removeRootTomlKey(finalConfig, "notify"),
+		trustKeyRewrites: trustMigration.keyRewrites,
+		metadataAfter: null,
+	};
 }
 
 async function planNativeHookSetupTransaction(
@@ -3596,6 +4131,9 @@ async function planNativeHookSetupTransaction(
 	let finalConfig = existingConfig;
 	let finalHooksContent = existingHooksContent;
 	let hooksRemovedCount = 0;
+	let removedCoordinates: ManagedCodexHookRemovalCoordinate[] = [];
+	let coordinateMoves: ManagedCodexHookCoordinateMove[] = [];
+	let trustKeyRewrites: ReturnType<typeof migrateManagedCodexHookTrustStateCoordinates>["keyRewrites"] = [];
 	let cleanedLegacyConfig = false;
 	let pluginMarketplaceResult: NativeHookSetupTransactionPlan["pluginMarketplaceResult"] = "unchanged";
 	let pluginDeveloperInstructionsResult: NativeHookSetupTransactionPlan["pluginDeveloperInstructionsResult"] = "skipped";
@@ -3604,8 +4142,50 @@ async function planNativeHookSetupTransaction(
 	let notifyMetadataPrecondition: NativeHookTransactionPrecondition | null = null;
 	let modelUpgrade: NativeHookSetupTransactionPlan["modelUpgrade"];
 	let repairedLegacyTeamRunTable = false;
+	if (options.disableHooks) {
+		let managedHooksPlan: ManagedCodexHooksPlan | null = null;
+		if (existingHooksContent !== null) {
+			const removal = planManagedCodexHooksRemoval(existingHooksContent, options.hooksPath, {
+				platform: options.platform,
+				codexHomeDir: options.codexHomeDir,
+			});
+			if (!removal.ok) throw removal.error;
+			managedHooksPlan = removal;
+			finalHooksContent = removal.finalContent;
+			hooksRemovedCount = removal.removedCount;
+			removedCoordinates = removal.removedCoordinates;
+			coordinateMoves = removal.coordinateMoves;
+			diagnostics = removal.diagnostics;
+		}
+		const notifyPlan = await planDisableHooksConfig(
+			existingConfig,
+			options.pkgRoot,
+			managedHooksPlan,
+			coordinateMoves,
+			options.codexHomeDir,
+			options.notifyMetadataSnapshot,
+		);
+		finalConfig = notifyPlan.finalConfig;
+		trustKeyRewrites = notifyPlan.trustKeyRewrites;
+		if (notifyPlan.metadataPath) {
+			const metadataBefore = options.notifyMetadataSnapshot ?? { bytes: null, topology: { kind: "absent" } };
+			notifyMetadataPrecondition = nativeHookTransactionPrecondition(
+				"metadata",
+				notifyPlan.metadataPath,
+				`notification metadata ${notifyPlan.metadataPath}`,
+				metadataBefore,
+			);
+			notifyMetadataArtifact = nativeHookTransactionArtifact(
+				"metadata",
+				notifyPlan.metadataPath,
+				`notification metadata ${notifyPlan.metadataPath}`,
+				metadataBefore,
+				notifyPlan.metadataAfter,
+			);
+		}
+	}
 
-	if (options.isPluginInstallMode) {
+	if (!options.disableHooks && options.isPluginInstallMode) {
 		const pluginPlan = buildPluginModeHooksConfigPlan(
 			existingConfig,
 			existingHooksContent,
@@ -3615,6 +4195,7 @@ async function planNativeHookSetupTransaction(
 			{
 				codexHookFeatureFlag: options.codexHookFeatureFlag,
 				pluginScopedHooks: options.pluginScopedHooks,
+				pluginHookFeatureFlag: options.pluginHookFeatureFlag,
 				preserveFirstPartyMcp: options.preserveFirstPartyMcp,
 				developerInstructionsDecision:
 					options.pluginDeveloperInstructionsDecision,
@@ -3624,6 +4205,9 @@ async function planNativeHookSetupTransaction(
 		finalConfig = pluginPlan.finalConfig;
 		finalHooksContent = pluginPlan.hooksFinalContent;
 		hooksRemovedCount = pluginPlan.hooksRemovedCount;
+		removedCoordinates = pluginPlan.removedCoordinates;
+		coordinateMoves = pluginPlan.coordinateMoves;
+		trustKeyRewrites = pluginPlan.trustKeyRewrites;
 		cleanedLegacyConfig = pluginPlan.cleanedLegacyConfig;
 		diagnostics = pluginPlan.diagnostics;
 
@@ -3648,7 +4232,7 @@ async function planNativeHookSetupTransaction(
 		);
 		finalConfig = developerInstructionsPlan.finalConfig;
 		pluginDeveloperInstructionsResult = developerInstructionsPlan.result;
-	} else {
+	} else if (!options.disableHooks) {
 		const managedHooksPlan = planManagedCodexHooksMerge(
 			existingHooksContent,
 			options.pkgRoot,
@@ -3664,6 +4248,8 @@ async function planNativeHookSetupTransaction(
 		}
 		finalHooksContent = managedHooksPlan.finalContent;
 		hooksRemovedCount = managedHooksPlan.removedCount;
+		removedCoordinates = managedHooksPlan.removedCoordinates;
+		coordinateMoves = managedHooksPlan.coordinateMoves;
 		diagnostics = managedHooksPlan.diagnostics;
 		const managedConfigPlan = await planManagedConfig(
 			options.hooksPath,
@@ -3733,7 +4319,7 @@ async function planNativeHookSetupTransaction(
 		}
 	}
 
-	if (options.isPluginInstallMode && options.sharedMcpRegistry.servers.length > 0) {
+	if (!options.disableHooks && options.isPluginInstallMode && options.sharedMcpRegistry.servers.length > 0) {
 		finalConfig = mergeSharedMcpRegistryBlock(
 			finalConfig,
 			options.sharedMcpRegistry.servers,
@@ -3767,7 +4353,7 @@ async function planNativeHookSetupTransaction(
 	let shimArtifact: NativeHookTransactionArtifact | null = null;
 	let shimPrecondition: NativeHookTransactionPrecondition | null = null;
 	if (options.platform === "win32") {
-		const shimPath = buildManagedCodexNativeHookWindowsShimPath(options.codexHomeDir);
+		const shimPath = buildManagedCodexNativeHookWindowsShimPathForFilesystem(options.codexHomeDir);
 		const shimSnapshot = await captureNativeHookTransactionArtifact(
 			shimPath,
 			`native hook Windows shim ${shimPath}`,
@@ -3781,13 +4367,15 @@ async function planNativeHookSetupTransaction(
 			finalHooksContent,
 			shimPath,
 		);
+		const shouldDeleteShim =
+			shimReference === "not_referenced" &&
+			(options.disableHooks || (options.isPluginInstallMode && options.pluginScopedHooks));
 		shimArtifact = nativeHookTransactionArtifact(
 			"shim",
 			shimPath,
 			`native hook Windows shim ${shimPath}`,
 			shimSnapshot,
-			options.isPluginInstallMode && options.pluginScopedHooks &&
-			shimReference === "not_referenced"
+			shouldDeleteShim
 				? null
 				: shimAfter,
 		);
@@ -3843,6 +4431,9 @@ async function planNativeHookSetupTransaction(
 		),
 		finalConfig,
 		hooksRemovedCount,
+		removedCoordinates,
+		coordinateMoves,
+		trustKeyRewrites,
 		pluginScopedHooks: options.pluginScopedHooks,
 		cleanedLegacyConfig,
 		pluginMarketplaceResult,
@@ -3855,14 +4446,15 @@ async function planNativeHookSetupTransaction(
 
 export async function setup(options: SetupOptions = {}): Promise<void> {
 	const {
+		disableHooks = false,
 		force = false,
+		repairPluginCache = false,
 		dryRun = false,
 		installMode: requestedInstallMode,
 		mcpMode: requestedMcpMode,
 		teamMode: requestedTeamMode,
 		scope: requestedScope,
 		verbose = false,
-		skipNativeAgentRefresh: requestedSkipNativeAgentRefresh = false,
 		setupScopePrompt,
 		persistedSetupReviewPrompt,
 		installModePrompt,
@@ -3873,6 +4465,22 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	} = options;
 	const pkgRoot = getPackageRoot();
 	const projectRoot = process.cwd();
+	
+	// Validate .omx is never a symlink before any operations touch it
+	if (!dryRun) {
+		const omxPath = join(projectRoot, ".omx");
+		try {
+			const omxScopeRoot = await getValidationScopeRoot(omxPath);
+			await assertManagedDestination(omxPath, omxScopeRoot);
+		} catch (error) {
+			// Missing .omx is fine, but symlinks must be refused
+			if (error instanceof Error && error.message.includes("Refusing to install through symlink")) {
+				throw error;
+			}
+			// Any other error is unexpected
+			throw error;
+		}
+	}
 	const persistedPreferences = await readPersistedSetupPreferences(
 		projectRoot,
 		{ warnOnLegacyScope: true },
@@ -3970,9 +4578,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		)
 		?? "enabled";
 	const isTeamModeEnabled = teamModeEnabled(resolvedTeamMode);
-	const skipNativeAgentRefresh =
-		requestedSkipNativeAgentRefresh ||
-		process.env[SKIP_NATIVE_AGENT_REFRESH_ENV] === "1";
 	const scopeDirs = resolveScopeDirectories(resolvedScope.scope, projectRoot);
 	if (!dryRun) {
 		const recoveryTracker: RegularFileDurabilityTracker = { degraded: false };
@@ -3995,7 +4600,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				getNotifyMetadataPath(scopeDirs.codexHomeDir),
 				...(nativeHookTransactionPlatform === "win32"
 					? [
-							buildManagedCodexNativeHookWindowsShimPath(
+							buildManagedCodexNativeHookWindowsShimPathForFilesystem(
 								scopeDirs.codexHomeDir,
 							),
 						]
@@ -4024,6 +4629,12 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			`notification metadata ${getNotifyMetadataPath(scopeDirs.codexHomeDir)}`,
 		)
 		: undefined;
+	if (disableHooks && !notifyMetadataSnapshot && isOmxDispatcherNotifyCommand(getRootTomlArray(existingConfigForMcpMigration, "notify"), pkgRoot)) {
+		throw new ManagedCodexHooksPlanError(
+			"invalid_document",
+			`Refusing to disable OMX hooks: managed notification metadata is unavailable for ${getNotifyMetadataPath(scopeDirs.codexHomeDir)}.`,
+		);
+	}
 	const firstPartyMcpRegistrationKinds = [
 		hasFirstPartyOmxMcpRegistrations(existingConfigForMcpMigration)
 			? "config.toml [mcp_servers.omx_*]"
@@ -4055,7 +4666,13 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	const scopeSourceMessage =
 		resolvedScope.source === "persisted" ? " (from .omx/setup-scope.json)" : "";
 	const backupContext = getBackupContext(resolvedScope.scope, projectRoot);
+	const skillReceiptPath = installedSkillReceiptPath(resolvedScope.scope, projectRoot);
+	// For user scope, compute the legacy receipt path at $HOME/.omx/state/setup/installed-skills.json
+	const legacySkillReceiptPath = resolvedScope.scope === "user" ? join(homedir(), ".omx", "state", "setup", "installed-skills.json") : undefined;
 	const isPluginInstallMode = resolvedInstallMode?.installMode === "plugin";
+	if (repairPluginCache && !isPluginInstallMode) {
+		throw new Error("--repair-plugin-cache requires plugin setup mode; add --plugin.");
+	}
 	const pluginAgentsMdDst =
 		resolvedScope.scope === "project"
 			? join(projectRoot, "AGENTS.md")
@@ -4097,6 +4714,10 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	});
 	const codexHookFeatureFlag = codexHookFeatureSupport.hookFeatureFlag;
 	const pluginScopedHooksSupported = codexHookFeatureSupport.pluginScopedHooks;
+	// Verbose ownership claim must be scoped to plugin installs: legacy
+	// --verbose setup writes the global wrapper surface and cannot claim
+	// manifest ownership (issue #3623 follow-up).
+	const manifestOwnsHookSurface = isPluginInstallMode && pluginScopedHooksSupported;
 	const shouldSyncSharedMcpRegistry = resolvedMcpMode.mcpMode === "compat";
 	const registryCandidates = getUnifiedMcpRegistryCandidates();
 	const defaultRegistryCandidates = registryCandidates.slice(0, 1);
@@ -4121,6 +4742,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 		isPluginInstallMode,
 		pluginScopedHooks: pluginScopedHooksSupported,
+		pluginHookFeatureFlag: codexHookFeatureSupport.pluginHookFeatureFlag ?? undefined,
 		codexHookFeatureFlag,
 		preserveFirstPartyMcp:
 			shouldOfferFirstPartyMcpRemoval && !removeFirstPartyMcpRegistrations,
@@ -4135,6 +4757,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		forceStatusLinePreset: force,
 		configSnapshot: existingConfigForMcpMigrationSnapshot,
 		notifyMetadataSnapshot,
+		disableHooks,
 	});
 	const summary = createEmptyRunSummary();
 	for (const precondition of nativeHookSetupTransaction.preconditions) {
@@ -4144,6 +4767,24 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	await assertNativeHookTransactionAncestorPrecondition(
 		nativeHookTransactionAncestorPrecondition,
 	);
+	if (disableHooks) {
+		const disableSummary = createEmptyRunSummary();
+		const durabilityTracker: RegularFileDurabilityTracker = { degraded: false };
+		await commitNativeHookTransaction(
+			nativeHookSetupTransaction.artifacts,
+			nativeHookSetupTransaction.preconditions,
+			nativeHookTransactionAncestorPrecondition,
+			backupContext,
+			durabilityTracker,
+			disableSummary.config,
+			{ dryRun, verbose },
+		);
+		emitDegradedDurabilityWarning("native-hook setup", durabilityTracker);
+		console.log(
+			`${dryRun ? "Would disable" : "Disabled"} OMX hook registrations; non-OMX hooks and .omx artifacts were preserved.`,
+		);
+		return;
+	}
 
 	console.log("oh-my-codex setup");
 	console.log("=================\n");
@@ -4181,25 +4822,28 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 	// Step 1: Ensure directories exist
 	console.log("[1/8] Creating directories...");
-	const dirs = isPluginInstallMode
-		? [
-				scopeDirs.codexHomeDir,
-				scopeDirs.nativeAgentsDir,
-				omxStateDir(projectRoot),
-				omxPlansDir(projectRoot),
-				omxLogsDir(projectRoot),
-			]
-		: [
-				scopeDirs.codexHomeDir,
-				scopeDirs.promptsDir,
-				scopeDirs.skillsDir,
-				scopeDirs.nativeAgentsDir,
-				omxStateDir(projectRoot),
-				omxPlansDir(projectRoot),
-				omxLogsDir(projectRoot),
-			];
-	for (const dir of dirs) {
+	const userScopeDirs = isPluginInstallMode
+		? [scopeDirs.codexHomeDir, scopeDirs.nativeAgentsDir]
+		: [scopeDirs.codexHomeDir, scopeDirs.promptsDir, scopeDirs.skillsDir, scopeDirs.nativeAgentsDir];
+	const projectScopeDirs = [omxStateDir(projectRoot), omxPlansDir(projectRoot), omxLogsDir(projectRoot)];
+
+	// Validate and create user-scope directories against appropriate authority root
+	// (CODEX_HOME for files under CODEX_HOME, homedir() for ~/.omx and other paths)
+	for (const dir of userScopeDirs) {
 		if (!dryRun) {
+			const dirScopeRoot = await getValidationScopeRoot(dir);
+			await assertManagedDestination(dir, dirScopeRoot);
+			await mkdir(dir, { recursive: true });
+		}
+		if (verbose) console.log(`  mkdir ${dir}`);
+	}
+
+	// Validate and create project-scope directories against appropriate authority root
+	// (projectRoot for normal files, OMX_ROOT if set for .omx/* paths)
+	for (const dir of projectScopeDirs) {
+		if (!dryRun) {
+			const dirScopeRoot = await getValidationScopeRoot(dir);
+			await assertManagedDestination(dir, dirScopeRoot);
 			await mkdir(dir, { recursive: true });
 		}
 		if (verbose) console.log(`  mkdir ${dir}`);
@@ -4303,7 +4947,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				skillsSrc,
 				skillsDst,
 				backupContext,
-				{ dryRun, verbose },
+				{ dryRun, verbose, skillReceiptPath, legacySkillReceiptPath },
 			);
 			summary.skills.backedUp += cleanup.backedUp;
 			summary.skills.removed += cleanup.removedSkillNames.length;
@@ -4329,6 +4973,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 					force,
 					dryRun,
 					verbose,
+					skillReceiptPath,
 					teamMode: resolvedTeamMode,
 				},
 			);
@@ -4344,12 +4989,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 	// Step 4: Install native agent configs
 	console.log("[4/8] Installing native agent configs...");
-	if (skipNativeAgentRefresh) {
-		summary.nativeAgents = createEmptyCategorySummary();
-		console.log(
-			"  Native agent refresh skipped for background update-check setup refresh.\n",
-		);
-	} else if (isPluginInstallMode) {
+	if (isPluginInstallMode) {
 		summary.nativeAgents = await refreshNativeAgentConfigs(
 			pkgRoot,
 			scopeDirs.nativeAgentsDir,
@@ -4365,7 +5005,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		console.log(
 			`  Native agent role refresh complete (${scopeDirs.nativeAgentsDir}); plugin mode still installs role TOML so agent_type routing works.\n`,
 		);
-	} else {
+	} else if (!options.disableHooks) {
 		summary.nativeAgents = await refreshNativeAgentConfigs(
 			pkgRoot,
 			scopeDirs.nativeAgentsDir,
@@ -4391,7 +5031,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			`  Native Codex hook feature flag: [features].${codexHookFeatureFlag}`,
 		);
 		console.log(
-			`  Plugin-scoped Codex hooks: ${pluginScopedHooksSupported ? "supported" : "not reported; using legacy setup fallback"}`,
+			`  Plugin-scoped Codex hooks: ${manifestOwnsHookSurface ? "supported (plugin manifest owns hooks)" : "not reported; using legacy setup fallback"}`,
 		);
 	}
 	if (
@@ -4416,6 +5056,23 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	logManagedCodexHooksPlanDiagnostics(nativeHookSetupTransaction.diagnostics, {
 		verbose,
 	});
+	if (dryRun || verbose) {
+		for (const coordinate of nativeHookSetupTransaction.removedCoordinates) {
+			console.log(
+				`  ${dryRun ? "Would remove" : "Removing"} OMX hook ${coordinate.eventName} [${coordinate.groupIndex},${coordinate.handlerIndex}]`,
+			);
+		}
+		for (const move of nativeHookSetupTransaction.coordinateMoves) {
+			console.log(
+				`  ${dryRun ? "Would move" : "Moving"} foreign hook ${move.eventName} [${move.oldGroupIndex},${move.oldHandlerIndex}] -> [${move.newGroupIndex},${move.newHandlerIndex}]`,
+			);
+		}
+		for (const rewrite of nativeHookSetupTransaction.trustKeyRewrites) {
+			console.log(
+				`  ${dryRun ? "Would rewrite" : "Rewrote"} [hooks.state."${escapeTomlBasicString(rewrite.oldKey)}"] -> [hooks.state."${escapeTomlBasicString(rewrite.newKey)}"] (trusted_hash unchanged)`,
+			);
+		}
+	}
 	const changedHookArtifact = nativeHookSetupTransaction.artifacts.some(
 		(artifact) => artifact.kind === "hooks",
 	);
@@ -4469,27 +5126,10 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				`  Local Codex plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} already registered (${pkgRoot}).`,
 			);
 		}
-		const pluginCacheRefresh = await refreshOmxPluginDiscoveryCache(
-			pkgRoot,
-			{
-				dryRun,
-				verbose,
-			},
-			scopeDirs.codexHomeDir,
-		);
-		if (pluginCacheRefresh.status === "refreshed") {
-			if (pluginCacheRefresh.staleDirs.length > 0) {
-				console.log(
-					`  ${dryRun ? "Would invalidate" : "Invalidated"} ${pluginCacheRefresh.staleDirs.length} stale Codex plugin discovery cache entr${pluginCacheRefresh.staleDirs.length === 1 ? "y" : "ies"} so plugin skills refresh from the packaged manifest.`,
-				);
-			}
-		} else if (pluginCacheRefresh.status === "unchanged") {
-			console.log("  Codex plugin discovery cache already matches packaged plugin metadata.");
-		}
 		const pluginCacheMaterialize = await materializePackagedOmxPluginCache(
 			scopeDirs.codexHomeDir,
 			preflightMarketplace,
-			{ dryRun, teamMode: resolvedTeamMode },
+			{ dryRun, repairCache: force || repairPluginCache, teamMode: resolvedTeamMode },
 		);
 		if (pluginCacheMaterialize.status === "materialized") {
 			console.log(
@@ -4497,6 +5137,18 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			);
 		} else if (pluginCacheMaterialize.status === "unchanged") {
 			console.log("  Local Codex plugin cache already exposes packaged OMX skills.");
+		} else if (pluginCacheMaterialize.status === "stale-launcher") {
+			const isProvenanceMismatch = pluginCacheMaterialize.reason?.includes("provenance mismatch");
+			const warningMessage = isProvenanceMismatch
+			? `  warning: local Codex plugin cache at ${pluginCacheMaterialize.cacheDir} has incompatible launcher provenance (${pluginCacheMaterialize.reason}); not reporting as current.`
+			: `  warning: local Codex plugin cache at ${pluginCacheMaterialize.cacheDir} is not safe to use as current (${pluginCacheMaterialize.reason}); not reporting as current.`;
+			console.log(warningMessage);
+			// Only suggest removal if the removal is safe: exclude live pins, late pins, and untrusted entries
+			if (pluginCacheMaterialize.removalSafe === true) {
+				console.log(
+					`  Run \`codex plugin remove ${OMX_PLUGIN_NAME}@${OMX_LOCAL_MARKETPLACE_NAME} --json\` then rerun \`omx setup --plugin\` to rebuild the snapshot for ${preflightMarketplace?.packageRoot ?? pkgRoot}.`,
+				);
+			}
 		}
 		if (
 			pluginCacheMaterialize.status === "materialized" ||
@@ -4513,8 +5165,8 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			);
 		}
 		console.log(
-			pluginScopedHooksSupported
-				? "  Plugin-scoped Codex hooks and runtime feature flags refresh complete (plugin_hooks, goals).\n"
+			manifestOwnsHookSurface
+				? `  Plugin-scoped Codex hooks and runtime feature flags refresh complete (${codexHookFeatureSupport.pluginHookFeatureFlag}, goals).\n`
 				: `  Native Codex hooks fallback and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; hooks, goals).\n`,
 		);
 		if (pluginDeveloperInstructionsDecision.action !== "preserve") {
@@ -4573,7 +5225,12 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		resolvedScope.scope === "project"
 			? await readSessionState(projectRoot)
 			: null;
-	const sessionIsActive = activeSession && !isSessionStale(activeSession);
+	// Only a definitely dead session releases the overlay. macOS records no process-birth evidence, so
+	// a live session classifies as identity-indeterminate; treating that as stale would let setup
+	// overwrite the AGENTS.md overlay of a running session.
+	const sessionIsActive =
+		activeSession !== null &&
+		classifySessionStateLiveness(activeSession) !== "stale-dead";
 	if (isPluginInstallMode) {
 		const agentsMdSrc = join(pkgRoot, "templates", "AGENTS.md");
 		const pluginAgentsMdExists = pluginAgentsMdPathExists;
@@ -4899,9 +5556,14 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	// Step 8: Configure HUD
 	console.log("[8/8] Configuring HUD...");
 	const hudConfigPath = join(projectRoot, ".omx", "hud-config.json");
+	// Validate .omx even when hud-config.json already exists to catch symlinks
+	if (!dryRun) {
+		await assertManagedDestination(hudConfigPath, projectRoot);
+	}
 	if (force || !existsSync(hudConfigPath)) {
 		if (!dryRun) {
 			const defaultHudConfig = { preset: "focused" };
+			await mkdir(dirname(hudConfigPath), { recursive: true });
 			await writeFile(hudConfigPath, JSON.stringify(defaultHudConfig, null, 2));
 		}
 		if (verbose) console.log("  Wrote .omx/hud-config.json");
@@ -5062,6 +5724,8 @@ async function syncManagedFileFromDisk(
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 	verboseLabel: string,
 ): Promise<void> {
+	const dstScopeRoot = await getValidationScopeRoot(dstPath);
+	await assertManagedDestination(dstPath, dstScopeRoot);
 	const destinationExists = existsSync(dstPath);
 	const changed = !destinationExists || (await filesDiffer(srcPath, dstPath));
 
@@ -5095,10 +5759,13 @@ async function syncManagedContent(
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 	verboseLabel: string,
 ): Promise<void> {
+	const dstScopeRoot = await getValidationScopeRoot(dstPath);
+	await assertManagedDestination(dstPath, dstScopeRoot);
 	const destinationExists = existsSync(dstPath);
 	let changed = true;
 	if (destinationExists) {
 		const existing = await readFile(dstPath, "utf-8");
+
 		changed = existing !== content;
 	}
 
@@ -5135,6 +5802,31 @@ interface NativeAgentInstallManifest {
 
 function hashContent(content: string): string {
 	return createHash("sha256").update(content).digest("hex");
+}
+
+// Model, provider, reasoning, and resolved_model values are derived from the current
+// Codex/.omx-config settings. Ignore only these fields when deciding whether a TOML
+// otherwise matches the generated file; all other local content must still match.
+function normalizeNativeAgentConfig(content: string): string {
+	const developerInstructionsMarker = 'developer_instructions = """';
+	const markerIndex = content.indexOf(developerInstructionsMarker);
+	if (markerIndex < 0) return content;
+
+	const header = content.slice(0, markerIndex).replace(
+		/^(?:model|model_provider|model_reasoning_effort) = .*\r?\n?/gm,
+		"",
+	);
+	const instructions = content
+		.slice(markerIndex)
+		.replace(/^- resolved_model:.*(?:\r?\n|$)/gm, "");
+	return `${header}${instructions}`;
+}
+
+function differsOnlyByNativeAgentConfig(existing: string, generated: string): boolean {
+	return (
+		existing !== generated &&
+		normalizeNativeAgentConfig(existing) === normalizeNativeAgentConfig(generated)
+	);
 }
 
 function nativeAgentInstallManifestPath(agentsDir: string): string {
@@ -5180,8 +5872,10 @@ async function readNativeAgentInstallManifest(
 async function writeNativeAgentInstallManifest(
 	agentsDir: string,
 	manifest: NativeAgentInstallManifest,
+	scopeRoot: string,
 ): Promise<void> {
 	const manifestPath = nativeAgentInstallManifestPath(agentsDir);
+	await assertManagedDestination(manifestPath, scopeRoot);
 	await mkdir(dirname(manifestPath), { recursive: true });
 	const sortedFiles = Object.fromEntries(
 		Object.entries(manifest.files).sort(([left], [right]) =>
@@ -5205,6 +5899,8 @@ async function syncNativeAgentToml(
 ): Promise<void> {
 	const fileName = basename(dstPath);
 	const nextHash = hashContent(content);
+	const dstScopeRoot = await getValidationScopeRoot(dstPath);
+	await assertManagedDestination(dstPath, dstScopeRoot);
 	const destinationExists = existsSync(dstPath);
 
 	if (!destinationExists) {
@@ -5233,7 +5929,8 @@ async function syncNativeAgentToml(
 	}
 
 	const priorHash = manifest.files[fileName]?.sha256;
-	const safeToOverwrite = options.force || priorHash === existingHash;
+	const differsOnlyByModelConfig = differsOnlyByNativeAgentConfig(existing, content);
+	const safeToOverwrite = options.force || priorHash === existingHash || differsOnlyByModelConfig;
 	if (!safeToOverwrite) {
 		summary.skipped += 1;
 		if (options.verbose) {
@@ -5503,6 +6200,8 @@ async function refreshNativeAgentConfigs(
 	const summary = createEmptyCategorySummary();
 
 	if (!options.dryRun) {
+		const agentsDirScopeRoot = await getValidationScopeRoot(agentsDir);
+		await assertManagedDestination(agentsDir, agentsDirScopeRoot);
 		await mkdir(agentsDir, { recursive: true });
 	}
 
@@ -5613,7 +6312,8 @@ async function refreshNativeAgentConfigs(
 	}
 
 	if (!options.dryRun) {
-		await writeNativeAgentInstallManifest(agentsDir, nativeAgentManifest);
+		const manifestScopeRoot = await getValidationScopeRoot(join(agentsDir, "..", ".omx", "native-agents.json"));
+		await writeNativeAgentInstallManifest(agentsDir, nativeAgentManifest, manifestScopeRoot);
 	}
 
 	return summary;
@@ -5683,6 +6383,11 @@ export async function installSkills(
 ): Promise<SetupCategorySummary> {
 	const summary = createEmptyCategorySummary();
 	if (!existsSync(srcDir)) return summary;
+	// Validate the skills directory before creating any skill subdirectories
+	if (!options.dryRun) {
+		const dstDirScopeRoot = await getValidationScopeRoot(dstDir);
+		await assertManagedDestination(dstDir, dstDirScopeRoot);
+	}
 	const installableSkillNames = getSetupInstallableSkillNames();
 	const installableSkills: Array<{
 		name: string;
@@ -5699,9 +6404,15 @@ export async function installSkills(
 	): boolean =>
 		isCatalogInstallableStatus(status) || installableSkillNames.has(skillName);
 	const entries = await readdir(srcDir, { withFileTypes: true });
-	const staleCandidateSkillNames = new Set(
+	const catalogKnownSkillNames = new Set(
 		manifest?.skills.map((skill) => skill.name) ?? [],
 	);
+	const staleCandidateSkillNames = new Set(catalogKnownSkillNames);
+	if (existsSync(dstDir)) {
+		for (const installed of await readdir(dstDir, { withFileTypes: true })) {
+			if (installed.isDirectory()) staleCandidateSkillNames.add(installed.name);
+		}
+	}
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
 		staleCandidateSkillNames.add(entry.name);
@@ -5738,21 +6449,26 @@ export async function installSkills(
 		await validateSkillFile(join(skill.sourceDir, "SKILL.md"));
 	}
 
+	const writtenFilesBySkill = new Map<string, readonly string[]>();
 	for (const skill of installableSkills) {
 		const skillName = skill.name;
 		const skillSrc = skill.sourceDir;
 		const skillDst = skill.destinationDir;
 
 		if (!options.dryRun) {
+			const skillDstScopeRoot = await getValidationScopeRoot(skillDst);
+			await assertManagedDestination(skillDst, skillDstScopeRoot);
 			await mkdir(skillDst, { recursive: true });
 		}
 
 		const skillFiles = await readdir(skillSrc);
+		const writtenForSkill: string[] = [];
 		for (const sf of skillFiles) {
 			const sfPath = join(skillSrc, sf);
 			const sfStat = await stat(sfPath);
 			if (!sfStat.isFile()) continue;
 			const dstPath = join(skillDst, sf);
+			writtenForSkill.push(sf);
 			if (sf === "SKILL.md") {
 				await syncManagedContent(
 					rewriteInstalledSkillDescriptionBadge(
@@ -5776,6 +6492,15 @@ export async function installSkills(
 				`skill ${skillName}/${sf}`,
 			);
 		}
+		writtenFilesBySkill.set(skillName, writtenForSkill);
+	}
+
+	// Record what we just wrote so a later refresh can prove an unmodified install before retiring it.
+	// Without an authority path, refuse to create a receipt rather than placing deletion authority
+	// in the user-writable skills directory.
+	if (options.skillReceiptPath) {
+		const receiptScopeRoot = await getValidationScopeRoot(options.skillReceiptPath);
+		await writeInstalledSkillReceipt(options.skillReceiptPath, dstDir, writtenFilesBySkill, options, receiptScopeRoot);
 	}
 
 	if (manifest && existsSync(dstDir)) {
@@ -5783,14 +6508,34 @@ export async function installSkills(
 			const status = skillStatusByName?.get(staleSkill);
 			const disabledTeamSkill = !teamModeEnabled(options.teamMode) && TEAM_MODE_SKILL_NAMES.has(staleSkill);
 			if (isSetupInstallableSkill(staleSkill, status) && !disabledTeamSkill) continue;
-			const hardDeprecated = HARD_DEPRECATED_SKILL_NAMES.has(staleSkill);
-			if (!options.force && !hardDeprecated && !disabledTeamSkill) continue;
 
 			const staleSkillDir = join(dstDir, staleSkill);
 			if (!existsSync(staleSkillDir)) continue;
 
-			if (!options.dryRun) {
-				await rm(staleSkillDir, { recursive: true, force: true });
+			// A directory the catalog no longer ships is ours to retire on any refresh - which is what
+			// makes `omx update` drop deprecated skills without an extra flag - but only when we can
+			// prove it is an UNMODIFIED install we wrote. The badge alone is not proof: a user who
+			// edits the body keeps it, and archiving their edit is not preserving it.
+			const unmodifiedInstall = Boolean(options.skillReceiptPath)
+				&& await isUnmodifiedRecordedInstall(options.skillReceiptPath!, staleSkill, staleSkillDir);
+			const omxManaged = await isOmxManagedInstalledSkillDir(staleSkillDir) && unmodifiedInstall;
+			const forcedCatalogSkill = options.force && catalogKnownSkillNames.has(staleSkill);
+			// Disabling Team mode is a configuration change, not a destructive opt-in, so it must not
+			// delete a directory we cannot prove we wrote. --force remains the explicit destructive path.
+			const removableDisabledTeamSkill = disabledTeamSkill && unmodifiedInstall;
+			if (!omxManaged && !forcedCatalogSkill && !removableDisabledTeamSkill) {
+				summary.skipped += 1;
+				if (options.verbose) {
+					const why = await isOmxManagedInstalledSkillDir(staleSkillDir)
+						? "modified since install, or installed before receipts existed"
+						: "not an OMX-managed skill install";
+					console.log(`  kept ${staleSkill}/ (${why})`);
+				}
+				continue;
+			}
+
+			if (await removeDirectoryCopyAware(staleSkillDir, backupContext, options)) {
+				summary.backedUp += 1;
 			}
 			summary.removed += 1;
 			if (options.verbose) {
@@ -5798,9 +6543,9 @@ export async function installSkills(
 					? "would remove stale skill"
 					: "removed stale skill";
 				const label = status ?? "unlisted";
-				const reason = disabledTeamSkill
+				const reason = removableDisabledTeamSkill
 					? ", Team mode disabled"
-					: hardDeprecated ? ", hard-deprecated" : "";
+					: omxManaged ? ", retired from the catalog" : "";
 				console.log(`  ${prefix} ${staleSkill}/ (status: ${label}${reason})`);
 			}
 		}
@@ -5817,12 +6562,7 @@ async function removeDirectoryCopyAware(
 	const destinationExists = existsSync(sourceDir);
 	if (!destinationExists) return false;
 
-	const relativePath = relative(backupContext.baseRoot, sourceDir);
-	const safeRelativePath =
-		relativePath.startsWith("..") || relativePath === ""
-			? sourceDir.replace(/^[/]+/, "")
-			: relativePath;
-	const backupPath = join(backupContext.backupRoot, safeRelativePath);
+	const backupPath = join(backupContext.backupRoot, backupRelativePath(backupContext.baseRoot, sourceDir));
 
 	if (!options.dryRun) {
 		await mkdir(dirname(backupPath), { recursive: true });
@@ -5849,7 +6589,7 @@ async function cleanupLegacyManagedSkills(
 	srcDir: string,
 	dstDir: string,
 	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
+	options: Pick<SetupOptions, "dryRun" | "verbose" | "skillReceiptPath"> & { legacySkillReceiptPath?: string },
 ): Promise<LegacySkillCleanupResult> {
 	const result: LegacySkillCleanupResult = {
 		backedUp: 0,
@@ -5886,6 +6626,15 @@ async function cleanupLegacyManagedSkills(
 			result.warnings.push(warning);
 			continue;
 		}
+		// A matching SKILL.md does not prove the whole directory is ours: a user file sitting beside it
+		// would be deleted with the directory. Require the same unmodified-install proof the ordinary
+		// retirement sweep uses.
+		if (!options.skillReceiptPath || !(await isUnmodifiedRecordedInstall(options.skillReceiptPath, skillName, installedSkillDir, options.legacySkillReceiptPath))) {
+			const warning = `Skipping legacy skill cleanup for ${skillName}: directory contents are not a receipted unmodified OMX install.`;
+			result.skippedSkillNames.push(skillName);
+			result.warnings.push(warning);
+			continue;
+		}
 
 		const removed = await removeDirectoryCopyAware(
 			installedSkillDir,
@@ -5895,6 +6644,27 @@ async function cleanupLegacyManagedSkills(
 		if (removed) {
 			result.backedUp += 1;
 			result.removedSkillNames.push(skillName);
+		}
+	}
+
+	// Plugin mode never reinstalls into the legacy directory, so a skill the catalog has retired
+	// would otherwise survive there forever. Retire OMX-badged orphans on every refresh.
+	for (const entry of await readdir(dstDir, { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		if (installableSkillNames.has(entry.name)) continue;
+		const installedSkillDir = join(dstDir, entry.name);
+		if (!(await isOmxManagedInstalledSkillDir(installedSkillDir))) continue;
+		// The badge alone is not proof of ownership for deletion; a user-edited body keeps it.
+		if (!options.skillReceiptPath || !(await isUnmodifiedRecordedInstall(options.skillReceiptPath, entry.name, installedSkillDir, options.legacySkillReceiptPath))) {
+			result.skippedSkillNames.push(entry.name);
+			result.warnings.push(
+				`Skipping retired skill ${entry.name}: modified since install, or installed before receipts existed.`,
+			);
+			continue;
+		}
+		if (await removeDirectoryCopyAware(installedSkillDir, backupContext, options)) {
+			result.backedUp += 1;
+			result.removedSkillNames.push(entry.name);
 		}
 	}
 
@@ -6113,6 +6883,7 @@ async function planManagedConfig(
 		notifyCommand: notifyPlan.notifyCommand,
 		includeFirstPartyMcp: mcpMode === "compat",
 		preserveExistingFirstPartyMcp,
+		preserveReasoningEffort: true,
 	});
 	return {
 		finalConfig,

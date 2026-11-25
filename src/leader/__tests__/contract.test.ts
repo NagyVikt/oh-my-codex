@@ -31,18 +31,22 @@ import {
 } from '../contract.js';
 
 describe('leader conductor contract', () => {
-  it('exports the exact canonical Golden Rule string', () => {
-    assert.equal(
-      LEADER_CONDUCTOR_GOLDEN_RULE,
-      'When the Main agent is acting in Conductor mode, NEVER make plan or code changes directly. ALWAYS delegate implementation to specialized agents. Your role is to guide, review, and orchestrate.',
-    );
+  it('keeps the Main-root Conductor contract reachable for delegated performer lanes (#3635)', () => {
+    assert.match(LEADER_CONDUCTOR_GOLDEN_RULE, /Main never writes plan, spec, source, package, git/i);
+    assert.match(LEADER_CONDUCTOR_GOLDEN_RULE, /delegated performer lanes.*perform the bounded implementation and report back/i);
+    assert.match(LEADER_CONDUCTOR_GOLDEN_RULE, /Ordinary native reporting is completion, not a separate authority grant/i);
+    assert.match(LEADER_CONDUCTOR_GOLDEN_RULE, /orchestration metadata, transport, and ledger writes stay with Main/i);
+    assert.doesNotMatch(LEADER_CONDUCTOR_GOLDEN_RULE, /NEVER make plan or code changes directly\. ALWAYS delegate implementation to specialized agents/);
+    assert.match(LEADER_CONDUCTOR_DELEGATION_NOTE, /under ordinary native support with inherited permissions/i);
+    assert.match(LEADER_CONDUCTOR_DELEGATION_NOTE, /let them implement, mutate, and report directly/i);
+    assert.match(LEADER_CONDUCTOR_DELEGATION_NOTE, /Never loosen real sandbox, approval, cross-session ownership, or privileged-operation boundaries/i);
   });
 
   it('exports the exact canonical conductor block without ledger/reuse guidance', () => {
     assert.deepEqual(LEADER_CONDUCTOR_REUSE_AND_LEDGER_RULES, [
       'Conductor mode is a Main-root contract only; typed subagents never receive this block.',
       'Use .omx/state/subagent-tracking.json as the source of truth for saved subagent ids and recovery order.',
-      'On SessionStart, eagerly attempt resume_agent(<subagent id>) for every saved subagent id before spawning any replacement agent.',
+      'On SessionStart, if resume_agent is available, eagerly attempt resume_agent(<subagent id>) for every saved subagent id before spawning any replacement agent. If resume_agent is unavailable, continue in the root or another compatible existing lane; do not spawn a replacement solely because reopen is unavailable.',
       'ralplan consensus planning may activate Conductor; autopilot rework stays exempt.',
     ]);
 
@@ -65,7 +69,7 @@ describe('leader conductor contract', () => {
         `- ${LEADER_CONDUCTOR_SILVER_RULE}`,
         '- Conductor mode is a Main-root contract only; typed subagents never receive this block.',
         '- Use .omx/state/subagent-tracking.json as the source of truth for saved subagent ids and recovery order.',
-        '- On SessionStart, eagerly attempt resume_agent(<subagent id>) for every saved subagent id before spawning any replacement agent.',
+        '- On SessionStart, if resume_agent is available, eagerly attempt resume_agent(<subagent id>) for every saved subagent id before spawning any replacement agent. If resume_agent is unavailable, continue in the root or another compatible existing lane; do not spawn a replacement solely because reopen is unavailable.',
         '- ralplan consensus planning may activate Conductor; autopilot rework stays exempt.',
       ].join('\n'),
     );

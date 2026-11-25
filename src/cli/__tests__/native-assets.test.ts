@@ -55,17 +55,17 @@ async function startStaticServer(root: string): Promise<{ baseUrl: string; close
 function sha256(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex');
 }
-async function collect(stream: NodeJS.ReadableStream): Promise<Buffer> {
+async function collect(stream: AsyncIterable<any>): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of stream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
 
-async function makeTar(entries: Array<{ name: string; data?: Buffer; type?: tar.Headers['type']; linkname?: string }>, format: 'tar.gz' | 'tar.xz' = 'tar.gz'): Promise<Buffer> {
+async function makeTar(entries: Array<{ name: string; data?: Buffer; type?: tar.Header['type']; linkname?: string }>, format: 'tar.gz' | 'tar.xz' = 'tar.gz'): Promise<Buffer> {
   const archive = tar.pack();
   for (const item of entries) {
     const type = item.type ?? 'file';
-    const header: tar.Headers = { name: item.name, type, size: type === 'file' ? item.data?.length ?? 0 : 0, linkname: item.linkname };
+    const header = { name: item.name, type, size: type === 'file' ? item.data?.length ?? 0 : 0, linkname: item.linkname ?? '' };
     if (type === 'file') archive.entry(header, item.data ?? Buffer.alloc(0));
     else archive.entry(header);
   }
@@ -464,6 +464,76 @@ describe('native asset helpers', () => {
         await server.close();
       }
     } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not require a release manifest for dev versions, even with strict manifest errors', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-native-hydrate-dev-version-'));
+    let manifestRequests = 0;
+    const server = createServer((_req, res) => {
+      manifestRequests += 1;
+      res.writeHead(404);
+      res.end('missing');
+    });
+    try {
+      await writeFile(join(wd, 'package.json'), JSON.stringify({
+        version: '0.22.24-dev',
+        repository: { url: 'git+https://github.com/Yeachan-Heo/oh-my-codex.git' },
+      }));
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('failed to bind test server');
+
+      const hydrated = await hydrateNativeBinary('omx-runtime', {
+        packageRoot: wd,
+        env: {
+          OMX_NATIVE_CACHE_DIR: join(wd, 'cache'),
+        },
+        platform: 'linux',
+        arch: 'x64',
+        strictManifestErrors: true,
+      });
+
+      assert.equal(hydrated, undefined);
+      assert.equal(manifestRequests, 0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('requests a release manifest for dev versions when OMX_NATIVE_MANIFEST_URL is set', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-native-hydrate-dev-manifest-override-'));
+    let manifestRequests = 0;
+    const server = createServer((_req, res) => {
+      manifestRequests += 1;
+      res.writeHead(404);
+      res.end('missing');
+    });
+    try {
+      await writeFile(join(wd, 'package.json'), JSON.stringify({
+        version: '0.22.24-dev',
+        repository: { url: 'git+https://github.com/Yeachan-Heo/oh-my-codex.git' },
+      }));
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('failed to bind test server');
+
+      const hydrated = await hydrateNativeBinary('omx-runtime', {
+        packageRoot: wd,
+        env: {
+          OMX_NATIVE_MANIFEST_URL: `http://127.0.0.1:${address.port}/native-release-manifest.json`,
+          OMX_NATIVE_CACHE_DIR: join(wd, 'cache'),
+        },
+        platform: 'linux',
+        arch: 'x64',
+      });
+
+      assert.equal(hydrated, undefined);
+      assert.equal(manifestRequests, 1);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
       await rm(wd, { recursive: true, force: true });
     }
   });
