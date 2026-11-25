@@ -136,9 +136,11 @@ describe('renderHud – gitBranch', () => {
 // ── GitGuardex finish ─────────────────────────────────────────────────────────────
 
 describe('renderHud – GitGuardex finish', () => {
-  it('renders the current finish step in every preset', () => {
+  it('explains CI waiting without color and shortens it on narrow panels in every preset', () => {
     const ctx = {
       ...emptyCtx(),
+      version: '0.22.25',
+      gitBranch: 'gitguardex/main',
       guardexFinish: {
         active: true as const,
         stage: 'ci',
@@ -150,8 +152,17 @@ describe('renderHud – GitGuardex finish', () => {
       },
     };
 
+    setColorEnabled(false);
     for (const preset of ['minimal', 'focused', 'full'] as const) {
-      assert.ok(stripSgr(renderHud(ctx, preset)).includes('gx:6/8 ci'));
+      const wide = stripSgr(renderHud(ctx, preset, { maxWidth: 96 }));
+      const narrow = stripSgr(renderHud(ctx, preset, { maxWidth: 44 }));
+      assert.match(wide, /gx:6\/8 CI · waiting for GitHub checks/u);
+      assert.match(narrow, /gx:6\/8 CI: wait/u);
+      assert.doesNotMatch(narrow, /GitHub checks|[◐◓◑◒]/u);
+      const lines = narrow.split('\n');
+      assert.ok(lines.length <= 2 && lines.every(line => line.length <= 44));
+      const settled = renderHud({ ...ctx, guardexFinish: { ...ctx.guardexFinish, state: 'complete' } }, preset);
+      assert.doesNotMatch(settled, /wait/);
     }
   });
 
