@@ -109,6 +109,23 @@ describe('readGuardexFinishState', () => {
     });
   });
 
+  it('reads shared finish events from a linked checkout', async () => {
+    await withTempRepo('omx-hud-guardex-linked-', async (cwd) => {
+      const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd });
+      git('init', '-q');
+      git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'init', '--allow-empty');
+      const linked = join(cwd, 'linked checkout');
+      git('worktree', 'add', '--detach', linked);
+      const runId = `finish-test-${process.pid}-12345678`;
+      const timestamp = new Date().toISOString();
+      await writeGuardexFinishEvents(cwd, runId, [
+        { schemaVersion: 1, runId, timestamp, stage: 'review', state: 'running', index: 4, total: 8, label: 'AI review' },
+      ]);
+
+      assert.equal((await readGuardexFinishState(linked))?.stage, 'review');
+    });
+  });
+
   it('ignores malformed trailing JSON and keeps the last valid live phase', async () => {
     await withTempRepo('omx-hud-guardex-partial-', async (cwd) => {
       const runId = `finish-test-${process.pid}-12345678`;

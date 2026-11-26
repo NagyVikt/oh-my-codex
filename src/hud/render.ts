@@ -66,15 +66,17 @@ function renderGuardexFinish(ctx: HudRenderContext, maxWidth?: number): string |
   if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index <= 0 || total <= 0 || index > total) return null;
   const stage = sanitizeDynamicText(ctx.guardexFinish.stage).slice(0, 40);
   if (!stage) return null;
+  const prefix = `GX Finish · ${index}/${total} · `;
   if (stage === 'ci' && state === 'running') {
     const compact = maxWidth !== undefined && maxWidth > 0 && maxWidth < GUARDEX_WIDE_CI_COLUMNS;
-    return yellow(`gx:${index}/${total} ${compact ? 'CI: wait' : 'CI · waiting for GitHub checks'}`);
+    return yellow(prefix + (compact ? 'CI: wait' : 'CI · waiting for GitHub checks'));
   }
   const animates = state === 'running' && (stage === 'review' || stage === 'autofix');
   const frame = animates
     ? ` ${GUARDEX_SPINNER_FRAMES[Math.floor(Date.now() / GUARDEX_SPINNER_FRAME_MS) % GUARDEX_SPINNER_FRAMES.length]}`
     : '';
-  return yellow(`gx:${index}/${total} ${stage}${frame}`);
+  const label = sanitizeDynamicText(ctx.guardexFinish.label).slice(0, 80) || stage;
+  return yellow(prefix + label + frame);
 }
 
 function renderRalph(ctx: HudRenderContext): string | null {
@@ -205,9 +207,10 @@ function truncateDynamicText(value: string, maxLength: number): string {
   return normalizeTrailingEllipsis(`${value.slice(0, maxLength - 1).trimEnd()}…`);
 }
 
-export function getHudRenderMaxLines(ctx: Pick<HudRenderContext, 'ultragoal' | 'team' | 'nativeAgents'>): number {
+export function getHudRenderMaxLines(ctx: Pick<HudRenderContext, 'ultragoal' | 'team' | 'nativeAgents' | 'guardexFinish'>): number {
   const summaryLines = ctx.ultragoal?.active ? HUD_TMUX_ULTRAGOAL_HEIGHT_LINES : HUD_TMUX_HEIGHT_LINES;
-  return summaryLines + (ctx.team?.active ? ctx.team.workers?.length ?? 0 : 0) + (ctx.nativeAgents?.length ?? 0);
+  return summaryLines + Number(Boolean(ctx.guardexFinish?.active))
+    + (ctx.team?.active ? ctx.team.workers?.length ?? 0 : 0) + (ctx.nativeAgents?.length ?? 0);
 }
 
 function clampHudMaxLines(ctx: HudRenderContext, maxLines: number | undefined): number {
@@ -384,7 +387,6 @@ type ElementRenderer = (ctx: HudRenderContext, maxWidth?: number) => string | nu
 
 const MINIMAL_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
-  renderGuardexFinish,
   renderRalph,
   renderUltrawork,
   renderRalplan,
@@ -399,7 +401,6 @@ const MINIMAL_ELEMENTS: ElementRenderer[] = [
 
 const FOCUSED_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
-  renderGuardexFinish,
   renderRalph,
   renderUltrawork,
   renderAutopilot,
@@ -419,7 +420,6 @@ const FOCUSED_ELEMENTS: ElementRenderer[] = [
 
 const FULL_ELEMENTS: ElementRenderer[] = [
   renderGitBranch,
-  renderGuardexFinish,
   renderRalph,
   renderUltrawork,
   renderAutopilot,
@@ -588,22 +588,26 @@ export function renderHud(
     maxLines: clampHudMaxLines(ctx, options.maxLines),
   };
 
-  if (parts.length === 0) {
-    return wrapHudParts(label, [dim('No active modes.')], renderOptions);
-  }
-
   const workers = ctx.team?.active ? ctx.team.workers ?? [] : [];
   const rosterCount = workers.length + agents.length;
-  if (rosterCount === 0) return wrapHudParts(label, parts, renderOptions);
-  const headerBudget = Math.max(1, renderOptions.maxLines - rosterCount);
-  const header = wrapHudParts(label, parts, { ...renderOptions, maxLines: headerBudget });
-  const availableRows = renderOptions.maxLines - countRenderedHudLines(header);
+  const finish = renderGuardexFinish(ctx, options.maxWidth);
+  const finishRow = finish && renderOptions.maxLines > 1 ? finish : null;
+  if (finish && !finishRow) parts.unshift(finish);
+  const headerBudget = Math.max(1, renderOptions.maxLines - rosterCount - Number(Boolean(finishRow)));
+  const header = wrapHudParts(label, parts.length ? parts : [dim('No active modes.')], {
+    ...renderOptions,
+    maxLines: headerBudget,
+  });
+  const width = Number.isFinite(options.maxWidth) && (options.maxWidth ?? 0) > 0
+    ? Math.max(12, Math.floor(options.maxWidth ?? 0)) : Infinity;
+  const clipRow = (row: string) => visibleLength(row) > width ? `${sliceAnsiVisible(row, 0, width - 1)}…` : row;
+  const summary = finishRow ? `${header}\n${clipRow(finishRow)}` : header;
+  if (rosterCount === 0) return summary;
+  const availableRows = renderOptions.maxLines - countRenderedHudLines(summary);
   const overflow = rosterCount > availableRows;
   const rowBudget = Math.max(0, availableRows - (overflow ? 1 : 0));
   const visibleWorkers = Math.min(rowBudget, workers.length);
   const visibleAgents = Math.max(0, rowBudget - visibleWorkers);
-  const width = Number.isFinite(options.maxWidth) && (options.maxWidth ?? 0) > 0
-    ? Math.max(12, Math.floor(options.maxWidth ?? 0)) : Infinity;
   const rows = [
     ...renderTeamWorkers(workers, width).slice(0, visibleWorkers),
     ...agents.slice(0, visibleAgents).map(renderNativeAgent),
@@ -617,7 +621,7 @@ export function renderHud(
     ].filter(Boolean).join(', ')));
   }
   // Keep identity, status, and task ahead of optional metadata on narrow panes.
-  return [header, ...rows.map(row => visibleLength(row) > width ? `${sliceAnsiVisible(row, 0, width - 1)}…` : row)].join('\n');
+  return [summary, ...rows.map(clipRow)].join('\n');
 }
 
 export function countRenderedHudLines(text: string): number {
