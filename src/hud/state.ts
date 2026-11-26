@@ -7,7 +7,7 @@
 import { statSync } from 'fs';
 import { open, readFile, readdir, stat } from 'fs/promises';
 import { execFileSync } from 'child_process';
-import { join, basename } from 'path';
+import { join, basename, dirname } from 'path';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import type { GitLayout } from '../utils/git-layout.js';
 import { resolveOmxDisplayVersionSync } from '../utils/version.js';
@@ -188,9 +188,20 @@ export async function readGuardexFinishState(
   cwd: string,
   dependencies: GuardexFinishStateDependencies = {},
 ): Promise<GuardexFinishStateForHud | null> {
-  // Guardex writes to the repository-local state directory, independent of
-  // OMX session/team state-root overrides inherited by the HUD process.
-  const repoRoot = findGitLayout(cwd)?.worktreeRoot ?? cwd;
+  const layout = findGitLayout(cwd);
+  const local = await readGuardexFinishCheckout(layout?.worktreeRoot ?? cwd, dependencies);
+  if (local || !layout || layout.gitDir === layout.commonDir || basename(layout.commonDir) !== '.git') {
+    return local;
+  }
+  // Newer GitGuardex versions keep a shared stream in the primary checkout.
+  // Keep local worktree streams readable for older versions and fallbacks.
+  return readGuardexFinishCheckout(dirname(layout.commonDir), dependencies);
+}
+
+async function readGuardexFinishCheckout(
+  repoRoot: string,
+  dependencies: GuardexFinishStateDependencies,
+): Promise<GuardexFinishStateForHud | null> {
   const directory = join(repoRoot, '.omx', 'state', 'finish-runs');
   try {
     const entries = await readdir(directory, { withFileTypes: true });

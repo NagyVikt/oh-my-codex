@@ -156,11 +156,15 @@ describe('renderHud – GitGuardex finish', () => {
     for (const preset of ['minimal', 'focused', 'full'] as const) {
       const wide = stripSgr(renderHud(ctx, preset, { maxWidth: 96 }));
       const narrow = stripSgr(renderHud(ctx, preset, { maxWidth: 44 }));
-      assert.match(wide, /gx:6\/8 CI · waiting for GitHub checks/u);
-      assert.match(narrow, /gx:6\/8 CI: wait/u);
+      const [summary, finish] = wide.split('\n');
+      assert.match(summary, /^\[OMX#0\.22\.25\].*gitguardex\/main/);
+      assert.doesNotMatch(summary, /GX Finish/);
+      assert.equal(finish, 'GX Finish · 6/8 · CI · waiting for GitHub checks');
+      assert.match(narrow, /\nGX Finish · 6\/8 · CI: wait/u);
       assert.doesNotMatch(narrow, /GitHub checks|[◐◓◑◒]/u);
       const lines = narrow.split('\n');
       assert.ok(lines.length <= 2 && lines.every(line => line.length <= 44));
+      assert.equal(stripSgr(renderHud({ ...ctx, guardexFinish: null }, preset)).split('\n').length, 1);
       const settled = renderHud({ ...ctx, guardexFinish: { ...ctx.guardexFinish, state: 'complete' } }, preset);
       assert.doesNotMatch(settled, /wait/);
     }
@@ -185,8 +189,8 @@ describe('renderHud – GitGuardex finish', () => {
     mock.method(Date, 'now', () => 1000);
     const second = stripSgr(renderHud(ctx, 'focused'));
 
-    assert.match(first, /gx:4\/8 review [◐◓◑◒]/u);
-    assert.match(second, /gx:4\/8 review [◐◓◑◒]/u);
+    assert.match(first, /\nGX Finish · 4\/8 · AI review [◐◓◑◒]/u);
+    assert.match(second, /\nGX Finish · 4\/8 · AI review [◐◓◑◒]/u);
     assert.notEqual(first, second);
   });
 
