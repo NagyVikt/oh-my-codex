@@ -156,10 +156,14 @@ describe('renderHud – GitGuardex finish', () => {
     for (const preset of ['minimal', 'focused', 'full'] as const) {
       const wide = stripSgr(renderHud(ctx, preset, { maxWidth: 96 }));
       const narrow = stripSgr(renderHud(ctx, preset, { maxWidth: 44 }));
-      const [summary, finish] = wide.split('\n');
+      const [summary, finish, stages] = wide.split('\n');
       assert.match(summary, /^\[OMX#0\.22\.25\].*gitguardex\/main/);
-      assert.doesNotMatch(summary, /GX Finish/);
-      assert.equal(finish, 'GX Finish · 6/8 · CI · waiting for GitHub checks');
+      assert.doesNotMatch(summary, /GITGUARDEX FINISH/i);
+      assert.equal(finish, '▌ GITGUARDEX FINISH  6/8  CI · waiting for GitHub checks');
+      assert.equal(stages, '  Prep ─ Preflight ─ PR ─ Review ─ Autofix ─ ◆ CI ─ Merge ─ Cleanup');
+      assert.deepEqual(renderHud(ctx, preset, { maxWidth: 96 }).split('\n').slice(1), [finish, stages]);
+      const medium = stripSgr(renderHud(ctx, preset, { maxWidth: 60 })).split('\n');
+      assert.deepEqual(medium.slice(1), ['GX Finish · 6/8 · CI · waiting for GitHub checks']);
       assert.match(narrow, /\nGX Finish · 6\/8 · CI: wait/u);
       assert.doesNotMatch(narrow, /GitHub checks|[◐◓◑◒]/u);
       const lines = narrow.split('\n');
@@ -189,9 +193,54 @@ describe('renderHud – GitGuardex finish', () => {
     mock.method(Date, 'now', () => 1000);
     const second = stripSgr(renderHud(ctx, 'focused'));
 
-    assert.match(first, /\nGX Finish · 4\/8 · AI review [◐◓◑◒]/u);
-    assert.match(second, /\nGX Finish · 4\/8 · AI review [◐◓◑◒]/u);
+    assert.match(first, /\n▌ GITGUARDEX FINISH  4\/8  AI review [◐◓◑◒]\n/u);
+    assert.match(second, /\n▌ GITGUARDEX FINISH  4\/8  AI review [◐◓◑◒]\n/u);
+    assert.match(first, /PR ─ ◆ Review ─ Autofix/u);
     assert.notEqual(first, second);
+  });
+
+  it('keeps a skipped phase readable without implying other phases passed', () => {
+    const ctx = {
+      ...emptyCtx(),
+      guardexFinish: {
+        active: true,
+        stage: 'autofix',
+        state: 'skipped',
+        index: 5,
+        total: 8,
+        label: 'Review autofix',
+        updatedAt: new Date().toISOString(),
+      },
+      team: {
+        active: true,
+        team_name: 'example',
+        workers: [{ name: 'worker-1', state: 'working' }],
+      },
+    } satisfies HudRenderContext;
+    const rows = stripSgr(renderHud(ctx, 'focused', { maxWidth: 96, maxLines: 3 })).split('\n');
+    assert.equal(rows.length, 3);
+    assert.match(rows[1], /5\/8  Review autofix · skipped  ────◆───$/u);
+    assert.match(rows[2], /worker-1/);
+
+    const roomy = stripSgr(renderHud({
+      ...ctx, nativeAgents: [{ name: 'scout', role: 'explore' }],
+    }, 'focused', { maxWidth: 96, maxLines: 5 })).split('\n');
+    assert.equal(roomy.length, 5);
+    assert.match(roomy[2], /Review ─ ◆ Autofix ─ CI/u);
+    assert.match(roomy[3], /worker-1/);
+    assert.match(roomy[4], /scout/);
+
+    const inline = stripSgr(renderHud(ctx, 'focused', { maxWidth: 64, maxLines: 1 }));
+    assert.match(inline, /GX Finish · 5\/8 · Review autofix · skipped/u);
+    assert.doesNotMatch(inline, /[\n◆]/u);
+
+    const huge: HudRenderContext = {
+      ...emptyCtx(),
+      guardexFinish: { ...ctx.guardexFinish, total: Number.MAX_SAFE_INTEGER },
+    };
+    assert.doesNotMatch(stripSgr(renderHud(huge, 'focused')), /◆/u);
+    const mismatched = { ...ctx, guardexFinish: { ...ctx.guardexFinish, stage: 'review' } };
+    assert.doesNotMatch(stripSgr(renderHud(mismatched, 'focused')), /Preflight/u);
   });
 
   it('does not animate a settled review phase', () => {
