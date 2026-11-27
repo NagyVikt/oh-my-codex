@@ -161,6 +161,8 @@ describe('renderHud – GitGuardex finish', () => {
       assert.doesNotMatch(summary, /GITGUARDEX FINISH/i);
       assert.equal(finish, '▌ GITGUARDEX FINISH  6/8  CI · waiting for GitHub checks  ─────◆──');
       assert.equal(finish, renderHud(ctx, preset, { maxWidth: 96 }).split('\n')[1]);
+      const medium = stripSgr(renderHud(ctx, preset, { maxWidth: 60 })).split('\n')[1];
+      assert.equal(medium, 'GX Finish · 6/8 · CI · waiting for GitHub checks');
       assert.match(narrow, /\nGX Finish · 6\/8 · CI: wait/u);
       assert.doesNotMatch(narrow, /GitHub checks|[◐◓◑◒]/u);
       const lines = narrow.split('\n');

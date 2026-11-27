@@ -74,14 +74,16 @@ function renderGuardexFinish(ctx: HudRenderContext, width: number): string | nul
     : '';
   const label = sanitizeDynamicText(ctx.guardexFinish.label).slice(0, 80) || stage;
   const details = label + frame + (state === 'skipped' ? ' · skipped' : '');
+  const status = ciWaiting ? 'CI · waiting for GitHub checks' : details;
   if (total <= GUARDEX_TRACK_MAX_STEPS) {
     // The event gives only the current position, not the outcome of other steps.
     const track = dim('─'.repeat(index - 1)) + cyan('◆') + dim('─'.repeat(total - index));
-    const status = ciWaiting ? 'CI · waiting for GitHub checks' : details;
     const row = `${cyan('▌')} ${bold('GITGUARDEX FINISH')}  ${position}  ${yellow(status)}  ${track}`;
     if (visibleLength(row) <= width) return row;
   }
-  return `${bold('GX Finish')} · ${position} · ${yellow(ciWaiting ? 'CI: wait' : details)}`;
+  const prefix = `${bold('GX Finish')} · ${position} · `;
+  const compactStatus = ciWaiting && visibleLength(prefix) + status.length > width ? 'CI: wait' : status;
+  return prefix + yellow(compactStatus);
 }
 
 function renderRalph(ctx: HudRenderContext): string | null {
