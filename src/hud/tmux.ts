@@ -1867,7 +1867,7 @@ export function createHudWatchPane(
       combineTmuxConditions(
         buildHudSplitSourceCondition(sourceAuthority),
         // tmux evaluates this at split time, even if the pane just became floating.
-        `#{!:${HUD_PANE_DISABLED_FORMAT}}`,
+        `#{==:${HUD_PANE_DISABLED_FORMAT},0}`,
         ...(mutationAuthority ? [buildHudMutationAuthorityCondition(mutationAuthority)] : []),
       ),
       `${splitCommand} ; display-message -p ${receipt}`,
