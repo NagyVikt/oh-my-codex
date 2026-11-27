@@ -59,8 +59,20 @@ function renderGitBranch(ctx: HudRenderContext): string | null {
 const GUARDEX_SPINNER_FRAMES = ['◐', '◓', '◑', '◒'] as const;
 const GUARDEX_SPINNER_FRAME_MS = 400;
 const GUARDEX_TRACK_MAX_STEPS = 12;
+const GUARDEX_STAGES = [
+  ['prepare', 'Prep'],
+  ['preflight', 'Preflight'],
+  ['pr', 'PR'],
+  ['review', 'Review'],
+  ['autofix', 'Autofix'],
+  ['ci', 'CI'],
+  ['merge', 'Merge'],
+  ['cleanup', 'Cleanup'],
+] as const;
 
-function renderGuardexFinish(ctx: HudRenderContext, width: number): string | null {
+function renderGuardexFinish(
+  ctx: HudRenderContext, width: number,
+): { row: string; expanded: string[] | null } | null {
   if (!ctx.guardexFinish?.active) return null;
   const { index, total, state } = ctx.guardexFinish;
   if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total) || index <= 0 || total <= 0 || index > total) return null;
@@ -75,15 +87,24 @@ function renderGuardexFinish(ctx: HudRenderContext, width: number): string | nul
   const label = sanitizeDynamicText(ctx.guardexFinish.label).slice(0, 80) || stage;
   const details = label + frame + (state === 'skipped' ? ' · skipped' : '');
   const status = ciWaiting ? 'CI · waiting for GitHub checks' : details;
+  const banner = `${cyan('▌')} ${bold('GITGUARDEX FINISH')}  ${position}  ${yellow(status)}`;
+  let expanded: string[] | null = null;
+  if (total === GUARDEX_STAGES.length && GUARDEX_STAGES[index - 1]?.[0] === stage
+      && visibleLength(banner) <= width) {
+    // Dim all other positions: the latest event cannot tell whether they passed.
+    const steps = GUARDEX_STAGES.map(([, name], offset) =>
+      offset + 1 === index ? cyan(`◆ ${name}`) : dim(name));
+    const namedTrack = `  ${steps.join(dim(' ─ '))}`;
+    if (visibleLength(namedTrack) <= width) expanded = [banner, namedTrack];
+  }
   if (total <= GUARDEX_TRACK_MAX_STEPS) {
-    // The event gives only the current position, not the outcome of other steps.
     const track = dim('─'.repeat(index - 1)) + cyan('◆') + dim('─'.repeat(total - index));
-    const row = `${cyan('▌')} ${bold('GITGUARDEX FINISH')}  ${position}  ${yellow(status)}  ${track}`;
-    if (visibleLength(row) <= width) return row;
+    const row = `${banner}  ${track}`;
+    if (visibleLength(row) <= width) return { row, expanded };
   }
   const prefix = `${bold('GX Finish')} · ${position} · `;
   const compactStatus = ciWaiting && visibleLength(prefix) + status.length > width ? 'CI: wait' : status;
-  return prefix + yellow(compactStatus);
+  return { row: prefix + yellow(compactStatus), expanded };
 }
 
 function renderRalph(ctx: HudRenderContext): string | null {
@@ -600,15 +621,19 @@ export function renderHud(
   const width = Number.isFinite(options.maxWidth) && (options.maxWidth ?? 0) > 0
     ? Math.max(12, Math.floor(options.maxWidth ?? 0)) : Infinity;
   const finish = renderGuardexFinish(ctx, renderOptions.maxLines > 1 ? width : 0);
-  const finishRow = finish && renderOptions.maxLines > 1 ? finish : null;
-  if (finish && !finishRow) parts.unshift(finish);
+  const finishRow = renderOptions.maxLines > 1 ? finish?.row : null;
+  if (finish && !finishRow) parts.unshift(finish.row);
   const headerBudget = Math.max(1, renderOptions.maxLines - rosterCount - Number(Boolean(finishRow)));
   const header = wrapHudParts(label, parts.length ? parts : [dim('No active modes.')], {
     ...renderOptions,
     maxLines: headerBudget,
   });
   const clipRow = (row: string) => visibleLength(row) > width ? `${sliceAnsiVisible(row, 0, width - 1)}…` : row;
-  const summary = finishRow ? `${header}\n${clipRow(finishRow)}` : header;
+  const expanded = finish?.expanded;
+  // Spend a spare line only after the OMX summary and the entire agent roster fit.
+  const finishRows = expanded && countRenderedHudLines(header) + expanded.length + rosterCount <= renderOptions.maxLines
+    ? expanded : finishRow ? [clipRow(finishRow)] : [];
+  const summary = [header, ...finishRows].join('\n');
   if (rosterCount === 0) return summary;
   const availableRows = renderOptions.maxLines - countRenderedHudLines(summary);
   const overflow = rosterCount > availableRows;
