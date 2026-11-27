@@ -922,6 +922,20 @@ export interface HudResizeHookContext {
 
 export type HudHookHealth = 'healthy' | 'repair_needed' | 'unknown' | 'owner_mismatch';
 
+const HUD_PANE_DISABLED_FORMAT = '#{||:#{pane_floating_flag},#{==:#{@omx_no_hud},1}}';
+
+export function isHudDisabledForPane(paneId: string, execTmuxSync: TmuxExecSync = defaultExecTmuxSync): boolean {
+  const target = parseCanonicalTmuxPaneId(paneId);
+  if (!target) return false;
+  try {
+    return parseExactTmuxAuthorityScalar(execTmuxSync([
+      'display-message', '-p', '-t', target, HUD_PANE_DISABLED_FORMAT,
+    ])) === '1';
+  } catch {
+    return false;
+  }
+}
+
 export function readHudLeaderOwnerIdentity(
   leaderPaneId: string,
   expectedOwnerId: string,
@@ -929,6 +943,7 @@ export function readHudLeaderOwnerIdentity(
 ): 'current' | 'mismatch' | 'unknown' {
   const paneId = parseCanonicalTmuxPaneId(leaderPaneId);
   if (!paneId || !expectedOwnerId.trim()) return 'unknown';
+  if (isHudDisabledForPane(paneId, execTmuxSync)) return 'mismatch';
   try {
     const output = parseExactTmuxAuthorityScalar(execTmuxSync([
       'display-message', '-p', '-t', paneId, `#{pane_id}|#{pane_dead}|${HUD_LEADER_OWNER_FORMAT}`,
@@ -1851,6 +1866,8 @@ export function createHudWatchPane(
       'if-shell', '-F', '-t', sourcePaneId,
       combineTmuxConditions(
         buildHudSplitSourceCondition(sourceAuthority),
+        // tmux evaluates this at split time, even if the pane just became floating.
+        `#{==:${HUD_PANE_DISABLED_FORMAT},0}`,
         ...(mutationAuthority ? [buildHudMutationAuthorityCondition(mutationAuthority)] : []),
       ),
       `${splitCommand} ; display-message -p ${receipt}`,

@@ -340,6 +340,17 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.equal(created, false);
   });
 
+  it('leaves a HUD-disabled leader and neighboring panes untouched', async () => {
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%12', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      isHudDisabledForPane: (paneId) => paneId === '%12',
+      listCurrentWindowPanes: () => assert.fail('no pane enumeration is needed'),
+      createHudWatchPane: () => assert.fail('must not create a HUD'),
+      killTmuxPane: () => assert.fail('must not close any pane'),
+    });
+    assert.equal(result.status, 'skipped_hud_disabled');
+  });
+
   it('skips recreating a missing HUD in explicit OMX-owned tmux without a session id', async () => {
     const created: Array<{ cwd: string; cmd: string; options?: { heightLines?: number; targetPaneId?: string } }> = [];
     const resized: Array<{ paneId: string; heightLines: number }> = [];

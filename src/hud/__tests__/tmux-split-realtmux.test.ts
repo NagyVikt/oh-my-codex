@@ -253,6 +253,31 @@ async function waitForOwnedHudHooksHealthy(
 }
 
 describe('createHudWatchPane real private-server split transaction', () => {
+  it('does not add a HUD to a floating pane beside a tiled leader', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+    await withTempTmuxSession({}, async (fixture) => {
+      const leader = fixture.leaderPaneId;
+      const extra = fixture.run(['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', leader]);
+      try {
+        fixture.run(['break-pane', '-d', '-W', '-s', extra]);
+      } catch {
+        t.skip('tmux does not support floating panes');
+        return;
+      }
+      const execTmuxSync = (args: string[]) => `${fixture.run(args)}\n`;
+      const layout = () => fixture.run([
+        'list-panes', '-t', leader, '-F', '#{pane_id} #{pane_pid} #{pane_floating_flag}',
+      ]);
+      const before = layout();
+      assert.equal(fixture.run(['display-message', '-p', '-t', extra, '#{pane_floating_flag}']), '1');
+      assert.equal(createHudWatchPane(process.cwd(), 'exec sleep 60', { targetPaneId: extra }, execTmuxSync), null);
+      assert.equal(layout(), before);
+      const hud = createHudWatchPane(process.cwd(), 'exec sleep 60', { targetPaneId: leader }, execTmuxSync);
+      assert.ok(hud, 'a tiled sibling can still create its own HUD');
+      assert.equal(fixture.run(['display-message', '-p', '-t', hud, '#{pane_floating_flag}']), '0');
+    });
+  });
+
   it('retains both HUDs when a vertically split sibling becomes the latest session owner', async (t) => {
     if (!skipUnlessPrivateRealTmux(t)) return;
 
