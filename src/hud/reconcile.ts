@@ -11,6 +11,7 @@ import {
   createHudWatchPane,
   findLegacyFocusedHudWatchPaneIds,
   findHudWatchPaneIds,
+  isHudDisabledForPane,
   isHudWatchPane,
   killTmuxPane,
   killTmuxPaneIfCurrent,
@@ -175,6 +176,7 @@ export interface ReconcileHudForPromptSubmitResult {
     | 'skipped_not_tmux'
     | 'skipped_no_entry'
     | 'skipped_not_omx_owned_tmux'
+    | 'skipped_hud_disabled'
     | 'skipped_no_session_id'
     | 'skipped_window_too_cramped'
     | 'skipped_stale_leader_pane'
@@ -214,6 +216,7 @@ export interface ReconcileHudForPromptSubmitDeps {
   readCurrentWindowSize?: (currentPaneId?: string) => { width: number | null; height: number | null };
   nowMs?: () => number;
   isProcessLive?: (pid: number) => boolean | null;
+  isHudDisabledForPane?: typeof isHudDisabledForPane;
   readHudLeaderOwnerIdentity?: typeof readHudLeaderOwnerIdentity;
 }
 
@@ -494,6 +497,11 @@ export async function reconcileHudForPromptSubmit(
     };
   }
 
+  const currentPaneId = env.TMUX_PANE?.trim();
+  if (currentPaneId && (deps.isHudDisabledForPane ?? isHudDisabledForPane)(currentPaneId)) {
+    return { status: 'skipped_hud_disabled', paneId: null, desiredHeight: null, duplicateCount: 0 };
+  }
+
   const resolveOmxCliEntryPathFn = deps.resolveOmxCliEntryPath ?? resolveOmxCliEntryPath;
   const omxBin = resolveOmxCliEntryPathFn();
   if (!omxBin) {
@@ -511,7 +519,6 @@ export async function reconcileHudForPromptSubmit(
   }));
   const killPaneRaw = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
   const resizePaneRaw = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
-  const currentPaneId = env.TMUX_PANE?.trim();
   const resolvedSessionId = deps.sessionId?.trim() || env.OMX_SESSION_ID?.trim() || undefined;
   const watchRepair = env.OMX_HUD_WATCH_REPAIR === '1';
   const expectedLeaderPid = env.OMX_HUD_WATCH_LEADER_PID?.trim();

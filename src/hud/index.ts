@@ -34,6 +34,7 @@ import {
   OMX_TMUX_HUD_LEADER_PANE_ENV,
   readActiveTmuxPaneId,
   registerHudResizeHook,
+  isHudDisabledForPane,
   isHudOwnerCurrent,
   clearTmuxPaneHistory,
   clearTmuxPaneHistoryIfCurrent,
@@ -726,6 +727,7 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
   const envPaneId = process.env.TMUX_PANE?.trim();
   const currentPaneId = envPaneId || readActiveTmuxPaneId() || undefined;
   const leaderPaneId = currentPaneId;
+  if (leaderPaneId && isHudDisabledForPane(leaderPaneId)) return;
   const sessionId = process.env.OMX_SESSION_ID?.trim() || undefined;
   const panes = listCurrentWindowPanes(undefined, leaderPaneId);
   const existingHudPaneIds = leaderPaneId || sessionId
