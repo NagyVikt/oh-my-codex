@@ -2016,6 +2016,7 @@ function mutateTmuxPaneIfCurrent(
   mutation: string,
   authority: HudTmuxMutationAuthority | undefined,
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+  geometry?: { hud: string; leader: string },
 ): boolean {
   const canonicalPaneId = parseCanonicalTmuxPaneId(paneId);
   const normalizedAuthority = authority ? normalizeHudMutationAuthority(authority) : null;
@@ -2024,13 +2025,19 @@ function mutateTmuxPaneIfCurrent(
   try {
     const targetMutation = [
       'if-shell', '-F', '-t', canonicalPaneId,
-      buildHudHookIncarnationCondition(canonicalPaneId, expectedPanePid),
+      combineTmuxConditions(
+        buildHudHookIncarnationCondition(canonicalPaneId, expectedPanePid),
+        ...(geometry ? [geometry.hud] : []),
+      ),
       `${mutation} ; display-message -p ${marker}`,
       `display-message -p __omx_hud_mutation_failed_${marker}`,
     ];
     const output = execTmuxSync(normalizedAuthority ? [
       'if-shell', '-F', '-t', normalizedAuthority.leaderPaneId,
-      buildHudMutationAuthorityCondition(normalizedAuthority),
+      combineTmuxConditions(
+        buildHudMutationAuthorityCondition(normalizedAuthority),
+        ...(geometry ? [geometry.leader] : []),
+      ),
       targetMutation.map(shellEscapeSingle).join(' '),
       `display-message -p __omx_hud_mutation_failed_${marker}`,
     ] : targetMutation);
@@ -2038,6 +2045,36 @@ function mutateTmuxPaneIfCurrent(
   } catch {
     return false;
   }
+}
+
+/** Adjusts the internal leader/HUD edge, leaving the divider below the HUD in place. */
+export function resizeHudAtLeaderEdge(
+  hud: TmuxPaneSnapshot,
+  leader: TmuxPaneSnapshot,
+  height: number,
+  authority: HudTmuxMutationAuthority,
+): boolean {
+  const leaderHeight = (leader.paneHeight ?? 0) + (hud.paneHeight ?? 0) - height;
+  const owner = normalizeHudMutationAuthority(authority);
+  if (!hud.panePid || !Number.isSafeInteger(leaderHeight) || leaderHeight < 1
+    || !owner || leader.paneId !== owner.leaderPaneId || leader.panePid !== owner.leaderPanePid
+    || !leader.windowId || hud.windowId !== leader.windowId || hud.sessionId !== leader.sessionId
+    || leader.paneBottom === undefined || hud.paneTop !== leader.paneBottom + 2
+    || hud.paneLeft !== leader.paneLeft || hud.paneWidth !== leader.paneWidth) return false;
+  const guard = (pane: TmuxPaneSnapshot) => {
+    const fields = {
+      pane_height: pane.paneHeight, pane_top: pane.paneTop, pane_left: pane.paneLeft,
+      pane_width: pane.paneWidth, window_height: pane.windowHeight, window_width: pane.windowWidth,
+    };
+    if (!Object.values(fields).every(Number.isSafeInteger)) return null;
+    return combineTmuxConditions(...Object.entries(fields).map(([field, value]) => `#{==:#{${field}},${value}}`));
+  };
+  const hudGuard = guard(hud);
+  const leaderGuard = guard(leader);
+  if (!hudGuard || !leaderGuard) return false;
+  return mutateTmuxPaneIfCurrent(hud.paneId, hud.panePid,
+    `resize-pane -t ${owner.leaderPaneId} -y ${leaderHeight}`, owner, defaultExecTmuxSync,
+    { hud: hudGuard, leader: leaderGuard });
 }
 
 /** Kills a pane only while its exact live incarnation remains the target. */

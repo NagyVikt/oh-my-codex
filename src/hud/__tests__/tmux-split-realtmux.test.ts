@@ -253,6 +253,47 @@ async function waitForOwnedHudHooksHealthy(
 }
 
 describe('createHudWatchPane real private-server split transaction', () => {
+  it('preserves the divider after resizing either edge of an owned HUD', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+    const workDir = await mkdtemp(join(tmpdir(), 'omx-hud-divider-'));
+    try {
+      await withTempTmuxSession({}, async (fixture) => {
+        const leader = fixture.leaderPaneId;
+        const sessionId = 'divider-owner';
+        const side = fixture.run(['split-window', '-d', '-h', '-P', '-F', '#{pane_id}', '-t', leader, 'sleep 60']);
+        const lower = fixture.run(['split-window', '-d', '-v', '-P', '-F', '#{pane_id}', '-t', leader, 'sleep 60']);
+        fixture.run(['set-option', '-p', '-t', leader, '@omx_pane_instance_id', sessionId]);
+        const { hudPaneId, omxEntry } = createOwnedHud(fixture, workDir, sessionId);
+        await waitForOwnedHudHooksHealthy(fixture, workDir, sessionId, hudPaneId, omxEntry);
+        const measure = (pane: string, field: 'height' | 'top') => Number(fixture.run([
+          'display-message', '-p', '-t', pane, `#{pane_${field}}`,
+        ]));
+        const waitForCompactHud = async () => {
+          const deadline = Date.now() + HUD_RECONCILE_TIMEOUT_MS;
+          while (measure(hudPaneId, 'height') !== 2 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, PANE_READY_INTERVAL_MS));
+          }
+          assert.equal(measure(hudPaneId, 'height'), 2);
+        };
+        const height = measure(leader, 'height');
+        const divider = measure(lower, 'top');
+        const sideHeight = measure(side, 'height');
+        fixture.run(['resize-pane', '-t', hudPaneId, '-y', '6']);
+        await waitForCompactHud();
+        assert.equal(measure(lower, 'top'), divider + 4, 'the lower HUD edge must not snap back');
+        assert.equal(measure(leader, 'height'), height + 4);
+
+        fixture.run(['resize-pane', '-t', leader, '-y', String(height)]);
+        await waitForCompactHud();
+        assert.equal(measure(leader, 'height'), height, 'normalizing the HUD must not undo an upper-edge resize');
+        assert.equal(measure(lower, 'top'), divider);
+        assert.equal(measure(side, 'height'), sideHeight, 'the neighboring column must not be resized');
+      });
+    } finally {
+      await removeTempDirWithRetry(workDir);
+    }
+  });
+
   it('does not add a HUD to a floating pane beside a tiled leader', async (t) => {
     if (!skipUnlessPrivateRealTmux(t)) return;
     await withTempTmuxSession({}, async (fixture) => {

@@ -38,12 +38,14 @@ import {
   isHudOwnerCurrent,
   clearTmuxPaneHistory,
   clearTmuxPaneHistoryIfCurrent,
+  resizeHudAtLeaderEdge,
   resizeTmuxPane,
   resizeTmuxPaneIfCurrent,
   readHudHookHealth,
   readHudLeaderOwnerIdentity,
   type ReadHudHookHealthInput,
   type HudHookHealth,
+  type TmuxPaneSnapshot,
 } from './tmux.js';
 import { OMX_TMUX_HUD_OWNER_ENV, assessOwnedHudLayout, needsHudTopologyRecreate, reconcileHudForPromptSubmit } from './reconcile.js';
 import { buildHudRuntimeEnv } from './tmux.js';
@@ -189,8 +191,9 @@ export function resolveHudWatchCwd(
 
 function reconcileRunningHudPaneHeight(
   desiredHeight: number,
-  leaderPanePid: string | undefined,
-  hudPanePid: string | undefined,
+  leader: TmuxPaneSnapshot | undefined,
+  hud: TmuxPaneSnapshot | undefined,
+  preserveBottom: boolean,
   cwd: string,
   dependencies: Pick<RunWatchModeDependencies, 'env' | 'resizeTmuxPaneFn' | 'registerHudResizeHookFn' | 'isHudOwnerCurrentFn'>,
   useInjectedMutationFns: boolean,
@@ -208,9 +211,14 @@ function reconcileRunningHudPaneHeight(
     if (!dependencies.resizeTmuxPaneFn(hudPaneId, desiredHeight)) return false;
     return dependencies.registerHudResizeHookFn(hudPaneId, leaderPaneId, desiredHeight);
   }
+  const leaderPanePid = leader?.panePid;
+  const hudPanePid = hud?.panePid;
   if (!leaderPanePid || !hudPanePid) return false;
   const authority = { leaderPaneId, leaderPanePid, ownerId: dependencies.env.OMX_SESSION_ID };
-  if (!resizeTmuxPaneIfCurrent(hudPaneId, hudPanePid, desiredHeight, authority)) return false;
+  const resized = preserveBottom && leader && hud
+    ? resizeHudAtLeaderEdge(hud, leader, desiredHeight, authority)
+    : resizeTmuxPaneIfCurrent(hudPaneId, hudPanePid, desiredHeight, authority);
+  if (!resized) return false;
   return registerHudResizeHook(hudPaneId, leaderPaneId, desiredHeight, {
     cwd,
     env: { ...dependencies.env, OMX_HUD_WATCH_REPAIR: '1', OMX_HUD_WATCH_LEADER_PID: leaderPanePid },
@@ -298,6 +306,7 @@ export async function runWatchMode(
   let stopped = false;
   let timer: ReturnType<typeof setInterval> | undefined;
   let lastDesiredHeight: number | undefined;
+  let lastStableHudPane: TmuxPaneSnapshot | undefined;
   let resolveDone: () => void = () => {};
   const done = new Promise<void>((resolve) => {
     resolveDone = resolve;
@@ -446,10 +455,33 @@ export async function runWatchMode(
         retryAt = 0;
         retryIndex = 0;
       }
-      if (exactOwner === 'current' && !ctx && assessment?.reason === 'height_mismatch' && hookHealth === 'healthy'
-        && !reconcileRunningHudPaneHeight(maxLines, leaderPane?.panePid, currentHudPane?.panePid,
-          frameCwd, dependencies, useInjectedMutationFns)) {
-        needsRepair = true;
+      if (assessment?.status === 'healthy') lastStableHudPane = currentHudPane;
+      else if (assessment?.reason !== 'height_mismatch') lastStableHudPane = undefined;
+      const canResize = exactOwner === 'current' && assessment?.reason === 'height_mismatch'
+        && (hookHealth === 'healthy' || (hookHealth === 'repair_needed' && !useInjectedMutationFns));
+      const reconcileHeight = () => {
+        // Same location and desired height, but the top stayed put: the divider below us moved.
+        const preserveBottom = lastStableHudPane?.paneHeight === maxLines && currentHudPane !== undefined
+          && lastStableHudPane.panePid === currentHudPane.panePid
+          && lastStableHudPane.windowId === currentHudPane.windowId
+          && lastStableHudPane.windowWidth === currentHudPane.windowWidth
+          && lastStableHudPane.windowHeight === currentHudPane.windowHeight
+          && lastStableHudPane.paneLeft === currentHudPane.paneLeft
+          && lastStableHudPane.paneWidth === currentHudPane.paneWidth
+          && lastStableHudPane.paneTop === currentHudPane.paneTop;
+        const resized = reconcileRunningHudPaneHeight(maxLines, leaderPane, currentHudPane,
+          preserveBottom, frameCwd, dependencies, useInjectedMutationFns);
+        needsRepair = !resized;
+        if (resized && preserveBottom && currentHudPane?.paneTop !== undefined && currentHudPane.paneHeight !== undefined) {
+          lastStableHudPane = {
+            ...currentHudPane, paneHeight: maxLines,
+            paneTop: currentHudPane.paneTop + currentHudPane.paneHeight - maxLines,
+          };
+        }
+        return resized;
+      };
+      if (!ctx && canResize) {
+        reconcileHeight();
       }
       if (ctx && preset) {
         const line = dependencies.renderHudFn(ctx, preset, {
@@ -466,18 +498,11 @@ export async function runWatchMode(
           // Clear before a pane resize so tmux cannot reflow stale HUD rows
           // into visible output or scrollback while changing the pane height.
           dependencies.writeStdout(clearFrame);
-          if (exactOwner === 'current' && assessment?.reason === 'height_mismatch' && hookHealth === 'healthy') {
-            if (reconcileRunningHudPaneHeight(maxLines, leaderPane?.panePid, currentHudPane?.panePid,
-              frameCwd, dependencies, useInjectedMutationFns)) {
-              if (hudPaneId) {
-                if (useInjectedMutationFns) dependencies.clearTmuxPaneHistoryFn(hudPaneId);
-                else if (leaderPane?.panePid && currentHudPane?.panePid && ownerId && leaderPaneId) {
-                  clearTmuxPaneHistoryIfCurrent(hudPaneId, currentHudPane.panePid,
-                    { leaderPaneId, leaderPanePid: leaderPane.panePid, ownerId });
-                }
-              }
-            } else {
-              needsRepair = true;
+          if (canResize && reconcileHeight() && hudPaneId) {
+            if (useInjectedMutationFns) dependencies.clearTmuxPaneHistoryFn(hudPaneId);
+            else if (leaderPane?.panePid && currentHudPane?.panePid && ownerId && leaderPaneId) {
+              clearTmuxPaneHistoryIfCurrent(hudPaneId, currentHudPane.panePid,
+                { leaderPaneId, leaderPanePid: leaderPane.panePid, ownerId });
             }
           }
           lastDesiredHeight = maxLines;
