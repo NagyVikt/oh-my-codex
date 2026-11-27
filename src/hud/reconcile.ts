@@ -11,6 +11,7 @@ import {
   createHudWatchPane,
   findLegacyFocusedHudWatchPaneIds,
   findHudWatchPaneIds,
+  hasValidHudOwnerMarker,
   isHudDisabledForPane,
   isHudWatchPane,
   killTmuxPane,
@@ -663,7 +664,12 @@ export async function reconcileHudForPromptSubmit(
     : undefined;
   if (singleHudPane && !needsHudTopologyRecreate(singleHudPane, leaderPane)) {
     desiredHeight = boundHudHeight(requestedHeight, panes, currentPaneId, singleHudPane.paneId);
-    const shouldResize = needsHudHeightResize(singleHudPane, desiredHeight);
+    const paneOwner = readHudPaneOwner(singleHudPane);
+    // A live watcher knows which divider the user moved; a one-shot layout hook does not.
+    const watcherOwnsHeight = singleHudPane.panePid && !singleHudPane.paneDead
+      && hasValidHudOwnerMarker(singleHudPane) && paneOwner.sessionId === resolvedSessionId
+      && paneOwner.leaderPaneId === currentPaneId;
+    const shouldResize = !watcherOwnsHeight && needsHudHeightResize(singleHudPane, desiredHeight);
     const resized = shouldResize ? resizePane(singleHudPane.paneId, desiredHeight) : true;
     if (resized && watchRepairAuthorized()) ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
     return {
